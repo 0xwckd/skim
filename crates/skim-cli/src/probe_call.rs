@@ -30,7 +30,10 @@ use revm::{
 use skim_el::ElNet;
 use skim_snap::{el::ElTransport, Key, Scheduler, Value};
 
-use crate::stats::Samples;
+use crate::{
+    learned::{AccessKey, Learned, Source},
+    stats::Samples,
+};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -57,6 +60,37 @@ pub struct Args {
     /// Use trusted peers only.
     #[arg(long)]
     trusted_only: bool,
+    /// Scheduler: use only the N fastest peers (peer-count experiment).
+    #[arg(long)]
+    max_peers: Option<usize>,
+    /// Skip cold runs after the first iteration (soak: steady-state hinted calls only).
+    #[arg(long)]
+    soak: bool,
+    /// Learned sets: keep keys seen in at least this fraction of recent runs.
+    #[arg(long, default_value_t = 0.5)]
+    min_freq: f64,
+    /// Learned sets: cap on core keys in the first wave.
+    #[arg(long, default_value_t = 256)]
+    core_cap: usize,
+}
+
+fn to_misses(keys: &[AccessKey]) -> Misses {
+    let mut m = Misses::default();
+    for k in keys {
+        match *k {
+            AccessKey::Account(a) => {
+                m.accounts.insert(a);
+            }
+            AccessKey::Storage(a, s) => {
+                m.storage.insert((a, s));
+            }
+        }
+    }
+    m
+}
+
+fn to_keys(m: &Misses) -> Vec<AccessKey> {
+    m.accounts.iter().map(|a| AccessKey::Account(*a)).chain(m.storage.iter().map(|(a, s)| AccessKey::Storage(*a, *s))).collect()
 }
 
 const QUOTER: Address = address!("Ed1f6473345F45b75F8179591dd5bA1888cf2FB3");
@@ -67,13 +101,6 @@ struct Call {
     name: String,
     to: Address,
     data: Bytes,
-}
-
-impl Call {
-    /// Learned access sets are keyed by target + selector, not by exact input.
-    fn shape(&self) -> (Address, [u8; 4]) {
-        (self.to, self.data[..4].try_into().unwrap())
-    }
 }
 
 fn calls() -> Vec<Call> {
@@ -344,6 +371,8 @@ struct PerCall {
     hinted_wall: Samples,
     hinted_rounds: Vec<usize>,
     hinted_keys: Vec<usize>,
+    hinted_exact_k: Vec<usize>,
+    hinted_core_k: Vec<usize>,
     warm_exec: Samples,
     infura_first: Samples,
     infura_warm: Samples,
@@ -378,6 +407,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         ElTransport(net.clone()),
         skim_snap::Config {
             per_peer_inflight: args.per_peer_inflight,
+            max_peers: args.max_peers,
             hedge_after: Duration::from_millis(args.hedge_ms),
             ..Default::default()
         },
@@ -386,7 +416,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let calls = calls();
     let mut res: Vec<PerCall> = calls.iter().map(|_| PerCall::default()).collect();
     // Learned access sets per call shape (union over inputs and blocks), and the bytecode cache.
-    let mut learned: HashMap<(Address, [u8; 4]), Misses> = HashMap::new();
+    let mut learned = Learned::new(8, args.min_freq, args.core_cap);
     let mut code_cache: HashMap<B256, Bytecode> = HashMap::new();
 
     let mut last: Option<u64> = None;
@@ -423,25 +453,33 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                 }
             }
 
-            if let Some(hint) = learned.get(&call.shape()) {
+            if let Some((source, keys)) = learned.predict(call.to, &call.data) {
+                let hint = to_misses(&keys);
                 let mut st = Sparse { code: code_cache.clone(), ..Default::default() };
-                match cold_run(&sched, &h, call, &mut st, Some(hint)).await {
+                match cold_run(&sched, &h, call, &mut st, Some(&hint)).await {
                     Ok(c) => {
                         r.hinted_wall.push(c.wall);
                         r.hinted_rounds.push(c.rounds.len());
                         r.hinted_keys.push(c.rounds.iter().map(|x| x.keys).sum());
+                        match source {
+                            Source::Exact => r.hinted_exact_k.push(c.rounds.len()),
+                            Source::Core => r.hinted_core_k.push(c.rounds.len()),
+                        }
                         if let Some(inf) = &infura {
                             check(r, &call.name, &c.output, inf);
                         }
-                        tracing::info!(call = %call.name, rounds = c.rounds.len(), ms = c.wall.as_millis() as u64, "hinted");
-                        let l = learned.get_mut(&call.shape()).unwrap();
-                        l.accounts.extend(c.access.accounts);
-                        l.storage.extend(c.access.storage);
+                        tracing::info!(call = %call.name, ?source, predicted = keys.len(), rounds = c.rounds.len(),
+                            ms = c.wall.as_millis() as u64, "hinted");
+                        code_cache.extend(st.code.iter().map(|(k, v)| (*k, v.clone())));
+                        learned.record(call.to, &call.data, to_keys(&c.access));
                     }
                     Err(e) => {
                         r.errors += 1;
                         tracing::warn!(call = %call.name, "hinted run failed: {e}");
                     }
+                }
+                if args.soak && it > 0 {
+                    continue;
                 }
             }
 
@@ -461,9 +499,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                     }
                     r.warm_exec.push(t.elapsed() / 20);
                     code_cache.extend(st.code.iter().map(|(k, v)| (*k, v.clone())));
-                    let l = learned.entry(call.shape()).or_default();
-                    l.accounts.extend(c.access.accounts);
-                    l.storage.extend(c.access.storage);
+                    learned.record(call.to, &call.data, to_keys(&c.access));
                     tracing::info!(call = %call.name, rounds = c.rounds.len(),
                         rtts = c.rounds.iter().map(|x| x.rtts).sum::<usize>(),
                         keys = c.rounds.iter().map(|x| x.keys).sum::<usize>(),
@@ -484,7 +520,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             serde_json::json!({
                 "call": c.name,
                 "cold": {"wall": r.cold_wall.json(), "k_median": median(&r.rounds), "rtts_median": median(&r.rtts), "keys_median": median(&r.keys)},
-                "hinted": {"wall": r.hinted_wall.json(), "k_median": median(&r.hinted_rounds), "k_all": r.hinted_rounds, "keys_median": median(&r.hinted_keys)},
+                "hinted": {"wall": r.hinted_wall.json(), "k_median": median(&r.hinted_rounds), "keys_median": median(&r.hinted_keys),
+                    "k_exact": r.hinted_exact_k, "k_core": r.hinted_core_k},
                 "warm_exec_us": r.warm_exec.pct(50.0).map(|ms| ms * 1e3),
                 "infura_first": r.infura_first.json(),
                 "infura_warm": r.infura_warm.json(),
@@ -498,5 +535,89 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         "peers": sched.peer_stats().into_iter().map(|(id, p)| (format!("{id:.8}"), p)).collect::<HashMap<_, _>>(),
     });
     println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
+}
+
+// ---------- peer-count sweep (probe-wave) ----------
+
+#[derive(clap::Args)]
+pub struct WaveArgs {
+    #[arg(long, default_value_t = 5)]
+    iterations: usize,
+    /// Peer counts to compare (0 = all available).
+    #[arg(long, value_delimiter = ',', default_value = "1,2,4,0")]
+    sweep: Vec<usize>,
+    #[arg(long, default_value_t = 4)]
+    min_snap_peers: usize,
+    #[arg(long, default_value_t = 8)]
+    per_peer_inflight: usize,
+    #[arg(long, default_value_t = 30393)]
+    port: u16,
+}
+
+/// Learns the access set of a large call once, then at each new head fetches that same wave
+/// with schedulers limited to N peers, all over the same live peer pool.
+pub async fn run_wave(args: WaveArgs) -> anyhow::Result<()> {
+    let net = ElNet::start_sepolia(args.port, Vec::new(), false).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let snap_peers = |net: &ElNet| net.peers().iter().filter(|(_, p)| p.snap2 || p.snap1).count();
+    while snap_peers(&net) < args.min_snap_peers || net.head().is_none() {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let call = calls().into_iter().find(|c| c.name.starts_with("v3_single 100")).unwrap();
+    let full = Scheduler::new(ElTransport(net.clone()), skim_snap::Config::default());
+    let h = net.head().unwrap();
+    let mut st = Sparse::default();
+    let learned = cold_run(&full, &h, &call, &mut st, None).await?.access;
+    let n_keys = learned.accounts.len() + learned.storage.len();
+    tracing::info!(keys = n_keys, "wave key set learned");
+
+    let mut results: HashMap<usize, (Samples, u64, u64)> = HashMap::new(); // wall, ok, failed
+    let mut last = h.number;
+    for it in 0..args.iterations {
+        let h = loop {
+            if let Some(h) = net.head().filter(|h| h.number > last) {
+                break h;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        last = h.number;
+        let mut keys: Vec<Key> =
+            learned.accounts.iter().map(|&address| Key::Account { root: h.state_root, address }).collect();
+        keys.extend(learned.storage.iter().map(|&(address, slot)| Key::Storage { root: h.state_root, address, slot }));
+        for &n in &args.sweep {
+            let sched = Scheduler::new(
+                ElTransport(net.clone()),
+                skim_snap::Config {
+                    per_peer_inflight: args.per_peer_inflight,
+                    max_peers: (n > 0).then_some(n),
+                    deadline: Duration::from_secs(60),
+                    ..Default::default()
+                },
+            );
+            // Let the fresh scheduler measure peers briefly so `max_peers` picks fast ones.
+            let warm: Vec<Key> = keys.iter().take(16).copied().collect();
+            let _ = sched.fetch(&warm).await;
+            let t = Instant::now();
+            let r = sched.fetch(&keys).await;
+            let wall = t.elapsed();
+            let ok = r.iter().filter(|x| x.is_ok()).count() as u64;
+            let e = results.entry(n).or_insert_with(|| (Samples::default(), 0, 0));
+            e.0.push(wall);
+            e.1 += ok;
+            e.2 += r.len() as u64 - ok;
+            tracing::info!(iteration = it, peers = n, live = snap_peers(&net), keys = keys.len(), ok,
+                ms = wall.as_millis() as u64, keys_per_s = (keys.len() as f64 / wall.as_secs_f64()) as u64, "wave");
+        }
+    }
+    let out: Vec<_> = args
+        .sweep
+        .iter()
+        .map(|n| {
+            let (w, ok, failed) = &results[n];
+            serde_json::json!({"max_peers": n, "wave_keys": n_keys, "wall": w.json(), "ok": ok, "failed": failed,
+                "keys_per_s_p50": w.pct(50.0).map(|ms| n_keys as f64 / (ms / 1e3))})
+        })
+        .collect();
+    println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(())
 }

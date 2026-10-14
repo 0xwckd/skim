@@ -127,6 +127,8 @@ pub struct Config {
     pub code_batch: usize,
     /// Empty-without-proof answers from this many distinct peers resolve a slot as zero.
     pub empty_quorum: u32,
+    /// Use only the N peers with the best latency (experiments; `None` = all).
+    pub max_peers: Option<usize>,
 }
 
 impl Default for Config {
@@ -138,6 +140,7 @@ impl Default for Config {
             deadline: Duration::from_secs(15),
             code_batch: 32,
             empty_quorum: 2,
+            max_peers: None,
         }
     }
 }
@@ -173,6 +176,7 @@ struct Job {
     tried: HashSet<PeerId>,
     empty_answers: HashSet<PeerId>,
     created: Instant,
+    first_sent: Option<Instant>,
     last_sent: Option<Instant>,
     hedged: bool,
     queued: bool,
@@ -286,6 +290,7 @@ impl<T: Transport> Inner<T> {
                 tried: HashSet::new(),
                 empty_answers: HashSet::new(),
                 created: Instant::now(),
+                first_sent: None,
                 last_sent: None,
                 hedged: false,
                 queued: true,
@@ -319,8 +324,14 @@ impl<T: Transport> Inner<T> {
 
     fn pick_peer(&self, st: &State, key: &Key, job: &Job) -> Option<PeerId> {
         let root = key.root();
+        let allowed: Option<HashSet<PeerId>> = self.cfg.max_peers.map(|n| {
+            let mut v: Vec<_> = st.peers.iter().map(|(id, p)| (*id, p.ewma_ms.unwrap_or(300.0))).collect();
+            v.sort_by(|a, b| a.1.total_cmp(&b.1));
+            v.into_iter().take(n).map(|(id, _)| id).collect()
+        });
         let eligible = |(id, p): &(&PeerId, &Peer)| {
-            p.inflight < self.cfg.per_peer_inflight
+            allowed.as_ref().is_none_or(|a| a.contains(*id))
+                && p.inflight < self.cfg.per_peer_inflight
                 && root.is_none_or(|r| p.unavailable_roots.get(&r).is_none_or(|t| t.elapsed() > ROOT_RETRY))
                 && !job.empty_answers.contains(*id)
         };
@@ -350,7 +361,13 @@ impl<T: Transport> Inner<T> {
         let mut expired = Vec::new();
         let mut hedge = Vec::new();
         for (k, j) in &st.jobs {
-            if now.duration_since(j.created) > self.cfg.deadline {
+            // Waiting for peer capacity is not failure: the deadline runs from the first send,
+            // or from creation only while there are no peers at all.
+            let overdue = match j.first_sent {
+                Some(t) => now.duration_since(t) > self.cfg.deadline,
+                None => st.peers.is_empty() && now.duration_since(j.created) > self.cfg.deadline,
+            };
+            if overdue {
                 expired.push(*k);
             } else if j.inflight == 1
                 && !j.hedged
@@ -399,6 +416,7 @@ impl<T: Transport> Inner<T> {
                 j.inflight += 1;
                 j.attempts += 1;
                 j.tried.insert(peer);
+                j.first_sent.get_or_insert_with(Instant::now);
                 j.last_sent = Some(Instant::now());
             }
             st.peers.get_mut(&peer).unwrap().inflight += 1;

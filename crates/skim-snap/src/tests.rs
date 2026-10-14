@@ -179,3 +179,12 @@ async fn waits_for_peers_then_deadline() {
     let s = Scheduler::new(m, Config { deadline: Duration::from_millis(200), ..cfg() });
     assert_eq!(s.fetch(&[slot(1)]).await[0], Err(FetchError::Deadline));
 }
+
+#[tokio::test]
+async fn queueing_for_capacity_is_not_a_deadline() {
+    // 40 keys, one peer, 2 in flight, 50 ms each: ~1 s of queueing against a 300 ms deadline.
+    let m = Mock::new(&[(1, Behav::Ok { ms: 50 })]);
+    let s = Scheduler::new(m, Config { per_peer_inflight: 2, deadline: Duration::from_millis(300), ..cfg() });
+    let keys: Vec<_> = (0..40).map(slot).collect();
+    assert!(s.fetch(&keys).await.iter().all(|x| x.is_ok()));
+}

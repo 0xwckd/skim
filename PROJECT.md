@@ -103,6 +103,7 @@ Consequences for skim:
   3. Check that `payload.block_hash` equals the bid's `block_hash` committed in the beacon block.
 
   This ties the BAL to a builder-signed bid inside a proposer-signed block, even before skim verifies any signatures.
+- **Measured (Lighthouse, 1,348 slots):** envelopes arrive P50 764 ms / P95 2.7 s after slot start. That is about 0.9 s earlier than skim's EL path (header poll + eth/71 BAL) and about 0.3–0.5 s before public EL nodes serve the header.
 - **ePBS separates three stages:** block commitment, payload reveal and payload status (full or empty). A received payload is only a *candidate* until the chain tracker selects it.
 - Joining CL gossip requires discv5 with eth2 ENRs (correct fork digest), libp2p gossipsub, and Status/Metadata/Ping request-response. A listen-only node may get scored down or dropped. M0 measures this.
 
@@ -359,6 +360,16 @@ REVM's `Database` is synchronous, so network I/O never happens inside it. A `Res
 - optionally, input bucketing (e.g. by amount magnitude)
 
 Misses beyond the predicted set are fetched in later rounds.
+
+**Measured policy (`docs/m0-round2.md`):**
+- exact-input set first
+- otherwise core keys (≥ 50% of the shape's last 8 runs, cap 256)
+
+Result: repeated inputs run at k=1, and new inputs of a known shape at k=2.
+
+**Throughput model:** a wave's speed is about Σ (in-flight_i / RTT_i) over serving peers (measured: 42 keys/s with one ~190 ms peer; 169 keys/s once a ~47 ms peer joined). Per-peer concurrency should adapt (AIMD) so that fast peers carry more of the load.
+
+**Dedicated peer:** serving costs 0.36 ms per lookup (local Nethermind). With a co-located snap peer, even k=8 cold calls finish in under 10 ms, so cold fetch fits on the live path. On public peers, cold fetch remains a k=1 game.
 
 **Sharing:** everything fetched joins the shared MVCC store. A second simulation touching the same contracts runs warm. Values learned from BAL writes are known without any SNAP request.
 
