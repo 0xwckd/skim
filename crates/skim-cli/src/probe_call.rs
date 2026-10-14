@@ -553,6 +553,9 @@ pub struct WaveArgs {
     per_peer_inflight: usize,
     #[arg(long, default_value_t = 30393)]
     port: u16,
+    /// Concurrency modes to compare for each peer count: fixed cap and/or AIMD.
+    #[arg(long, value_delimiter = ',', default_value = "fixed,aimd")]
+    modes: Vec<String>,
 }
 
 /// Learns the access set of a large call once, then at each new head fetches that same wave
@@ -571,7 +574,7 @@ pub async fn run_wave(args: WaveArgs) -> anyhow::Result<()> {
     let n_keys = learned.accounts.len() + learned.storage.len();
     tracing::info!(keys = n_keys, "wave key set learned");
 
-    let mut results: HashMap<usize, (Samples, u64, u64)> = HashMap::new(); // wall, ok, failed
+    let mut results: HashMap<(usize, String), (Samples, u64, u64)> = HashMap::new(); // wall, ok, failed
     let mut last = h.number;
     for it in 0..args.iterations {
         let h = loop {
@@ -584,11 +587,12 @@ pub async fn run_wave(args: WaveArgs) -> anyhow::Result<()> {
         let mut keys: Vec<Key> =
             learned.accounts.iter().map(|&address| Key::Account { root: h.state_root, address }).collect();
         keys.extend(learned.storage.iter().map(|&(address, slot)| Key::Storage { root: h.state_root, address, slot }));
-        for &n in &args.sweep {
+        for (&n, mode) in args.sweep.iter().flat_map(|n| args.modes.iter().map(move |m| (n, m))) {
             let sched = Scheduler::new(
                 ElTransport(net.clone()),
                 skim_snap::Config {
                     per_peer_inflight: args.per_peer_inflight,
+                    adaptive: mode == "aimd",
                     max_peers: (n > 0).then_some(n),
                     deadline: Duration::from_secs(60),
                     ..Default::default()
@@ -601,20 +605,21 @@ pub async fn run_wave(args: WaveArgs) -> anyhow::Result<()> {
             let r = sched.fetch(&keys).await;
             let wall = t.elapsed();
             let ok = r.iter().filter(|x| x.is_ok()).count() as u64;
-            let e = results.entry(n).or_insert_with(|| (Samples::default(), 0, 0));
+            let e = results.entry((n, mode.clone())).or_insert_with(|| (Samples::default(), 0, 0));
             e.0.push(wall);
             e.1 += ok;
             e.2 += r.len() as u64 - ok;
-            tracing::info!(iteration = it, peers = n, live = snap_peers(&net), keys = keys.len(), ok,
+            tracing::info!(iteration = it, peers = n, %mode, live = snap_peers(&net), keys = keys.len(), ok,
                 ms = wall.as_millis() as u64, keys_per_s = (keys.len() as f64 / wall.as_secs_f64()) as u64, "wave");
         }
     }
-    let out: Vec<_> = args
-        .sweep
+    let mut keys_sorted: Vec<_> = results.keys().cloned().collect();
+    keys_sorted.sort();
+    let out: Vec<_> = keys_sorted
         .iter()
-        .map(|n| {
-            let (w, ok, failed) = &results[n];
-            serde_json::json!({"max_peers": n, "wave_keys": n_keys, "wall": w.json(), "ok": ok, "failed": failed,
+        .map(|k| {
+            let (w, ok, failed) = &results[k];
+            serde_json::json!({"max_peers": k.0, "mode": k.1, "wave_keys": n_keys, "wall": w.json(), "ok": ok, "failed": failed,
                 "keys_per_s_p50": w.pct(50.0).map(|ms| n_keys as f64 / (ms / 1e3))})
         })
         .collect();

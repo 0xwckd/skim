@@ -119,7 +119,11 @@ pub trait Transport: Clone + Send + Sync + 'static {
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Fixed per-peer in-flight cap when `adaptive` is off; the starting cap when it is on.
     pub per_peer_inflight: usize,
+    /// AIMD per-peer concurrency: grow on fast answers, shrink on latency inflation or errors.
+    pub adaptive: bool,
+    pub inflight_max: usize,
     pub max_attempts: u32,
     /// Send one duplicate to another peer if no answer after this long.
     pub hedge_after: Duration,
@@ -135,6 +139,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             per_peer_inflight: 8,
+            adaptive: true,
+            inflight_max: 48,
             max_attempts: 8,
             hedge_after: Duration::from_millis(1200),
             deadline: Duration::from_secs(15),
@@ -163,6 +169,8 @@ pub struct Stats {
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct PeerStats {
+    pub limit: f64,
+    pub min_ms: f64,
     pub ok: u64,
     pub errors: u64,
     pub ewma_ms: f64,
@@ -185,6 +193,9 @@ struct Job {
 #[derive(Default)]
 struct Peer {
     inflight: usize,
+    /// AIMD concurrency limit (0 = not initialized yet).
+    limit: f64,
+    min_ms: Option<f64>,
     ewma_ms: Option<f64>,
     ok: u64,
     errors: u64,
@@ -196,6 +207,35 @@ struct Peer {
 const ROOT_RETRY: Duration = Duration::from_millis(400);
 
 impl Peer {
+    fn cap(&self, cfg: &Config) -> usize {
+        if cfg.adaptive && self.limit > 0.0 { self.limit.floor().max(1.0) as usize } else { cfg.per_peer_inflight }
+    }
+
+    /// Additive increase on answers near this peer's best latency; multiplicative decrease on
+    /// latency inflation (queueing at the peer) and on errors.
+    fn on_answer(&mut self, cfg: &Config, ms: f64) {
+        if !cfg.adaptive {
+            return;
+        }
+        if self.limit == 0.0 {
+            self.limit = cfg.per_peer_inflight as f64;
+        }
+        let min = self.min_ms.map_or(ms, |m| m.min(ms));
+        self.min_ms = Some(min);
+        if ms <= 2.0 * min + 25.0 {
+            self.limit = (self.limit + 1.0 / self.limit).min(cfg.inflight_max as f64);
+        } else if ms > 4.0 * min + 100.0 {
+            self.limit = (self.limit * 0.7).max(1.0);
+        }
+    }
+
+    fn on_error(&mut self, cfg: &Config) {
+        if cfg.adaptive {
+            let cur = if self.limit == 0.0 { cfg.per_peer_inflight as f64 } else { self.limit };
+            self.limit = (cur * 0.5).max(1.0);
+        }
+    }
+
     fn score(&self) -> f64 {
         // Unmeasured peers look average-fast so they get tried.
         self.ewma_ms.unwrap_or(300.0) * (1.0 + self.inflight as f64)
@@ -267,7 +307,14 @@ impl<T: Transport> Scheduler<T> {
             .peers
             .iter()
             .map(|(id, p)| {
-                (*id, PeerStats { ok: p.ok, errors: p.errors, ewma_ms: p.ewma_ms.unwrap_or(0.0), inflight: p.inflight })
+                (*id, PeerStats {
+                    limit: p.limit,
+                    min_ms: p.min_ms.unwrap_or(0.0),
+                    ok: p.ok,
+                    errors: p.errors,
+                    ewma_ms: p.ewma_ms.unwrap_or(0.0),
+                    inflight: p.inflight,
+                })
             })
             .collect()
     }
@@ -331,7 +378,7 @@ impl<T: Transport> Inner<T> {
         });
         let eligible = |(id, p): &(&PeerId, &Peer)| {
             allowed.as_ref().is_none_or(|a| a.contains(*id))
-                && p.inflight < self.cfg.per_peer_inflight
+                && p.inflight < p.cap(&self.cfg)
                 && root.is_none_or(|r| p.unavailable_roots.get(&r).is_none_or(|t| t.elapsed() > ROOT_RETRY))
                 && !job.empty_answers.contains(*id)
         };
@@ -475,6 +522,7 @@ impl<T: Transport> Inner<T> {
             Outcome::Values(values) => {
                 st.stats.ok += 1;
                 if let Some(p) = st.peers.get_mut(&peer) {
+                    p.on_answer(&self.cfg, elapsed_ms);
                     p.ok += 1;
                     p.ewma_ms = Some(p.ewma_ms.map_or(elapsed_ms, |e| 0.8 * e + 0.2 * elapsed_ms));
                 }
@@ -524,6 +572,7 @@ impl<T: Transport> Inner<T> {
                     st.stats.errors += 1;
                 }
                 if let Some(p) = st.peers.get_mut(&peer) {
+                    p.on_error(&self.cfg);
                     p.errors += 1;
                     // Penalize slow/failing peers so placement drifts away from them.
                     p.ewma_ms = Some(p.ewma_ms.unwrap_or(300.0) * 1.5);

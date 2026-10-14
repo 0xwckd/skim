@@ -122,7 +122,7 @@ async fn disconnect_requeues_to_other_peer() {
 #[tokio::test]
 async fn respects_per_peer_inflight_cap() {
     let m = Mock::new(&[(1, Behav::Ok { ms: 20 }), (2, Behav::Ok { ms: 20 })]);
-    let s = Scheduler::new(m.clone(), Config { per_peer_inflight: 4, ..cfg() });
+    let s = Scheduler::new(m.clone(), Config { per_peer_inflight: 4, adaptive: false, ..cfg() });
     let keys: Vec<_> = (0..64).map(slot).collect();
     assert!(s.fetch(&keys).await.iter().all(|x| x.is_ok()));
     for (_, (_, max)) in m.inflight.lock().iter() {
@@ -184,7 +184,44 @@ async fn waits_for_peers_then_deadline() {
 async fn queueing_for_capacity_is_not_a_deadline() {
     // 40 keys, one peer, 2 in flight, 50 ms each: ~1 s of queueing against a 300 ms deadline.
     let m = Mock::new(&[(1, Behav::Ok { ms: 50 })]);
-    let s = Scheduler::new(m, Config { per_peer_inflight: 2, deadline: Duration::from_millis(300), ..cfg() });
+    let s = Scheduler::new(m, Config { per_peer_inflight: 2, adaptive: false, deadline: Duration::from_millis(300), ..cfg() });
     let keys: Vec<_> = (0..40).map(slot).collect();
     assert!(s.fetch(&keys).await.iter().all(|x| x.is_ok()));
+}
+
+#[tokio::test]
+async fn aimd_gives_fast_peers_more_concurrency() {
+    let m = Mock::new(&[(1, Behav::Ok { ms: 5 }), (2, Behav::Ok { ms: 120 })]);
+    let s = Scheduler::new(m.clone(), Config { per_peer_inflight: 4, inflight_max: 32, ..cfg() });
+    let keys: Vec<_> = (0..600).map(slot).collect();
+    let t = Instant::now();
+    assert!(s.fetch(&keys).await.iter().all(|x| x.is_ok()));
+    let ps = s.peer_stats();
+    let (fast, slow) = (&ps[&pid(1)], &ps[&pid(2)]);
+    assert!(fast.limit > slow.limit + 4.0, "fast {} slow {}", fast.limit, slow.limit);
+    assert!(fast.ok > 5 * slow.ok, "fast {} slow {}", fast.ok, slow.ok);
+    // Fixed cap 4 on both would take >= 600 / (4/5ms + 4/120ms) ~ 0.72 s.
+    assert!(t.elapsed() < Duration::from_millis(700), "took {:?}", t.elapsed());
+}
+
+#[test]
+fn aimd_rules() {
+    let c = Config { per_peer_inflight: 8, inflight_max: 16, ..cfg() };
+    let mut p = Peer::default();
+    p.on_answer(&c, 50.0); // initializes at 8, min 50
+    assert!(p.limit > 8.0);
+    for _ in 0..500 {
+        p.on_answer(&c, 55.0);
+    }
+    assert_eq!(p.limit, 16.0); // capped
+    p.on_answer(&c, 400.0); // > 4x min + 100: queueing at the peer
+    assert!((p.limit - 11.2).abs() < 1e-9);
+    p.on_error(&c);
+    assert!((p.limit - 5.6).abs() < 1e-9);
+    for _ in 0..10 {
+        p.on_error(&c);
+    }
+    assert_eq!(p.limit, 1.0);
+    assert_eq!(p.cap(&c), 1);
+    assert_eq!(Peer::default().cap(&Config { adaptive: false, ..c }), 8);
 }
