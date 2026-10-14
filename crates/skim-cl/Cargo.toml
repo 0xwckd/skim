@@ -1,0 +1,24 @@
+[package]
+name = "skim-cl"
+description = "Minimal Ethereum CL gossip listener: discv5 + libp2p gossipsub/req-resp, Gloas envelope parsing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+alloy-primitives.workspace = true
+alloy-rlp.workspace = true
+alloy-consensus.workspace = true
+skim-bal.workspace = true
+tokio.workspace = true
+futures.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+libp2p = { version = "=0.57.0", default-features = false, features = ["tokio", "tcp", "noise", "yamux", "quic", "gossipsub", "identify", "request-response", "secp256k1", "macros"] }
+discv5 = "=0.12.0"
+enr = { version = "0.14.0", features = ["k256"] }
+snap = "1.1.2"
+sha2 = "0.10.9"
