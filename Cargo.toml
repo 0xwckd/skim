@@ -1,0 +1,48 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+# Pinned to the versions reth v2.7.0 uses, so one alloy/revm graph is shared with reth crates.
+alloy-primitives = { version = "1.6.1", features = ["serde"] }
+alloy-rlp = "0.3.16"
+alloy-eip7928 = { version = "0.4.10", features = ["rlp"] }
+alloy-consensus = "2.5.0"
+
+reth-network = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-eth-wire = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-network-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-eth-wire-types = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-network-peers = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-storage-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-tasks = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-dns-discovery = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+parking_lot = "0.12"
+revm = { version = "43.0.3", default-features = false, features = ["std", "dev", "optional_fee_charge"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+skim-bal = { path = "crates/skim-bal" }
+skim-el = { path = "crates/skim-el" }
+skim-snap = { path = "crates/skim-snap" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

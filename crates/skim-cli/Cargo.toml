@@ -1,0 +1,32 @@
+[package]
+name = "skim-cli"
+description = "skim command line: M0 probes, later run/status/watch/call/bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "skim"
+path = "src/main.rs"
+
+[dependencies]
+skim-bal.workspace = true
+skim-el.workspace = true
+alloy-primitives.workspace = true
+alloy-consensus.workspace = true
+alloy-rlp.workspace = true
+reth-eth-wire-types.workspace = true
+tokio.workspace = true
+futures.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+parking_lot.workspace = true
+revm.workspace = true
+reqwest.workspace = true
+skim-snap.workspace = true
