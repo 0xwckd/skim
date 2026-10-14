@@ -104,6 +104,13 @@ Consequences for skim:
 
   This ties the BAL to a builder-signed bid inside a proposer-signed block, even before skim verifies any signatures.
 - **Measured (Lighthouse, 1,348 slots):** envelopes arrive P50 764 ms / P95 2.7 s after slot start. That is about 0.9 s earlier than skim's EL path (header poll + eth/71 BAL) and about 0.3–0.5 s before public EL nodes serve the header.
+- **Own listener works (`skim-cl`, `skim probe-cl`, `docs/m0-spike-a.md`).** It uses libp2p 0.57 + discv5 and a hand-written envelope parser. Over 139 slots:
+  - envelope P50 823 ms / P95 2.7 s (about 0.1–0.2 s behind Lighthouse's post-validation log)
+  - EL header rebuilt from the payload, hash equal to `block_hash` in 139/139
+  - bid link 138/138
+  - about 0.3 ms per envelope
+
+  Open risks: a small `execution_payload` mesh, no inbound peers (ENR without IP), advertised data-column custody that isn't served, no BLS checks.
 - **ePBS separates three stages:** block commitment, payload reveal and payload status (full or empty). A received payload is only a *candidate* until the chain tracker selects it.
 - Joining CL gossip requires discv5 with eth2 ENRs (correct fork digest), libp2p gossipsub, and Status/Metadata/Ping request-response. A listen-only node may get scored down or dropped. M0 measures this.
 
