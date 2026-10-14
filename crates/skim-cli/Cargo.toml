@@ -30,4 +30,5 @@ parking_lot.workspace = true
 revm.workspace = true
 reqwest.workspace = true
 skim-snap.workspace = true
+skim-state.workspace = true
 skim-cl.workspace = true

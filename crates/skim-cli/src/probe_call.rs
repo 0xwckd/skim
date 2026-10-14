@@ -97,13 +97,13 @@ const QUOTER: Address = address!("Ed1f6473345F45b75F8179591dd5bA1888cf2FB3");
 const WETH: Address = address!("fFf9976782d46CC05630D1f6eBAb18b2324d6B14");
 const USDC: Address = address!("1c7D4B196Cb0C7B01d743Fbc6116a902379C7238");
 
-struct Call {
-    name: String,
-    to: Address,
-    data: Bytes,
+pub(crate) struct Call {
+    pub(crate) name: String,
+    pub(crate) to: Address,
+    pub(crate) data: Bytes,
 }
 
-fn calls() -> Vec<Call> {
+pub(crate) fn calls() -> Vec<Call> {
     let pad = |h: &str| format!("{h:0>64}");
     let w = "fff9976782d46cc05630d1f6ebab18b2324d6b14";
     let u = "1c7d4b196cb0c7b01d743fbc6116a902379c7238";
@@ -130,17 +130,17 @@ fn calls() -> Vec<Call> {
 // ---------- sparse state + recording database ----------
 
 #[derive(Default)]
-struct Sparse {
-    accounts: HashMap<Address, Option<AccountInfo>>,
-    storage: HashMap<(Address, U256), U256>,
-    code: HashMap<B256, Bytecode>,
+pub(crate) struct Sparse {
+    pub(crate) accounts: HashMap<Address, Option<AccountInfo>>,
+    pub(crate) storage: HashMap<(Address, U256), U256>,
+    pub(crate) code: HashMap<B256, Bytecode>,
 }
 
 #[derive(Default)]
-struct Misses {
-    accounts: HashSet<Address>,
-    storage: HashSet<(Address, U256)>,
-    code: HashSet<B256>,
+pub(crate) struct Misses {
+    pub(crate) accounts: HashSet<Address>,
+    pub(crate) storage: HashSet<(Address, U256)>,
+    pub(crate) code: HashSet<B256>,
 }
 
 impl Misses {
@@ -198,7 +198,7 @@ impl DatabaseRef for Recorder<'_> {
     }
 }
 
-fn block_env(h: &Header) -> BlockEnv {
+pub(crate) fn block_env(h: &Header) -> BlockEnv {
     BlockEnv {
         number: U256::from(h.number),
         beneficiary: h.beneficiary,
@@ -248,7 +248,7 @@ fn execute(st: &Sparse, h: &Header, to: Address, data: &Bytes) -> (Option<Bytes>
 // ---------- fetch waves through the scheduler ----------
 
 #[derive(Default, Clone, Copy)]
-struct RoundCost {
+pub(crate) struct RoundCost {
     keys: usize,
     rtts: usize,
 }
@@ -305,15 +305,15 @@ async fn resolve_round(
     Ok(RoundCost { keys: n, rtts })
 }
 
-struct ColdRun {
-    output: Option<Bytes>,
-    rounds: Vec<RoundCost>,
+pub(crate) struct ColdRun {
+    pub(crate) output: Option<Bytes>,
+    pub(crate) rounds: Vec<RoundCost>,
     wall: Duration,
-    access: Misses,
+    pub(crate) access: Misses,
 }
 
 /// `hints`: a learned access set for this call shape, fetched as round 1.
-async fn cold_run(
+pub(crate) async fn cold_run(
     sched: &Scheduler<ElTransport>,
     h: &Header,
     call: &Call,
@@ -350,7 +350,7 @@ async fn infura_call(client: &reqwest::Client, url: &str, hash: B256, to: Addres
     Ok((alloy_primitives::hex::decode(r)?.into(), took))
 }
 
-fn infura_url() -> anyhow::Result<String> {
+pub(crate) fn infura_url() -> anyhow::Result<String> {
     if let Ok(u) = std::env::var("INFURA_SEPOLIA_URL") {
         return Ok(u);
     }

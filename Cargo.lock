@@ -7273,6 +7273,7 @@ dependencies = [
  "skim-cl",
  "skim-el",
  "skim-snap",
+ "skim-state",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -7315,6 +7316,17 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "skim-state"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "parking_lot",
+ "skim-bal",
+ "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]

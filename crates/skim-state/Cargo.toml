@@ -1,0 +1,15 @@
+[package]
+name = "skim-state"
+description = "Per-key MVCC state store driven by block access lists"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+skim-bal.workspace = true
+alloy-primitives.workspace = true
+parking_lot.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
