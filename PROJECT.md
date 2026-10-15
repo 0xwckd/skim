@@ -465,6 +465,22 @@ state:
 - **Limits are hard.** A subscription that would exceed `max_subscribed_keys` is rejected or truncated, and the condition is reported.
 - The learned access set and protocol predictors (§7.2) become the **auto-configuration layer** for subscriptions, not a separate mode.
 
+## 7.6 M4: selective state archiving (planned)
+
+> Sync and archive only what you need.
+
+`retention: archive` on a subscription persists every version of its keys instead of collapsing old versions. BALs carry absolute post-values, so storing the initial value plus each changed version is enough to answer any later block:
+
+```text
+(slot X, block 100) -> 10      # SNAP base when subscribed
+(slot X, block 102) -> 20      # BAL write; blocks 101 and 103 store nothing
+```
+
+- **Coverage is explicit.** Each key records the first block where its value is known: the subscription start, or the block a late-discovered slot was fetched. A historical read before that block is `-32002`, never a guess. SNAP cannot reliably serve arbitrary old roots (about 128 recent roots).
+- **Bounded backfill from retained BALs.** eth/71 peers keep BALs for the weak-subjectivity period (~2 weeks). For a key written in that window, its value is known from its earliest retained write onward: a write at W fixes the value on [W, next write). Before the first write, the pre-value isn't in any BAL, so it stays uncovered.
+- **Historical execution context.** A historical `eth_call` needs that block's header, code by hash (immutable, already content-addressed), and BLOCKHASH history. It succeeds only if every key the call reads is covered at that block; otherwise it returns `-32002` listing the uncovered keys.
+- **Separate storage.** The archive is an append-only on-disk index keyed by `(key, block)`, separate from the in-memory MVCC hot set and from the on-demand TTL cache. Archive data is never evicted by default; the cache evicts aggressively.
+
 ## 8. Trust model
 **Checked (cheap):**
 - header parent links
