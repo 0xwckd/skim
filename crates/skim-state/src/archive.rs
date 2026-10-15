@@ -39,6 +39,10 @@ const JOURNAL: TableDefinition<u64, &[u8]> = TableDefinition::new("journal");
 /// Keys whose coverage starts at a BAL **write** (not a base): the value before that write is in
 /// no BAL, so their history can never be extended backwards.
 const WRITE_BOUND: TableDefinition<&[u8; K], ()> = TableDefinition::new("write_bound");
+/// Keys whose coverage-start block is known not to write them (a backfill scanned it), so the
+/// value there also held just before it. A plain base is a post-state: the base block itself
+/// may have changed the key, so extending backwards needs that block's BAL.
+const PRE_CLEAN: TableDefinition<&[u8; K], ()> = TableDefinition::new("pre_clean");
 /// Segments: first block -> last block (inclusive) of each run of consecutive processed blocks.
 const SEGMENTS: TableDefinition<u64, u64> = TableDefinition::new("segments");
 
@@ -60,6 +64,8 @@ db_err!(redb::DatabaseError, redb::TransactionError, redb::TableError, redb::Sto
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveRead {
     Value(U256),
+    /// The archive's block at that height is not the one asked for (a reorg replaced it).
+    OtherFork,
     /// Not answerable at this block. `from` is where this key's coverage starts, if anywhere.
     NotCovered { from: Option<u64> },
 }
@@ -139,6 +145,7 @@ impl Archive {
         tx.open_table(JOURNAL)?;
         tx.open_table(SEGMENTS)?;
         tx.open_table(WRITE_BOUND)?;
+        tx.open_table(PRE_CLEAN)?;
         tx.commit()?;
         Ok(Self { db })
     }
@@ -235,6 +242,7 @@ impl Archive {
             if cur.is_none_or(|c| b.number < c) {
                 cov.insert(&ek, b.number)?;
                 tx.open_table(WRITE_BOUND)?.insert(&ek, ())?;
+                tx.open_table(PRE_CLEAN)?.remove(&ek)?;
             }
             journal.extend_from_slice(&ek);
         }
@@ -324,6 +332,7 @@ impl Archive {
             let mut versions = tx.open_table(VERSIONS)?;
             let mut cov = tx.open_table(COVERAGE)?;
             let mut wb = tx.open_table(WRITE_BOUND)?;
+            let mut clean = tx.open_table(PRE_CLEAN)?;
             for (k, c, extendable) in covs {
                 if c <= from {
                     continue;
@@ -333,16 +342,28 @@ impl Archive {
                     report.keys_write_bound += 1;
                     continue;
                 }
-                if c > scan_end + 1 {
-                    report.keys_unscanned += 1;
+                let ek = encode_key(&k);
+                // Did block c itself write k? From its BAL if scanned, else only if an earlier
+                // backfill proved c clean. Unknown -> can't extend this time.
+                let writes_k = |b: &ArchiveBlock<'_>| b.writes.iter().find(|(wk, _)| *wk == k).map(|(_, v)| *v);
+                let wrote_at_c = match blocks.iter().find(|b| b.number == c) {
+                    Some(b) => writes_k(b).is_some(),
+                    None if clean.get(&ek)?.is_some() && c <= scan_end + 1 => false,
+                    None => {
+                        report.keys_unscanned += 1;
+                        continue;
+                    }
+                };
+                let writes: Vec<(u64, U256)> =
+                    blocks.iter().filter(|b| b.number < c).filter_map(|b| writes_k(b).map(|v| (b.number, v))).collect();
+                if writes.is_empty() && wrote_at_c {
+                    // The base is block c's post-state and c changed it: the earlier value is in
+                    // no BAL we have. Coverage stays at c, and can never be extended.
+                    wb.insert(&ek, ())?;
+                    clean.remove(&ek)?;
+                    report.keys_write_bound += 1;
                     continue;
                 }
-                let ek = encode_key(&k);
-                let writes: Vec<(u64, U256)> = blocks
-                    .iter()
-                    .filter(|b| b.number < c)
-                    .filter_map(|b| b.writes.iter().find(|(wk, _)| *wk == k).map(|(_, v)| (b.number, *v)))
-                    .collect();
                 if writes.is_empty() {
                     let at_c = versions.get(&vkey(&ek, c))?.map(|g| *g.value());
                     let Some(v) = at_c else {
@@ -352,6 +373,7 @@ impl Archive {
                     versions.insert(&vkey(&ek, from), &v)?;
                     Self::journal_add(&tx, from, &ek)?;
                     cov.insert(&ek, from)?;
+                    clean.insert(&ek, ())?; // `from` was scanned and doesn't write k
                     report.keys_unchanged += 1;
                 } else {
                     for (n, v) in &writes {
@@ -360,6 +382,7 @@ impl Archive {
                     }
                     cov.insert(&ek, writes[0].0)?;
                     wb.insert(&ek, ())?;
+                    clean.remove(&ek)?;
                     report.keys_written += 1;
                 }
             }
@@ -431,6 +454,7 @@ impl Archive {
             if cur.is_none_or(|c| block < c) {
                 cov.insert(&ek, block)?;
                 tx.open_table(WRITE_BOUND)?.remove(&ek)?;
+                tx.open_table(PRE_CLEAN)?.remove(&ek)?;
             }
             tx.open_table(ARCHIVED)?.insert(&ek, ())?;
         }
@@ -520,8 +544,23 @@ impl Archive {
 
     /// The value of `key` at block `number`, if the archive covers it.
     pub fn get(&self, key: &StateKey, number: u64) -> Result<ArchiveRead, ArchiveError> {
+        self.read(key, number, None)
+    }
+
+    /// [`Self::get`] for a specific block: the hash check and the value come from the same read
+    /// transaction, so a reorg can't slip between them.
+    pub fn get_at(&self, key: &StateKey, number: u64, hash: B256) -> Result<ArchiveRead, ArchiveError> {
+        self.read(key, number, Some(hash))
+    }
+
+    fn read(&self, key: &StateKey, number: u64, expect: Option<B256>) -> Result<ArchiveRead, ArchiveError> {
         let ek = encode_key(key);
         let tx = self.db.begin_read()?;
+        if let Some(h) = expect
+            && tx.open_table(HASHES)?.get(number)?.map(|g| B256::from(*g.value())) != Some(h)
+        {
+            return Ok(ArchiveRead::OtherFork);
+        }
         let from = tx.open_table(COVERAGE)?.get(&ek)?.map(|g| g.value());
         let in_segment = {
             let seg = tx.open_table(SEGMENTS)?;
@@ -568,7 +607,7 @@ mod tests {
     fn val(a: &Archive, k: StateKey, n: u64) -> Option<u64> {
         match a.get(&k, n).unwrap() {
             ArchiveRead::Value(v) => Some(v.to()),
-            ArchiveRead::NotCovered { .. } => None,
+            ArchiveRead::NotCovered { .. } | ArchiveRead::OtherFork => None,
         }
     }
 
@@ -652,10 +691,11 @@ mod tests {
             blk(&a, n, &[]);
         }
         a.write_base(&slot(3), 103, U256::from(30), &[]).unwrap();
-        // Scan BALs 90..=102: slot 2 written at 95 (=21) and 97 (=20); slot 3 written at 101 (=30).
+        // Scan BALs 90..=103 (through slot 3's base block): slot 2 written at 95 (=21) and 97
+        // (=20); slot 3 written at 101 (=30).
         let (w95, w97, w101) = ([(slot(2), U256::from(21))], [(slot(2), U256::from(20))], [(slot(3), U256::from(30))]);
-        let hashes: Vec<B256> = (90..=102u64).map(|n| B256::with_last_byte(n as u8)).collect();
-        let blocks: Vec<ArchiveBlock<'_>> = (90..=102u64)
+        let hashes: Vec<B256> = (90..=103u64).map(|n| B256::with_last_byte(n as u8)).collect();
+        let blocks: Vec<ArchiveBlock<'_>> = (90..=103u64)
             .map(|n| ArchiveBlock {
                 number: n,
                 hash: hashes[(n - 90) as usize],
@@ -691,6 +731,52 @@ mod tests {
         assert_eq!(val(&a, slot(2), 94), None);
         assert_eq!(val(&a, slot(3), 100), None);
         assert_eq!(val(&a, slot(1), 85), Some(10)); // the unchanged key keeps extending
+    }
+
+    #[test]
+    fn reads_for_a_replaced_block_are_refused() {
+        // Review finding: archived reads went by number only, so a handle to A100 read B100.
+        let d = tempfile::tempdir().unwrap();
+        let a = Archive::open(d.path().join("a.redb")).unwrap();
+        blk(&a, 99, &[]);
+        a.write_base(&slot(1), 99, U256::from(1), &[]).unwrap();
+        blk(&a, 100, &[(slot(1), 2)]);
+        let a100 = B256::with_last_byte(100);
+        assert_eq!(a.get_at(&slot(1), 100, a100).unwrap(), ArchiveRead::Value(U256::from(2)));
+        a.truncate_above(99).unwrap();
+        let b100 = B256::repeat_byte(0xb0);
+        a.write_block(&ArchiveBlock { number: 100, hash: b100, header_rlp: &[0xc0], writes: &[(slot(1), U256::from(3))] }).unwrap();
+        assert_eq!(a.get_at(&slot(1), 100, a100).unwrap(), ArchiveRead::OtherFork);
+        assert_eq!(a.get_at(&slot(1), 100, b100).unwrap(), ArchiveRead::Value(U256::from(3)));
+    }
+
+    #[test]
+    fn backfill_checks_the_base_block_itself() {
+        // Review finding: K was 10 in 90..=99 and became 20 at block 100. K was archived late,
+        // with base (100, 20). The old backfill scanned only < 100, saw no write, and claimed
+        // K = 20 back to 90.
+        let d = tempfile::tempdir().unwrap();
+        let a = Archive::open(d.path().join("a.redb")).unwrap();
+        for n in 100..=103 {
+            blk(&a, n, &[]); // K not archived yet when these were written
+        }
+        a.write_base(&slot(1), 100, U256::from(20), &[]).unwrap(); // late key, base at 100
+        a.write_base(&slot(2), 100, U256::from(7), &[]).unwrap(); // late key, unchanged since 90
+        let w100 = [(slot(1), U256::from(20))];
+        let blocks: Vec<ArchiveBlock<'_>> = (90..=100u64)
+            .map(|n| ArchiveBlock { number: n, hash: B256::with_last_byte(n as u8), header_rlp: &[0xc0], writes: if n == 100 { &w100 } else { &[] } })
+            .collect();
+        let r = a.backfill(&blocks, Some(B256::with_last_byte(99))).unwrap();
+        assert_eq!(r.keys_write_bound, 1);
+        assert_eq!(val(&a, slot(1), 95), None); // was 10: refuse, never 20
+        assert_eq!(val(&a, slot(1), 100), Some(20));
+        assert_eq!(val(&a, slot(2), 90), Some(7)); // block 100 didn't write it: extends
+        // A deeper pass needn't rescan 90: it was proven clean for slot 2.
+        let deeper: Vec<ArchiveBlock<'_>> =
+            (85..=89u64).map(|n| ArchiveBlock { number: n, hash: B256::with_last_byte(n as u8), header_rlp: &[0xc0], writes: &[] }).collect();
+        a.backfill(&deeper, Some(B256::with_last_byte(89))).unwrap();
+        assert_eq!(val(&a, slot(2), 85), Some(7));
+        assert_eq!(val(&a, slot(1), 89), None);
     }
 
     #[test]

@@ -14,17 +14,26 @@ value the reference contradicts). WRONG is the failure this soak exists to catch
 Chaos, every 6-12 minutes: SIGKILL + restart, graceful restart, or restart with the *other*
 config (key-set change). The archive file persists across all of them.
 
-Resources: skim_status every block; subscribed keys must stay <= max_subscribed_keys.
+Resources: skim_status every block; subscribed keys must stay <= max_subscribed_keys, and RSS
+under RSS_LIMIT_MB if set. Exit status is nonzero on any WRONG answer or limit breach.
+
+`--selftest` checks the classification rules (reverts and halts are outcomes to compare).
+Reorgs are not injected here (live network); they're covered by deterministic store tests.
 """
 import json, os, random, signal, subprocess, sys, time, urllib.request
 
-BIN, OUT = sys.argv[1], sys.argv[2]
-MINUTES = float(sys.argv[3]) if len(sys.argv) > 3 else 120
-REF = os.environ["REF_URL"]
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--selftest":
+    pass  # handled below, after the helpers are defined
+else:
+    BIN, OUT = sys.argv[1], sys.argv[2]
+MINUTES = float(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[1] != "--selftest" else 120
+REF = os.environ.get("REF_URL", "")
 PORT = 8547
 SKIM = f"http://127.0.0.1:{PORT}"
 MAX_KEYS = 60
-os.makedirs(OUT, exist_ok=True)
+RSS_LIMIT_MB = float(os.environ.get("RSS_LIMIT_MB", "0"))  # 0 = no limit
+if sys.argv[1] != "--selftest":
+    os.makedirs(OUT, exist_ok=True)
 
 QUOTER = "0xEd1f6473345F45b75F8179591dd5bA1888cf2FB3"
 POOL = "0x6Ce0896eAE6D4BD668fDe41BB784548fb8F59b50"
@@ -121,15 +130,58 @@ class Skim:
                 self.proc.wait()
 
 
+HALT_WORDS = ("out of gas", "execution", "invalid opcode", "stack", "halt", "gas required exceeds")
+
+
+def outcome(resp, side):
+    """Execution outcome of a JSON-RPC response:
+    ("ok", result) | ("revert", data) | ("halt",) | ("unavailable", why).
+    Reverts and EVM halts are results to compare, not failures; only transport and resource
+    errors (or, for skim, its -32002 refusals) are "unavailable"."""
+    e = resp.get("error")
+    if e is None:
+        return ("ok", resp.get("result"))
+    code, msg = e.get("code"), str(e.get("message", "")).lower()
+    if code == 3:
+        return ("revert", e.get("data"))
+    if code == -32000 and any(w in msg for w in HALT_WORDS):
+        return ("halt",)
+    return ("unavailable", f"{side} {code} {msg[:60]}")
+
+
 def classify(s, r):
-    if "error" in r or r.get("result") is None:
+    ro, so = outcome(r, "ref"), outcome(s, "skim")
+    if ro[0] == "unavailable":
         return "ref_unavailable"
-    if "error" in s:
-        # A revert must match the reference's revert; other errors are refusals.
-        if s["error"].get("code") == 3:
-            return "match" if r.get("error", {}).get("data") == s["error"].get("data") else "WRONG"
+    if so[0] == "unavailable":
         return "refused"
-    return "match" if s["result"] == r["result"] else "WRONG"
+    return "match" if so == ro else "WRONG"
+
+
+def selftest():
+    ok = {"result": "0x01"}
+    rev = lambda d: {"error": {"code": 3, "message": "execution reverted", "data": d}}
+    cases = [
+        (ok, rev("0xaa"), "WRONG"),                                   # skim succeeded, ref reverted
+        (rev("0xbb"), rev("0xaa"), "WRONG"),                          # both reverted, different data
+        (rev("0xaa"), rev("0xaa"), "match"),                          # same revert
+        (ok, {"result": "0x02"}, "WRONG"),
+        (ok, ok, "match"),
+        ({"error": {"code": -32002, "message": "unavailable"}}, ok, "refused"),
+        (ok, {"error": {"code": "transport", "message": "timeout"}}, "ref_unavailable"),
+        (ok, {"error": {"code": -32000, "message": "header not found"}}, "ref_unavailable"),
+        ({"error": {"code": -32000, "message": "execution halted: OutOfGas"}}, {"error": {"code": -32000, "message": "out of gas"}}, "match"),
+        (ok, {"error": {"code": -32000, "message": "out of gas"}}, "WRONG"),  # ref halted, skim didn't
+    ]
+    bad = [(s, r, want, classify(s, r)) for s, r, want in cases if classify(s, r) != want]
+    for b in bad:
+        print("SELFTEST FAIL", b)
+    print(f"selftest: {len(cases) - len(bad)}/{len(cases)} ok")
+    sys.exit(1 if bad else 0)
+
+
+if len(sys.argv) > 1 and sys.argv[1] == "--selftest":
+    selftest()
 
 
 counts = {"match": 0, "refused": 0, "WRONG": 0, "ref_unavailable": 0}
@@ -144,6 +196,7 @@ next_chaos = time.time() + random.uniform(6, 12) * 60
 last = None
 first_block = None
 over_limit = 0
+rss_max = 0.0
 rnd = random.Random(7)
 
 while time.time() < t_end:
@@ -188,6 +241,7 @@ while time.time() < t_end:
     st = rpc(SKIM, "skim_status", [], timeout=5).get("result")
     sub = rpc(SKIM, "skim_subscriptionStatus", [], timeout=5).get("result")
     rss = subprocess.run(["ps", "-o", "rss=", "-p", str(skim.proc.pid)], capture_output=True, text=True).stdout.strip()
+    rss_max = max(rss_max, int(rss or 0) / 1024)
     if st and st["store"]["subscribed_keys"] > MAX_KEYS:
         over_limit += 1
     status_log.write(json.dumps({"t": time.time(), "block": n, "config": skim.cfg, "rss_mb": int(rss or 0) / 1024,
@@ -196,6 +250,15 @@ while time.time() < t_end:
     print(f"block {n} [{skim.cfg}] {counts} rss={int(rss or 0)//1024}MB subscribed={st and st['store']['subscribed_keys']}", flush=True)
 
 skim.stop(signal.SIGTERM)
-summary = {"minutes": MINUTES, "counts": counts, "by_kind": by_kind, "subscribed_over_limit_samples": over_limit}
+failures = []
+if counts["WRONG"]:
+    failures.append(f"{counts['WRONG']} wrong answers (see wrong.jsonl)")
+if over_limit:
+    failures.append(f"subscribed keys over the limit in {over_limit} samples")
+if RSS_LIMIT_MB and rss_max > RSS_LIMIT_MB:
+    failures.append(f"RSS {rss_max:.0f} MB over the {RSS_LIMIT_MB:.0f} MB limit")
+summary = {"minutes": MINUTES, "counts": counts, "by_kind": by_kind, "subscribed_over_limit_samples": over_limit,
+           "rss_max_mb": rss_max, "verdict": "FAIL" if failures else "PASS", "failures": failures}
 json.dump(summary, open(os.path.join(OUT, "summary.json"), "w"), indent=2)
 print(json.dumps(summary, indent=2))
+sys.exit(1 if failures else 0)

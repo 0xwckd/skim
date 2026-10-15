@@ -146,12 +146,18 @@ impl Default for OnDemand {
 struct Limits {
     #[serde(default = "hundred_k")]
     max_subscribed_keys: usize,
+    #[serde(default = "two_hundred_k")]
+    max_on_demand_keys: usize,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { max_subscribed_keys: 100_000 }
+        Self { max_subscribed_keys: 100_000, max_on_demand_keys: 200_000 }
     }
+}
+
+fn two_hundred_k() -> usize {
+    200_000
 }
 
 fn yes() -> bool {
@@ -243,6 +249,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let subs = Arc::new(skim_sim::subscription::Subscriptions::new(cfg.state.subscriptions, cfg.state.limits.max_subscribed_keys)?);
     // The limit is enforced by the store itself, for every path that subscribes keys.
     store.set_max_subscribed(cfg.state.limits.max_subscribed_keys);
+    store.set_max_on_demand(cfg.state.limits.max_on_demand_keys);
     tracing::info!(subscriptions = subs.status().len(), declared_keys = subs.total_keys(), "state subscriptions loaded");
     let mut ncfg = NodeConfig::sepolia(args.cl_port);
     ncfg.mesh_n = args.cl_mesh;
@@ -542,7 +549,8 @@ async fn backfill_archive(store: &Store, net: &ElNet, from: u64) -> anyhow::Resu
     let segs = ar.segments()?;
     let (s, e) = *segs.first().ok_or_else(|| anyhow::anyhow!("empty archive"))?;
     let c_max = ar.coverages()?.iter().filter(|(_, _, ext)| *ext).map(|(_, c, _)| *c).max().unwrap_or(s);
-    let scan_end = (c_max.saturating_sub(1)).max(s.saturating_sub(1)).min(e);
+    // Include block c itself: a base is c's post-state, and c may have changed the key.
+    let scan_end = c_max.max(s.saturating_sub(1)).min(e);
     if from > scan_end {
         return Ok(Default::default());
     }

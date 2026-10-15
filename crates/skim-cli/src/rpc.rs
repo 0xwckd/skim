@@ -338,6 +338,7 @@ impl Rpc {
                         "chain": z.chain, "recent_bals": z.recent_bals, "keys": z.keys, "versions": z.versions,
                         "subscribed_keys": z.watched_keys, "on_demand_keys": z.temp_keys,
                         "code": z.code, "code_bytes": z.code_bytes, "admissions_refused": z.admissions_refused,
+                        "on_demand_evicted": z.on_demand_evicted, "recent_bal_bytes": z.recent_bal_bytes,
                     },
                     "light_client": self.light.as_ref().map(|l| l.status()),
                     "el_peers": peers.len(),

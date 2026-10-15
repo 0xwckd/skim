@@ -300,3 +300,76 @@ fn bytecode_is_dropped_with_its_last_account() {
     assert_eq!(s.code(&h), None);
     assert_eq!(s.sizes().code, 0);
 }
+
+#[test]
+fn a_base_write_and_a_rollback_never_interleave() {
+    // Review finding: insert_base_with checked the fork and collected replay values under the
+    // lock, released it, then wrote the archive. A rollback + new fork in between left the old
+    // fork's replayed value in the archive. Now the write happens under the same lock as the
+    // check, so the rollback can only run before or after it, never in between.
+    use std::sync::{Barrier, atomic::{AtomicBool, Ordering}};
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::with_archive(64, archive::Archive::open(d.path().join("a.redb")).unwrap()).unwrap();
+    s.apply_block(blk(1, 0), writes(&[])).unwrap();
+    s.archive_key(slot(1));
+    // Fork A's block 2 writes K = 20 (seen in the BAL index before K's base arrives).
+    s.apply_block(blk(2, 0), writes(&[(slot(1), 20)])).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let once = Arc::new(AtomicBool::new(false));
+    {
+        let (barrier, once) = (barrier.clone(), once.clone());
+        *s.test_hook.lock() = Some(Box::new(move || {
+            if !once.swap(true, Ordering::SeqCst) {
+                barrier.wait(); // let the rollback thread go...
+                std::thread::sleep(std::time::Duration::from_millis(100)); // ...and try to cut in
+            }
+        }));
+    }
+    let s2 = s.clone();
+    let b2 = barrier.clone();
+    let rollback = std::thread::spawn(move || {
+        b2.wait();
+        s2.rollback_to(1);
+        s2.apply_block(blk(2, 1), writes(&[])).unwrap(); // fork B's block 2 leaves K alone
+    });
+    // Base for K at block 1 (= 10); replays fork A's write at 2 while the rollback waits.
+    s.insert_base(&blk(1, 0), slot(1), U256::from(10)).unwrap();
+    rollback.join().unwrap();
+    let ar = s.archive().unwrap();
+    assert_eq!(ar.get_at(&slot(1), 2, blk(2, 1).hash).unwrap(), archive::ArchiveRead::Value(U256::from(10)));
+    assert_eq!(ar.get_at(&slot(1), 2, blk(2, 0).hash).unwrap(), archive::ArchiveRead::OtherFork);
+    assert_eq!(known(&s.snapshot(&blk(2, 1)).unwrap(), slot(1)), Some(10));
+}
+
+#[test]
+fn archive_admission_and_insert_are_atomic() {
+    // Review finding: archive_key_checked admitted under a read lock and inserted later, so two
+    // callers could both take the last slot. Now one write lock covers both.
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::with_archive(64, archive::Archive::open(d.path().join("a.redb")).unwrap()).unwrap();
+    s.set_max_subscribed(50);
+    s.apply_block(blk(1, 0), writes(&[])).unwrap();
+    let handles: Vec<_> = (0..8)
+        .map(|t| {
+            let s = s.clone();
+            std::thread::spawn(move || (0..20).filter(|i| s.archive_key_checked(slot(t * 100 + i))).count())
+        })
+        .collect();
+    let admitted: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+    assert_eq!(admitted, 50);
+    assert_eq!(s.sizes().watched_keys, 50);
+}
+
+#[test]
+fn on_demand_keys_are_capped() {
+    let s = Store::new(64);
+    s.set_max_on_demand(100);
+    s.apply_block(blk(1, 0), writes(&[])).unwrap();
+    for i in 0..1000 {
+        s.insert_base_with(&blk(1, 0), slot(i), U256::from(i), Retention::Ttl(4)).unwrap();
+        assert!(s.sizes().temp_keys <= 100);
+    }
+    assert!(s.sizes().on_demand_evicted >= 900);
+    // The newest key is always kept (the call that fetched it can run).
+    assert_eq!(known(&s.snapshot(&blk(1, 0)).unwrap(), slot(999)), Some(999));
+}

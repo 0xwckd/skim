@@ -25,6 +25,7 @@ state:
 
   limits:
     max_subscribed_keys: 100000       # hard cap on subscribed keys in the store (see below)
+    max_on_demand_keys: 200000        # hard cap on on-demand keys; soonest-expiring evicted first
 
 predictors:
   uniswap_v3:                         # input-aware prefetch for QuoterV2.quoteExactInputSingle
@@ -92,6 +93,11 @@ The snapshot is a cache, never a source of truth. On start it is used only after
 Anything that doesn't check out (a reorg while skim was down, a gap over 8,192 blocks, an unreadable file) is discarded, and state is fetched as on a fresh start. The replay needs one EL peer that serves eth/71. In practice, restart time is dominated by how long the first such peer takes to connect.
 
 ## Sizing
-- **Memory:** tracked keys, their versions inside `--window`, and contract code. Measured: ~120 MB RSS for a few pools, tokens and quotes, following Sepolia.
+- **Memory:** bounded by three things.
+  - **Subscribed and on-demand keys:** both have hard caps (`limits`).
+  - **Contract code:** freed with its accounts.
+  - **The recent-BAL index:** every write of the last `--window` blocks, needed to replay fetched values to the head. This part scales with chain activity, not with your keys. `skim_status.store.recent_bal_bytes` shows it; lower `--window` to shrink it.
+
+  There is no single "total memory" cap. Measured: ~120 MB RSS for a few pools, tokens and quotes, following Sepolia.
 - **Network and CPU:** skim receives and checks every block's full payload and BAL, so this part follows the whole chain's activity, not just your keys. What scales with your app is the state it keeps and the fetches it makes.
 - **Disk:** none, unless `--archive`.

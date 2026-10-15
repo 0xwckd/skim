@@ -100,3 +100,17 @@ Mesh 12 / 80 peers against 8 / 50, measured on the same 304 blocks:
 | Arrival after slot start, P90 | 1,601 ms | 1,671 ms |
 
 The median per-block difference between the two was −17 ms (new earlier in 56% of blocks). The payload-topic mesh stayed at 6 peers either way, because remote peers decide whether to graft us. The defaults stay at 8 / 50.
+
+## Second review (findings on the M6 code)
+| Finding | Fix | Test (fails without the fix) |
+|---|---|---|
+| Backfill extended a late key's base (post-state of block c) back past c without checking whether c itself wrote the key (K was 10 before 100, 20 after; backfill claimed 20 for 90–99) | Block c's BAL is part of the scan. If c wrote the key and nothing earlier did, coverage stays at c (write-bound). Keys whose start block a previous backfill proved clean are tracked (`PRE_CLEAN`), so deeper passes need not rescan c | `backfill_checks_the_base_block_itself` ✓ |
+| Archived snapshots read by block number only, so a handle for A100 could read B100 after a reorg | Archive reads take the expected block hash and check it in the same read transaction (`get_at`); mismatch is `Reorged` | `reads_for_a_replaced_block_are_refused` |
+| `insert_base_with` checked the fork, released the lock, then wrote the archive, so a rollback in between left old-fork data | Every archive mutation (base writes, key archiving, rollback truncation) happens under the same store write lock as the in-memory change | `a_base_write_and_a_rollback_never_interleave` (a test hook pauses the write while another thread rolls back and switches forks) ✓ |
+| `archive_key_checked` admitted under a read lock and inserted later (two callers could take the last slot) | Admission and insertion under one write lock | `archive_admission_and_insert_are_atomic` (8 threads, limit 50 → exactly 50) |
+| On-demand keys had no cap; recent BALs are bounded only by block count | `limits.max_on_demand_keys` (default 200k; soonest-expiring evicted). The recent-BAL index is reported (`skim_status.store.recent_bal_bytes`), and `--window` bounds it. No single total-memory cap is claimed | `on_demand_keys_are_capped` |
+| The soak counted a reference revert as "reference unavailable", hiding success-vs-revert and different-revert mismatches; no failing exit | Classified by execution outcome (result / revert data / EVM halt) vs unavailability; nonzero exit on WRONG, limit breach, or RSS over `RSS_LIMIT_MB`; `--selftest` with the review's cases | `chaos_soak.py --selftest` 10/10 |
+
+✓ = also checked to fail against the previous code.
+
+Re-checking the first soak with the corrected classifier: the 3 "reference unavailable" results were all `BLOCKHASH` probes. Probes that both sides answered were all counted as matches before as well, so the 0-wrong result stands. Reorgs are covered by the deterministic store tests, not by the live soak.

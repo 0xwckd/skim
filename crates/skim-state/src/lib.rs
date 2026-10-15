@@ -65,6 +65,12 @@ pub struct StoreSizes {
     pub code_bytes: usize,
     /// Subscriptions refused because the subscribed-key limit was reached (kept on demand).
     pub admissions_refused: u64,
+    /// On-demand keys evicted early because `max_on_demand` was reached.
+    pub on_demand_evicted: u64,
+    /// Estimated bytes held by the recent-BAL index (all writes of the last `window` blocks,
+    /// needed to replay fetched values to the head). Scales with chain activity, not with
+    /// your keys; `--window` bounds it.
+    pub recent_bal_bytes: usize,
 }
 
 /// How long a fetched value is kept current.
@@ -147,7 +153,17 @@ pub struct Store {
     /// Hard limit on subscribed keys, enforced where keys are admitted (not just counted).
     max_subscribed: std::sync::atomic::AtomicUsize,
     admissions_refused: std::sync::atomic::AtomicU64,
+    /// Hard limit on on-demand (TTL) keys; the soonest-expiring are evicted first.
+    max_on_demand: std::sync::atomic::AtomicUsize,
+    on_demand_evicted: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    pub(crate) test_hook: parking_lot::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
+
+/// Default cap on on-demand keys (each holds a few versions within the window).
+pub const DEFAULT_MAX_ON_DEMAND: usize = 200_000;
+/// Rough bytes per entry of a block's write list (key + value + vector overhead).
+const BAL_ENTRY_BYTES: usize = 96;
 
 /// What an over-limit subscription becomes: an on-demand key with this TTL.
 const REFUSED_TTL: u64 = 4;
@@ -164,6 +180,10 @@ impl Store {
             archive_errors: Default::default(),
             max_subscribed: std::sync::atomic::AtomicUsize::new(usize::MAX),
             admissions_refused: Default::default(),
+            max_on_demand: std::sync::atomic::AtomicUsize::new(DEFAULT_MAX_ON_DEMAND),
+            on_demand_evicted: Default::default(),
+            #[cfg(test)]
+            test_hook: Default::default(),
         })
     }
 
@@ -179,6 +199,10 @@ impl Store {
             archive_errors: Default::default(),
             max_subscribed: std::sync::atomic::AtomicUsize::new(usize::MAX),
             admissions_refused: Default::default(),
+            max_on_demand: std::sync::atomic::AtomicUsize::new(DEFAULT_MAX_ON_DEMAND),
+            on_demand_evicted: Default::default(),
+            #[cfg(test)]
+            test_hook: Default::default(),
         }))
     }
 
@@ -207,6 +231,12 @@ impl Store {
         }
     }
 
+    /// Caps on-demand (TTL) keys. When full, the soonest-expiring keys are evicted (they are
+    /// refetched, verified, if a call needs them again).
+    pub fn set_max_on_demand(&self, n: usize) {
+        self.max_on_demand.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Caps subscribed keys (watched keys, including archived ones). Keys already subscribed
     /// stay; new subscriptions beyond the cap are refused and kept on demand instead.
     pub fn set_max_subscribed(&self, n: usize) {
@@ -226,34 +256,46 @@ impl Store {
     /// Archives `k` (a subscription that keeps every version on disk). Returns false if the
     /// subscribed-key limit refused it.
     pub fn archive_key_checked(&self, k: StateKey) -> bool {
-        if !self.admit(&self.inner.read(), &k) {
-            return false;
-        }
-        self.archive_key(k);
-        true
+        self.archive_key_inner(k, true)
     }
 
     /// Subscribes `k` and archives every version of it from now on. Versions already held in
     /// memory (the key was tracked) are archived too, so coverage starts at the earliest one.
     pub fn archive_key(&self, k: StateKey) {
+        self.archive_key_inner(k, false);
+    }
+
+    /// Admission (if `check`), subscription and the archive write happen under one write lock:
+    /// no other subscription can take the last slot in between, and no rollback can interleave
+    /// with the archive write (archive and memory always change together).
+    fn archive_key_inner(&self, k: StateKey, check: bool) -> bool {
         let Some(ar) = &self.archive else {
-            self.watch_key(k);
-            return;
+            return if check { self.watch_key(k) } else { self.watch_key_unchecked(k) };
         };
-        let mem: Vec<(u64, U256)> = {
-            let mut st = self.inner.write();
-            st.temp.remove(&k);
-            st.watched_keys.insert(k);
-            if !st.archived.insert(k) {
-                return;
-            }
-            st.versions.get(&k).cloned().unwrap_or_default()
-        };
+        let mut st = self.inner.write();
+        if check && !self.admit(&st, &k) {
+            return false;
+        }
+        st.temp.remove(&k);
+        st.watched_keys.insert(k);
+        if !st.archived.insert(k) {
+            return true;
+        }
+        let mem = st.versions.get(&k).cloned().unwrap_or_default();
         let r = match mem.split_first() {
             Some(((b0, v0), rest)) => ar.write_base(&k, *b0, *v0, rest),
             None => ar.add_keys(&[k]),
         };
         self.archive_try(r);
+        drop(st);
+        true
+    }
+
+    fn watch_key_unchecked(&self, k: StateKey) -> bool {
+        let mut st = self.inner.write();
+        st.temp.remove(&k);
+        st.watched_keys.insert(k);
+        true
     }
 
     pub fn is_archived(&self, k: &StateKey) -> bool {
@@ -378,11 +420,12 @@ impl Store {
 
     /// Drops chain entries, BAL index and versions above `number` (reorg to that ancestor).
     pub fn rollback_to(&self, number: u64) {
+        // Archive and memory roll back under the same lock as every other mutation of either.
+        let mut st = self.inner.write();
         if let Some(ar) = &self.archive {
             let r = ar.truncate_above(number);
             self.archive_try(r);
         }
-        let mut st = self.inner.write();
         st.chain.retain(|n, _| *n <= number);
         st.hashes.retain(|n, _| *n <= number);
         st.recent.retain(|n, _| *n <= number);
@@ -417,6 +460,18 @@ impl Store {
                 let subscribed = st.watched_keys.contains(&key) || st.tracked_by_address(&key);
                 if !subscribed {
                     let head = st.head().map_or(at.number, |h| h.number);
+                    let max = self.max_on_demand.load(std::sync::atomic::Ordering::Relaxed);
+                    if !st.temp.contains_key(&key) && st.temp.len() >= max {
+                        // Evict the soonest-expiring tenth (never the key being inserted).
+                        let mut by_exp: Vec<(u64, StateKey)> = st.temp.iter().map(|(k, e)| (*e, *k)).collect();
+                        by_exp.sort();
+                        let n_evict = (max / 10).max(1).min(by_exp.len());
+                        for (_, k) in by_exp.into_iter().take(n_evict) {
+                            st.temp.remove(&k);
+                            st.versions.remove(&k);
+                        }
+                        self.on_demand_evicted.fetch_add(n_evict as u64, std::sync::atomic::Ordering::Relaxed);
+                    }
                     let e = st.temp.entry(key).or_insert(0);
                     *e = (*e).max(head + n);
                 }
@@ -435,14 +490,20 @@ impl Store {
         for (n, v) in &later {
             st.put(key, *n, *v);
         }
+        #[cfg(test)]
+        if let Some(h) = self.test_hook.lock().as_ref() {
+            h(); // tests pause here, still holding the lock, to race a rollback against us
+        }
         if st.archived.contains(&key) {
             let base = st.versions.get(&key).and_then(|v| v.iter().find(|(n, _)| *n == at.number).copied());
-            drop(st);
+            // Written while still holding the lock: the chain check above and the archive write
+            // are one step, so a rollback can't land between them and leave old-fork data.
             if let (Some(ar), Some((n, v))) = (&self.archive, base) {
                 let r = ar.write_base(&key, n, v, &later);
                 self.archive_try(r);
             }
         }
+        drop(st);
         Ok(())
     }
 
@@ -460,6 +521,8 @@ impl Store {
             code: st.code.len(),
             code_bytes: st.code.values().map(|c| c.len()).sum(),
             admissions_refused: self.admissions_refused.load(std::sync::atomic::Ordering::Relaxed),
+            on_demand_evicted: self.on_demand_evicted.load(std::sync::atomic::Ordering::Relaxed),
+            recent_bal_bytes: st.recent.values().map(|w| (w.writes.len() + w.touched.len() + w.storage_reads.len()) * BAL_ENTRY_BYTES).sum(),
         }
     }
 
@@ -661,10 +724,11 @@ impl Snapshot {
     pub fn get(&self, key: &StateKey) -> Result<StateValue, StateError> {
         if self.archived {
             let ar = self.store.archive.as_ref().expect("archived snapshot without archive");
-            return Ok(match ar.get(key, self.block.number) {
-                Ok(archive::ArchiveRead::Value(v)) => StateValue::Known(v),
-                _ => StateValue::Unknown,
-            });
+            return match ar.get_at(key, self.block.number, self.block.hash) {
+                Ok(archive::ArchiveRead::Value(v)) => Ok(StateValue::Known(v)),
+                Ok(archive::ArchiveRead::OtherFork) => Err(StateError::Reorged { number: self.block.number, hash: self.block.hash }),
+                _ => Ok(StateValue::Unknown),
+            };
         }
         let st = self.store.inner.read();
         if st.chain.get(&self.block.number).map(|b| b.hash) != Some(self.block.hash) {
