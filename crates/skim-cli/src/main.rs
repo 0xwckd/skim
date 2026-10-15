@@ -1,5 +1,6 @@
 //! `skim` command line. For now: M0 probes (PROJECT.md §10).
 
+mod bench_node;
 mod chain;
 mod follow;
 mod probe_cl;
@@ -29,6 +30,8 @@ enum Cmd {
     Follow(follow::Args),
     /// Follow the chain and serve JSON-RPC (eth_call, eth_getStorageAt, ...) on top of it.
     Run(run::Args),
+    /// P3 baseline: same per-block eth_call workload against a full node's RPC.
+    BenchNode(bench_node::Args),
     /// Peer-count sweep: one large learned wave fetched with 1/2/4/all peers per block.
     ProbeWave(probe_call::WaveArgs),
     /// M0 Spike A: Sepolia CL gossip listener; execution-payload envelope timing and BAL checks.
@@ -49,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::ProbeCall(args) => probe_call::run(args).await,
         Cmd::Follow(args) => follow::run(args).await,
         Cmd::Run(args) => run::run(args).await,
+        Cmd::BenchNode(args) => bench_node::run(args).await,
         Cmd::ProbeWave(args) => probe_call::run_wave(args).await,
         Cmd::ProbeCl(args) => probe_cl::run(args).await,
     }
