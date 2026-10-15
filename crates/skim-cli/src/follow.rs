@@ -261,6 +261,8 @@ struct Stats {
     local_fail: u64,
     slow_calls: u64,
     oracle_checked: u64,
+    prefetch_covered_keys: u64,
+    prefetch_avoided_waves: u64,
     predict_keys: u64,
     predict_wall: Samples,
     prefetch_keys: u64,
@@ -288,7 +290,7 @@ struct Ctx {
     prefetch_budget: usize,
     infura_every: u64,
     /// Keys fetched by background prefetch -> whether any simulation has read them since.
-    prefetched: StdMutex<HashMap<StateKey, bool>>,
+    prefetched: StdMutex<HashMap<StateKey, (u64, Option<u64>)>>,
     health_out: StdMutex<std::io::BufWriter<std::fs::File>>,
 }
 
@@ -515,6 +517,14 @@ async fn bootstrap(ctx: &Ctx, h: &Header, b: &BlockRef) {
     tracing::info!(at = b.number, ?head, "bootstrap complete; following");
 }
 
+/// Background-prefetched keys: how many were read by a simulation within 1/10/100 blocks.
+fn prefetch_efficiency(ctx: &Ctx) -> serde_json::Value {
+    let pf = ctx.prefetched.lock().unwrap();
+    let within = |n: u64| pf.values().filter(|(f, u)| u.is_some_and(|u| u.saturating_sub(*f) < n)).count();
+    serde_json::json!({"tracked_keys": pf.len(), "used": pf.values().filter(|(_, u)| u.is_some()).count(),
+        "used_within_1": within(1), "used_within_10": within(10), "used_within_100": within(100)})
+}
+
 /// Periodic growth / stability record (`<out>.health`).
 fn write_health(ctx: &Ctx, b: &BlockRef) {
     use std::io::Write;
@@ -527,10 +537,7 @@ fn write_health(ctx: &Ctx, b: &BlockRef) {
     let (q_hi, q_lo) = ctx.sched.queue_lens();
     let rej = &ctx.sched.transport().rejections;
     use std::sync::atomic::Ordering::Relaxed;
-    let (pf_n, pf_used) = {
-        let pf = ctx.prefetched.lock().unwrap();
-        (pf.len(), pf.values().filter(|u| **u).count())
-    };
+    let pf_eff = prefetch_efficiency(ctx);
     let s = ctx.stats.lock().unwrap();
     let rec = serde_json::json!({
         "t": unix_ms(SystemTime::now()) / 1e3, "number": b.number,
@@ -542,7 +549,10 @@ fn write_health(ctx: &Ctx, b: &BlockRef) {
         "scheduler": ctx.sched.stats(), "queues": {"high": q_hi, "low": q_lo},
         "rejections": {"no_proof": rej.no_proof.load(Relaxed), "bad_proof": rej.bad_proof.load(Relaxed),
                        "contradiction": rej.contradiction.load(Relaxed), "root_unavailable": rej.root_unavailable.load(Relaxed)},
-        "prefetch": {"tracked": pf_n, "used": pf_used, "keys_total": s.prefetch_keys},
+        "prefetch": {"efficiency": pf_eff, "keys_total": s.prefetch_keys, "covered_keys": s.prefetch_covered_keys,
+                     "avoided_waves": s.prefetch_avoided_waves,
+                     "requests_low": ctx.sched.stats().requests_low, "requests_all": ctx.sched.stats().requests,
+                     "snap_bytes_in": rej.bytes_in.load(Relaxed), "snap_responses": rej.responses.load(Relaxed)},
         "calls": {"run": s.calls_run, "local_ok": s.local_ok, "local_fail": s.local_fail, "over_1s": s.slow_calls,
                   "p99_ms": s.call_lat.pct(99.0)},
         "oracle": {"checked": s.oracle_checked, "disagree": s.match_fail},
@@ -647,7 +657,7 @@ fn spawn_prefetch(ctx: &Arc<Ctx>, b: BlockRef) {
                         StateKey::Nonce(a) | StateKey::CodeHash(a) => StateKey::Balance(a),
                         k => k,
                     };
-                    pf.entry(k).or_insert(false);
+                    pf.entry(k).or_insert((b.number, None));
                 }
             }
             let mut s = ctx.stats.lock().unwrap();
@@ -682,9 +692,27 @@ async fn measure_block(ctx: Arc<Ctx>, h: Header, b: BlockRef, recv_ms: f64, appl
                     .iter()
                     .filter(|k| matches!(snap.get(k), Ok(StateValue::Unknown)))
                     .count();
+                // Keys known only because background prefetch fetched them.
+                let covered = {
+                    let pf = ctx.prefetched.lock().unwrap();
+                    keys.iter()
+                        .filter(|k| {
+                            let k = match **k {
+                                StateKey::Nonce(a) | StateKey::CodeHash(a) => StateKey::Balance(a),
+                                k => k,
+                            };
+                            pf.get(&k).is_some_and(|(fetched, _)| *fetched <= b.number)
+                                && matches!(snap.get(&k), Ok(StateValue::Known(_)))
+                        })
+                        .count()
+                };
                 let mut s = ctx.stats.lock().unwrap();
                 s.predicted_keys += keys.len() as u64;
                 s.predicted_unknown += unknown as u64;
+                s.prefetch_covered_keys += covered as u64;
+                if unknown == 0 && covered > 0 {
+                    s.prefetch_avoided_waves += 1;
+                }
             }
             if !accts.is_empty() || !slots.is_empty() {
                 let r = prefetch::resolve(&ctx.store, &ctx.sched, &at, &accts, &slots, &[]).await;
@@ -771,13 +799,13 @@ async fn measure_block(ctx: Arc<Ctx>, h: Header, b: BlockRef, recv_ms: f64, appl
             let mut pf = ctx.prefetched.lock().unwrap();
             if !pf.is_empty() {
                 for a in &m.touched_accounts {
-                    if let Some(u) = pf.get_mut(&StateKey::Balance(*a)) {
-                        *u = true;
+                    if let Some((_, u)) = pf.get_mut(&StateKey::Balance(*a)) {
+                        u.get_or_insert(b.number);
                     }
                 }
                 for (a, sl) in &m.touched_storage {
-                    if let Some(u) = pf.get_mut(&StateKey::Storage(*a, *sl)) {
-                        *u = true;
+                    if let Some((_, u)) = pf.get_mut(&StateKey::Storage(*a, *sl)) {
+                        u.get_or_insert(b.number);
                     }
                 }
             }
@@ -857,11 +885,7 @@ async fn measure_block(ctx: Arc<Ctx>, h: Header, b: BlockRef, recv_ms: f64, appl
 }
 
 fn report(ctx: &Ctx) {
-    let prefetch_eff = {
-        let pf = ctx.prefetched.lock().unwrap();
-        let used = pf.values().filter(|u| **u).count();
-        serde_json::json!({"tracked_keys": pf.len(), "used": used})
-    };
+    let prefetch_eff = prefetch_efficiency(ctx);
     let s = ctx.stats.lock().unwrap();
     let summary = serde_json::json!({
         "blocks": s.blocks, "from_gossip": s.from_gossip, "from_el_fill": s.from_el_fill, "reorgs": s.reorgs,
@@ -885,6 +909,7 @@ fn report(ctx: &Ctx) {
         "prefetch_hit_rate": if s.predicted_keys > 0 { 1.0 - s.predicted_unknown as f64 / s.predicted_keys as f64 } else { 0.0 },
         "predict_waves": s.predict_waves, "predict_keys": s.predict_keys, "predict_wall": s.predict_wall.json(),
         "prefetch_skipped": s.prefetch_skipped,
+        "prefetch_avoided_waves": s.prefetch_avoided_waves, "prefetch_covered_keys": s.prefetch_covered_keys,
         "call_latency": {"p50_ms": s.call_lat.pct(50.0), "p95_ms": s.call_lat.pct(95.0), "p99_ms": s.call_lat.pct(99.0),
             "p999_ms": s.call_lat.pct(99.9), "max_ms": s.call_lat.pct(100.0), "n": s.call_lat.len(), "over_1s": s.slow_calls},
         "local_success": {"ok": s.local_ok, "failed": s.local_fail},

@@ -374,6 +374,8 @@ Misses beyond the predicted set are fetched in later rounds.
 
 Result: repeated inputs run at k=1, and new inputs of a known shape at k=2.
 
+**Planned (after the Nethermind benchmark): generalized learned patterns.** Exact-input entries churn under randomized inputs, even with the 4,096-entry FIFO bound. Patterns will be keyed by `pool + direction + amount bucket (log10) + tick range` instead of raw calldata, and bounded by total stored keys and estimated bytes, not just entry count.
+
 **Throughput model:** a wave's speed is about Σ (in-flight_i / RTT_i) over serving peers (measured: 42 keys/s with one ~190 ms peer; 169 keys/s once a ~47 ms peer joined). Per-peer concurrency should adapt (AIMD) so that fast peers carry more of the load.
 
 **Dedicated peer:** serving costs 0.36 ms per lookup (local Nethermind). With a co-located snap peer, even k=8 cold calls finish in under 10 ms, so cold fetch fits on the live path. On public peers, cold fetch remains a k=1 game.

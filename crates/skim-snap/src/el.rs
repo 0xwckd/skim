@@ -36,6 +36,16 @@ pub struct Rejections {
     pub bad_proof: AtomicU64,
     pub contradiction: AtomicU64,
     pub root_unavailable: AtomicU64,
+    /// Response payload bytes received (RLP length) and responses, for traffic accounting.
+    pub bytes_in: AtomicU64,
+    pub responses: AtomicU64,
+}
+
+impl Rejections {
+    fn traffic(&self, bytes: usize) {
+        self.bytes_in.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.responses.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 type AccountCell = Arc<OnceCell<Option<AccountState>>>;
@@ -64,6 +74,7 @@ impl ElTransport {
         let h = keccak256(address);
         let m = self.net.account_range(peer, root, h, 512).await.0.map_err(map_err)?;
         let r = &self.rejections;
+        r.traffic(alloy_rlp::Encodable::length(&m));
         if m.accounts.is_empty() && m.proof.is_empty() {
             r.root_unavailable.fetch_add(1, Ordering::Relaxed);
             return Ok(AccountAnswer::Unavailable);
@@ -165,6 +176,7 @@ impl Transport for ElTransport {
             Some(Some(a)) => a.storage_root,
         };
         let m = resp.0.map_err(map_err)?;
+        r.traffic(alloy_rlp::Encodable::length(&m));
         let slots = m.slots.into_iter().next().unwrap_or_default();
         if m.proof.is_empty() {
             // Only a complete small trie may come without proof: it must rebuild to the root.
@@ -213,6 +225,8 @@ impl Transport for ElTransport {
 
     async fn codes(&self, peer: PeerId, hashes: Vec<B256>) -> Result<Vec<Bytes>, TransportError> {
         // Codes are content-addressed: the scheduler keys each answer by keccak256(code).
-        Ok(self.net.byte_codes(peer, hashes, 2 << 20).await.0.map_err(map_err)?.codes)
+        let m = self.net.byte_codes(peer, hashes, 2 << 20).await.0.map_err(map_err)?;
+        self.rejections.traffic(alloy_rlp::Encodable::length(&m));
+        Ok(m.codes)
     }
 }

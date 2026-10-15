@@ -170,6 +170,8 @@ pub struct Stats {
     pub failed: u64,
     pub code_batches: u64,
     pub low_jobs: u64,
+    /// Requests sent for Low (background) jobs; `requests` counts all.
+    pub requests_low: u64,
     pub upgraded: u64,
 }
 
@@ -566,6 +568,7 @@ impl<T: Transport> Inner<T> {
             }
             st.peers.get_mut(&peer).unwrap().inflight += 1;
             st.stats.requests += 1;
+            st.stats.requests_low += low as u64;
             let this = self.clone();
             tokio::spawn(async move { this.run(peer, keys).await });
         }
