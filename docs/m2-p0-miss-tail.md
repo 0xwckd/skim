@@ -84,3 +84,29 @@ A miss on a bitmap word is expanded to the whole word range back to the current 
 **Next:**
 - Widen the *background* window per pool to the furthest reach the predictor has observed. Those keys then leave the critical path entirely: one initial fetch, then BAL keeps them current.
 - Handle very wide waves with AIMD and more peers.
+
+## P1: budgeted background prefetch with scheduler priorities (runs F, G)
+Same workload as E: 100 blocks, 1,500 calls, 800 of them unseen random V3 quotes.
+
+| | E: adaptive window | F: + priorities + budget (first try) | **G: F with fixes** |
+|---|---|---|---|
+| Critical-path fetch waves | 13, P50 463 / P95 3,389 ms | 49, P50 43 s / P95 123 s | **11, P50 283 / P95 = max 1,590 ms** |
+| Calls missing after run | 4 | 2 | **1** |
+| Background prefetch keys (whole run) | 5,842 | 7,275 | **1,048** (0 blocks skipped) |
+| Prefetch hit rate at call time | – | 99.3% | **99.9%** |
+| Scheduler failed jobs | 0 | 24 | **0** |
+| Outputs match Infura | 1,470 / 0 | 1,460 / 0 | **1,500 / 0** |
+
+### Why F collapsed
+Waves spent 100–200 s queued and about 300 ms in service. Three things combined:
+1. **AIMD decrease rule.** Limits shrank when a response exceeded 4× the peer's *best* latency. With verified lookups, slot answers mix one- and two-request latencies (shared account proof), so normal spread read as queueing and limits fell toward 1.
+2. **Low jobs at cap 1.** The "Low uses at most half the cap" rule became `max(1, cap/2) = 1`, so background work competed for the only slot.
+3. **No backpressure.** Background refills kept arriving every block faster than the shrunken capacity drained them.
+
+### Fixes (G)
+- AIMD decreases only above 3× the peer's typical (EWMA) latency + 100 ms. Errors still halve.
+- Low jobs may use `min(cap/2, cap−1)`, so at least one slot always stays free for simulations; at cap 1, background work pauses.
+- A block's refresh is skipped while the Low queue holds more than one budget of work.
+- New regression test: a 2,000-job background backlog under AIMD must not delay a High request.
+
+Result: background prefetch now holds ~99.9% of predicted keys ready at call time while using about 1/6 of E's prefetch traffic. The worst critical-path fetch fell from 2.4 s (D) / 3.4 s (E) to 1.6 s. The all-calls-done P99 for a block (4.0 s) is now set by envelope arrival (P95 ~2.8 s), not by fetching.

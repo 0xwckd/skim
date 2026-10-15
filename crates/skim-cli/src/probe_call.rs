@@ -101,8 +101,8 @@ fn to_keys(m: &Misses) -> Vec<AccessKey> {
 pub(crate) const WETH_ADDR: Address = WETH;
 pub(crate) const USDC_ADDR: Address = USDC;
 
-/// `n` new-input V3 single-hop quotes for block `seed`: random direction, fee tier (0.05% or
-/// 0.3%) and log-uniform amount (0.0001–100 WETH, or 0.001–100,000 USDC).
+/// `n` new-input V3 single-hop quotes for block `seed`: random direction, fee tier (0.05%,
+/// 0.3% or 1%) and log-uniform amount (0.0001–100 WETH, or 0.001–100,000 USDC).
 pub(crate) fn random_quotes(seed: u64, n: usize) -> Vec<Call> {
     let mut x = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
     let mut next = || {
@@ -117,7 +117,7 @@ pub(crate) fn random_quotes(seed: u64, n: usize) -> Vec<Call> {
         .map(|_| {
             let r = next();
             let weth_in = r & 1 == 0;
-            let fee: u32 = if r & 2 == 0 { 500 } else { 3000 };
+            let fee: u32 = [500, 3000, 10000][((r >> 1) % 3) as usize];
             let frac = (next() % 1_000_000) as f64 / 1_000_000.0;
             let (tin, tout, amount) = if weth_in {
                 (w, u, 10f64.powf(14.0 + 6.0 * frac)) // 1e14..1e20 wei

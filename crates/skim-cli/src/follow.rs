@@ -62,6 +62,9 @@ pub struct Args {
     /// Skip Infura comparison.
     #[arg(long)]
     no_infura: bool,
+    /// Compare with Infura (and poll its readiness) only on every Nth block (long soaks).
+    #[arg(long, default_value_t = 1)]
+    infura_every: u64,
     #[arg(long, default_value = "data/follow.jsonl")]
     out: String,
     /// Root to resolve misses at: `parent` (fetch at H-1, replay BAL(H)) or `head`.
@@ -71,7 +74,7 @@ pub struct Args {
     #[arg(long, default_value_t = 2)]
     v3_words: i32,
     /// V3 pools to prefetch for (default: Sepolia WETH/USDC 0.05% and 0.3%).
-    #[arg(long, value_delimiter = ',', default_value = "0x3289680dD4d6C10bb19b899729cda5eEF58AEfF1,0x6Ce0896eAE6D4BD668fDe41BB784548fb8F59b50")]
+    #[arg(long, value_delimiter = ',', default_value = "0x3289680dD4d6C10bb19b899729cda5eEF58AEfF1,0x6Ce0896eAE6D4BD668fDe41BB784548fb8F59b50,0x6418EEC70f50913ff0d756B48d32Ce7C02b47C47")]
     v3_pools: Vec<Address>,
     /// Random new-input V3 quotes per block (no learned set applies to them).
     #[arg(long, default_value_t = 0)]
@@ -252,6 +255,7 @@ struct Stats {
     predict_waves: u64,
     predicted_keys: u64,
     predicted_unknown: u64,
+    prefetch_skipped: u64,
     predict_keys: u64,
     predict_wall: Samples,
     prefetch_keys: u64,
@@ -277,6 +281,7 @@ struct Ctx {
     predictor: Option<StdMutex<skim_sim::predictor::Predictor>>,
     adaptive_window: bool,
     prefetch_budget: usize,
+    infura_every: u64,
 }
 
 /// First successful Infura `eth_call` at a block number: when that request was sent (an upper
@@ -367,6 +372,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         random_quotes: args.random_quotes,
         adaptive_window: args.adaptive_window,
         prefetch_budget: args.prefetch_budget,
+        infura_every: args.infura_every.max(1),
         predictor: args.predictor.then(|| {
             StdMutex::new(skim_sim::predictor::Predictor {
                 learned: skim_sim::learned::Learned::new(8, 0.5, 256),
@@ -456,7 +462,9 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             _ => {}
         }
         followed += 1;
-        spawn_poller(&ctx, b.number + 1, b.timestamp + 12);
+        if (b.number + 1) % ctx.infura_every == 0 {
+            spawn_poller(&ctx, b.number + 1, b.timestamp + 12);
+        }
         spawn_prefetch(&ctx, b);
         {
             let mut s = ctx.stats.lock().unwrap();
@@ -561,6 +569,13 @@ fn spawn_prefetch(ctx: &Arc<Ctx>, b: BlockRef) {
         return;
     }
     let pools = ctx.v3_pools.lock().unwrap().clone();
+    // Backpressure: if earlier background work hasn't drained, skip this block's refresh.
+    let (q_hi, q_lo) = ctx.sched.queue_lens();
+    if q_lo > ctx.prefetch_budget {
+        ctx.stats.lock().unwrap().prefetch_skipped += 1;
+        tracing::debug!(q_hi, q_lo, "prefetch skipped: background backlog");
+        return;
+    }
     let ctx = ctx.clone();
     tokio::spawn(async move {
         let at = if ctx.miss_at_parent { ctx.store.block(b.number - 1).unwrap_or(b) } else { b };
@@ -682,7 +697,7 @@ async fn measure_block(ctx: Arc<Ctx>, h: Header, b: BlockRef, recv_ms: f64, appl
         }
     };
     let (mut warm_ms, mut matches, mut mismatches) = (None, 0, 0);
-    if let Some((client, url)) = &ctx.infura {
+    if let (Some((client, url)), true) = (&ctx.infura, b.number % ctx.infura_every == 0) {
         for (call, ours) in calls.iter().zip(&outputs) {
             let t = Instant::now();
             match infura_call(client, url, b.hash, call).await {
@@ -717,7 +732,8 @@ async fn measure_block(ctx: Arc<Ctx>, h: Header, b: BlockRef, recv_ms: f64, appl
             s.infura_call.push_ms(w);
         }
     }
-    tracing::info!(number = b.number, env_ms = (recv_ms - slot0) as i64, applied_ms = (applied_ms - slot0) as i64,
+    let (q_hi, q_lo) = ctx.sched.queue_lens();
+    tracing::info!(number = b.number, q_hi, q_lo, env_ms = (recv_ms - slot0) as i64, applied_ms = (applied_ms - slot0) as i64,
         sim_ms = (sim_ms - slot0) as i64,
         infura_ready_le_ms = poll.map(|p| (p.first_ok_sent_ms - slot0) as i64),
         infura_answer_ms = poll.map(|p| (p.first_ok_recv_ms - slot0) as i64),
@@ -754,6 +770,8 @@ fn report(ctx: &Ctx) {
         "predicted_keys": s.predicted_keys, "predicted_unknown_at_call": s.predicted_unknown,
         "prefetch_hit_rate": if s.predicted_keys > 0 { 1.0 - s.predicted_unknown as f64 / s.predicted_keys as f64 } else { 0.0 },
         "predict_waves": s.predict_waves, "predict_keys": s.predict_keys, "predict_wall": s.predict_wall.json(),
+        "prefetch_skipped": s.prefetch_skipped,
+        "peers": ctx.sched.peer_stats().into_iter().map(|(id, p)| (format!("{id:.10}"), serde_json::json!({"limit": p.limit, "ewma_ms": p.ewma_ms, "ok": p.ok, "errors": p.errors}))).collect::<std::collections::HashMap<_, _>>(),
         "prefetch_rounds": s.prefetch_rounds, "prefetch_keys": s.prefetch_keys, "prefetch_wall": s.prefetch_wall.json(),
         "outputs_match": s.match_ok, "outputs_mismatch": s.match_fail,
         "scheduler": ctx.sched.stats(),

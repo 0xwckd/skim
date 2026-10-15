@@ -247,7 +247,8 @@ fn aimd_rules() {
         p.on_answer(&c, 55.0);
     }
     assert_eq!(p.limit, 16.0); // capped
-    p.on_answer(&c, 400.0); // > 4x min + 100: queueing at the peer
+    p.ewma_ms = Some(55.0);
+    p.on_answer(&c, 400.0); // > 3x typical + 100: queueing at the peer
     assert!((p.limit - 11.2).abs() < 1e-9);
     p.on_error(&c);
     assert!((p.limit - 5.6).abs() < 1e-9);
@@ -278,4 +279,20 @@ async fn background_work_never_takes_more_than_half_the_cap_and_promotes() {
     assert!(s.stats().upgraded >= 1);
     // Low jobs alone never exceeded half the cap (4); high jobs could use the rest.
     assert!(m.inflight.lock()[&pid(1)].1 <= 8);
+}
+
+#[tokio::test]
+async fn high_is_not_starved_by_a_large_background_backlog_under_aimd() {
+    // Reproduction attempt for run F: thousands of Low jobs, AIMD on, a High request later.
+    let m = Mock::new(&[(1, Behav::Ok { ms: 30 }), (2, Behav::Ok { ms: 30 })]);
+    let s = Scheduler::new(m.clone(), Config { per_peer_inflight: 2, ..cfg() });
+    let bg: Vec<_> = (0..2000).map(slot).collect();
+    let s2 = s.clone();
+    let bg_task = tokio::spawn(async move { s2.fetch_detailed_with(&bg, Priority::Low).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let t = Instant::now();
+    let hi = s.fetch(&[slot(5000), slot(5001)]).await;
+    assert!(hi.iter().all(|x| x.is_ok()));
+    assert!(t.elapsed() < Duration::from_millis(300), "high waited {:?}", t.elapsed());
+    bg_task.abort();
 }

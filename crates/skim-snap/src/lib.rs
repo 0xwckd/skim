@@ -255,9 +255,12 @@ impl Peer {
         }
         let min = self.min_ms.map_or(ms, |m| m.min(ms));
         self.min_ms = Some(min);
-        if ms <= 2.0 * min + 25.0 {
+        // Compare against the peer's typical latency, not its best: verified lookups mix one-
+        // and two-request answers, and a min-based test read that spread as queueing.
+        let typical = self.ewma_ms.unwrap_or(ms);
+        if ms <= 1.5 * typical + 25.0 {
             self.limit = (self.limit + 1.0 / self.limit).min(cfg.inflight_max as f64);
-        } else if ms > 4.0 * min + 100.0 {
+        } else if ms > 3.0 * typical + 100.0 {
             self.limit = (self.limit * 0.7).max(1.0);
         }
     }
@@ -337,6 +340,12 @@ impl<T: Transport> Scheduler<T> {
             rx.await.unwrap_or((Err(FetchError::Deadline), FetchMeta::default()))
         }))
         .await
+    }
+
+    /// (queued High jobs, queued Low jobs).
+    pub fn queue_lens(&self) -> (usize, usize) {
+        let st = self.inner.state.lock();
+        (st.queue.len(), st.queue_lo.len())
     }
 
     pub fn transport(&self) -> &T {
@@ -450,7 +459,12 @@ impl<T: Transport> Inner<T> {
         });
         let eligible = |(id, p): &(&PeerId, &Peer)| {
             allowed.as_ref().is_none_or(|a| a.contains(*id))
-                && p.inflight < if job.low { (p.cap(&self.cfg) / 2).max(1) } else { p.cap(&self.cfg) }
+                && p.inflight < if job.low {
+                    // Background work keeps at least one slot free for simulations.
+                    (p.cap(&self.cfg) / 2).min(p.cap(&self.cfg).saturating_sub(1))
+                } else {
+                    p.cap(&self.cfg)
+                }
                 && root.is_none_or(|r| p.unavailable_roots.get(&r).is_none_or(|t| t.elapsed() > ROOT_RETRY))
 
         };
