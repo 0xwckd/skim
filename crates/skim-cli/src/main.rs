@@ -1,12 +1,12 @@
 //! `skim` command line. For now: M0 probes (PROJECT.md §10).
 
+mod chain;
 mod follow;
-mod learned;
-mod predictor;
-mod prefetch;
 mod probe_cl;
 mod probe_call;
 mod probe_el;
+mod rpc;
+mod run;
 mod stats;
 
 use clap::{Parser, Subcommand};
@@ -27,6 +27,8 @@ enum Cmd {
     /// M1: follow the chain from CL gossip BALs into the MVCC store; time block -> state ready
     /// -> eth_call done vs when Infura can answer the same block.
     Follow(follow::Args),
+    /// Follow the chain and serve JSON-RPC (eth_call, eth_getStorageAt, ...) on top of it.
+    Run(run::Args),
     /// Peer-count sweep: one large learned wave fetched with 1/2/4/all peers per block.
     ProbeWave(probe_call::WaveArgs),
     /// M0 Spike A: Sepolia CL gossip listener; execution-payload envelope timing and BAL checks.
@@ -46,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::ProbeEl(args) => probe_el::run(args).await,
         Cmd::ProbeCall(args) => probe_call::run(args).await,
         Cmd::Follow(args) => follow::run(args).await,
+        Cmd::Run(args) => run::run(args).await,
         Cmd::ProbeWave(args) => probe_call::run_wave(args).await,
         Cmd::ProbeCl(args) => probe_cl::run(args).await,
     }

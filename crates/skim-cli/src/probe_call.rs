@@ -30,10 +30,8 @@ use revm::{
 use skim_el::ElNet;
 use skim_snap::{el::ElTransport, Key, Scheduler, Value};
 
-use crate::{
-    learned::{AccessKey, Learned, Source},
-    stats::Samples,
-};
+use crate::stats::Samples;
+use skim_sim::learned::{AccessKey, Learned, Source};
 
 #[derive(clap::Args)]
 pub struct Args {

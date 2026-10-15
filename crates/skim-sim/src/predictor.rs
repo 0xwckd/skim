@@ -17,31 +17,35 @@ use skim_bal::StateKey;
 use skim_state::{Snapshot, StateValue};
 
 use crate::{
+    CallInput as Call,
     learned::{AccessKey, Learned},
     prefetch::{self, V3Pool},
-    probe_call::Call,
 };
 
 const MAX_WORDS: i32 = 64;
 const QUOTE_EXACT_INPUT_SINGLE: [u8; 4] = [0xc6, 0xa5, 0x02, 0x6a];
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct V3Meta {
+pub struct V3Meta {
     pub pool: V3Pool,
     pub fee: u32,
     pub token0: Address,
     pub token1: Address,
 }
 
-pub(crate) struct Predictor {
+pub struct Predictor {
     pub learned: Learned,
     pub v3: Vec<V3Meta>,
     /// Bitmap words always covered around the current tick.
     pub base_words: i32,
+    /// Per pool, the furthest word offsets (below, above the current word) any prediction has
+    /// needed. The background refresh keeps this window warm, so repeat reaches stay off the
+    /// simulation path.
+    pub reach: std::sync::Mutex<HashMap<Address, (i32, i32)>>,
 }
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
-pub(crate) struct Prediction {
+pub struct Prediction {
     pub learned: usize,
     pub protocol: usize,
     /// Bitmap words the V3 source predicted for this input (0 if not a V3 quote).
@@ -58,7 +62,7 @@ fn u256_word(data: &[u8], i: usize) -> Option<U256> {
 
 /// Ticks a swap of `amount_in` can reach: `(current_tick, target_tick)` from the
 /// constant-liquidity formula. The caller widens it, since liquidity can drop after a crossing.
-pub(crate) fn v3_target_tick(slot0: U256, liquidity: U256, amount_in: U256, zero_for_one: bool) -> (i32, Option<i32>) {
+pub fn v3_target_tick(slot0: U256, liquidity: U256, amount_in: U256, zero_for_one: bool) -> (i32, Option<i32>) {
     let (tick, _) = prefetch::decode_slot0(slot0);
     let sqrt_x96: U256 = slot0 & ((U256::from(1u8) << 160usize) - U256::from(1u8));
     let sqrt_p = f64::from(sqrt_x96) / 2f64.powi(96);
@@ -103,6 +107,12 @@ impl Predictor {
         };
         let reach = ((dist as f64 * 1.5).ceil() as i32 + 1).clamp(self.base_words, MAX_WORDS);
         let (lo, hi) = if zero_for_one { (w0 - reach, w0 + 1) } else { (w0 - 1, w0 + reach) };
+        {
+            let mut r = self.reach.lock().unwrap();
+            let e = r.entry(a).or_insert((-self.base_words, self.base_words));
+            e.0 = e.0.min(lo - w0);
+            e.1 = e.1.max(hi - w0);
+        }
         let mut keys = prefetch::predict(snap, &m.pool, self.base_words);
         for w in lo..=hi {
             let wk = prefetch::bitmap_slot(w);
@@ -165,6 +175,11 @@ impl Predictor {
             }
         }
         out
+    }
+
+    /// Background window for a pool: the observed reach, at least ±`base_words`.
+    pub fn window(&self, pool: &Address) -> (i32, i32) {
+        self.reach.lock().unwrap().get(pool).copied().unwrap_or((-self.base_words, self.base_words))
     }
 
     pub fn record(&mut self, call: &Call, accounts: &[Address], storage: &[(Address, U256)]) {

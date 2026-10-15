@@ -19,7 +19,7 @@ use skim_snap::{FetchMeta, Key, Scheduler, Value, el::ElTransport};
 use skim_state::{BlockRef, Snapshot, StateValue, Store};
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
-pub(crate) struct Resolve {
+pub struct Resolve {
     pub keys: usize,
     pub wall_ms: f64,
     pub queue_ms_max: f64,
@@ -41,7 +41,7 @@ fn absorb(r: &mut Resolve, m: &FetchMeta) {
 }
 
 /// Fetches `accounts`/`storage`/`code` at `at.state_root` and commits them as bases at `at`.
-pub(crate) async fn resolve(
+pub async fn resolve(
     store: &Store,
     sched: &Scheduler<ElTransport>,
     at: &BlockRef,
@@ -104,7 +104,7 @@ const BITMAP_SLOT: u64 = 6;
 const OBSERVATIONS_SLOT: u64 = 8;
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct V3Pool {
+pub struct V3Pool {
     pub address: Address,
     pub spacing: i32,
 }
@@ -116,30 +116,35 @@ fn mapping_slot(key: I256, slot: u64) -> U256 {
     U256::from_be_bytes(keccak256(buf).0)
 }
 
-pub(crate) fn bitmap_slot(word: i32) -> U256 {
+pub fn bitmap_slot(word: i32) -> U256 {
     mapping_slot(I256::try_from(word).unwrap(), BITMAP_SLOT)
 }
 
-pub(crate) fn tick_base_slot(tick: i32) -> U256 {
+pub fn tick_base_slot(tick: i32) -> U256 {
     mapping_slot(I256::try_from(tick).unwrap(), TICKS_SLOT)
 }
 
 /// `(tick, observationIndex)` from a packed `slot0`.
-pub(crate) fn decode_slot0(v: U256) -> (i32, u16) {
+pub fn decode_slot0(v: U256) -> (i32, u16) {
     let raw: u32 = ((v >> 160usize) & U256::from(0xff_ffffu32)).to::<u32>();
     let tick = ((raw << 8) as i32) >> 8; // sign-extend int24
     let obs: u16 = ((v >> 184usize) & U256::from(0xffffu32)).to::<u16>();
     (tick, obs)
 }
 
-pub(crate) fn word_of(tick: i32, spacing: i32) -> i32 {
+pub fn word_of(tick: i32, spacing: i32) -> i32 {
     tick.div_euclid(spacing) >> 8
 }
 
 /// Keys a swap from the current state can touch within ±`words` bitmap words.
 /// Initialized ticks are known only once their bitmap words are, so this is called again after
 /// each refresh round until nothing new appears.
-pub(crate) fn predict(snap: &Snapshot, pool: &V3Pool, words: i32) -> Vec<StateKey> {
+pub fn predict(snap: &Snapshot, pool: &V3Pool, words: i32) -> Vec<StateKey> {
+    predict_range(snap, pool, -words, words)
+}
+
+/// Like [`predict`] with an asymmetric word window `[w0 + lo, w0 + hi]`.
+pub fn predict_range(snap: &Snapshot, pool: &V3Pool, lo: i32, hi: i32) -> Vec<StateKey> {
     let a = pool.address;
     let get = |slot: U256| snap.get(&StateKey::Storage(a, slot)).ok();
     let mut keys: Vec<StateKey> = [0u64, 1, 2, 3, 4].iter().map(|s| StateKey::Storage(a, U256::from(*s))).collect();
@@ -148,7 +153,7 @@ pub(crate) fn predict(snap: &Snapshot, pool: &V3Pool, words: i32) -> Vec<StateKe
     let (tick, obs) = decode_slot0(s0);
     keys.push(StateKey::Storage(a, U256::from(OBSERVATIONS_SLOT + obs as u64)));
     let w0 = word_of(tick, pool.spacing);
-    for w in (w0 - words)..=(w0 + words) {
+    for w in (w0 + lo)..=(w0 + hi) {
         let wk = bitmap_slot(w);
         keys.push(StateKey::Storage(a, wk));
         if let Some(StateValue::Known(bits)) = get(wk) {
@@ -168,18 +173,18 @@ pub(crate) fn predict(snap: &Snapshot, pool: &V3Pool, words: i32) -> Vec<StateKe
 
 /// Fetches whatever `predict` says is unknown, repeating while new keys appear (bitmap words
 /// first, then the ticks they reveal). Returns the rounds' breakdowns.
-pub(crate) async fn refresh_pool(
+pub async fn refresh_pool(
     store: &std::sync::Arc<Store>,
     sched: &Scheduler<ElTransport>,
     head: &BlockRef,
     at: &BlockRef,
     pool: &V3Pool,
-    words: i32,
+    (lo, hi): (i32, i32),
 ) -> Vec<Resolve> {
     let mut rounds = Vec::new();
     for _ in 0..3 {
         let Ok(snap) = store.snapshot(head) else { break };
-        let unknown: Vec<StateKey> = predict(&snap, pool, words)
+        let unknown: Vec<StateKey> = predict_range(&snap, pool, lo, hi)
             .into_iter()
             .filter(|k| matches!(snap.get(k), Ok(StateValue::Unknown)))
             .collect();
@@ -204,7 +209,7 @@ pub(crate) async fn refresh_pool(
 }
 
 /// `tickSpacing()` decoded from a call's output (int24 ABI-encoded).
-pub(crate) fn decode_spacing(out: &Bytes) -> Option<i32> {
+pub fn decode_spacing(out: &Bytes) -> Option<i32> {
     (out.len() == 32).then(|| {
         let v = U256::from_be_slice(out);
         let raw = (v & U256::from(0xff_ffffu32)).to::<u32>();

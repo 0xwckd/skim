@@ -1,0 +1,22 @@
+[package]
+name = "skim-sim"
+description = "Simulation over skim's MVCC snapshots: revm adapter, state access prediction, miss resolution"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+skim-bal.workspace = true
+skim-state.workspace = true
+skim-snap.workspace = true
+alloy-primitives.workspace = true
+alloy-consensus.workspace = true
+revm.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true

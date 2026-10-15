@@ -23,7 +23,6 @@ use std::{
 
 use alloy_consensus::Header;
 use alloy_primitives::{Address, B256, Bytes, U256};
-use reth_eth_wire_types::BlockHashOrNumber;
 use revm::{
     Context, DatabaseRef, ExecuteEvm, MainBuilder, MainContext,
     bytecode::Bytecode,
@@ -38,8 +37,9 @@ use skim_el::ElNet;
 use skim_snap::{Scheduler, el::ElTransport};
 use skim_state::{BlockRef, Snapshot, StateValue, Store};
 
+use skim_sim::prefetch;
+
 use crate::{
-    prefetch,
     probe_call::{Call, Misses, Sparse, block_env, calls, cold_run, infura_url},
     stats::Samples,
 };
@@ -80,6 +80,9 @@ pub struct Args {
     /// and expand V3 bitmap misses.
     #[arg(long)]
     predictor: bool,
+    /// Background V3 window follows the predictor's observed per-pool reach.
+    #[arg(long)]
+    adaptive_window: bool,
 }
 
 fn unix_ms(t: SystemTime) -> f64 {
@@ -266,7 +269,8 @@ struct Ctx {
     v3_words: i32,
     v3_pools: StdMutex<Vec<prefetch::V3Pool>>,
     random_quotes: usize,
-    predictor: Option<StdMutex<crate::predictor::Predictor>>,
+    predictor: Option<StdMutex<skim_sim::predictor::Predictor>>,
+    adaptive_window: bool,
 }
 
 /// First successful Infura `eth_call` at a block number: when that request was sent (an upper
@@ -355,11 +359,13 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         v3_words: args.v3_words,
         v3_pools: Default::default(),
         random_quotes: args.random_quotes,
+        adaptive_window: args.adaptive_window,
         predictor: args.predictor.then(|| {
-            StdMutex::new(crate::predictor::Predictor {
-                learned: crate::learned::Learned::new(8, 0.5, 256),
+            StdMutex::new(skim_sim::predictor::Predictor {
+                learned: skim_sim::learned::Learned::new(8, 0.5, 256),
                 v3: Vec::new(),
                 base_words: args.v3_words.max(1),
+                reach: Default::default(),
             })
         }),
     });
@@ -368,6 +374,12 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     }
     let pools = args.v3_pools.clone();
     tracing::info!(calls = ctx.calls.len(), "follow: waiting for envelopes and SNAP peers");
+    let chain = crate::chain::Chain {
+        store: ctx.store.clone(),
+        net: ctx.net.clone(),
+        on_header: Box::new(|_| {}),
+        lookback: 32,
+    };
 
     // 0 = not started, 1 = running, 2 = done. Blocks are applied from the first envelope on, so
     // the BAL index covers the bootstrap block; bootstrap starts once SNAP peers exist.
@@ -393,36 +405,25 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         let b = block_ref(&h);
         headers.insert(b.hash, h.clone());
 
-        // Place the block on the selected chain.
-        match ctx.store.head() {
-            None => {}
-            Some(head) if b.parent_hash == head.hash => {}
-            Some(head) if b.number <= head.number => {
-                match ctx.store.block(b.number) {
-                    Some(x) if x.hash == b.hash => continue, // duplicate
-                    _ if ctx.store.block(b.number - 1).is_some_and(|p| p.hash == b.parent_hash) => {
-                        ctx.store.rollback_to(b.number - 1);
-                        ctx.stats.lock().unwrap().reorgs += 1;
-                        tracing::warn!(number = b.number, "reorg: switched branch");
-                    }
-                    _ => continue, // deeper fork: wait for EL to resolve
+        // Place the block on the selected chain (fork switch / EL reconcile in `chain`).
+        match chain.place(h.clone(), writes).await {
+            crate::chain::Placed::Applied { reorged_to, filled, .. } => {
+                let mut st = ctx.stats.lock().unwrap();
+                st.reorgs += reorged_to.is_some() as u64;
+                st.from_el_fill += filled;
+                if reorged_to.is_some() || filled > 0 {
+                    tracing::warn!(number = b.number, ?reorged_to, filled, "reconciled with EL chain");
                 }
             }
-            Some(head) => {
-                // Gap: fill head+1 .. b.number-1 from EL peers.
-                if let Err(e) = fill_gap(&ctx, head.number + 1, b.number - 1, &mut headers).await {
-                    tracing::warn!(from = head.number + 1, to = b.number - 1, "gap fill failed: {e}; re-anchoring");
-                    ctx.store.rollback_to(0);
-                    boot.store(0, std::sync::atomic::Ordering::SeqCst);
-                }
-                if ctx.store.head().is_some_and(|hd| hd.hash != b.parent_hash) {
-                    continue;
-                }
+            crate::chain::Placed::Reanchored(_) => {
+                tracing::warn!(number = b.number, "re-anchored: state reset, bootstrapping again");
+                boot.store(0, std::sync::atomic::Ordering::SeqCst);
             }
-        }
-        if let Err(e) = ctx.store.apply_block(b, writes) {
-            tracing::warn!(number = b.number, "apply failed: {e}");
-            continue;
+            crate::chain::Placed::Duplicate => continue,
+            crate::chain::Placed::Deferred(why) => {
+                tracing::debug!(number = b.number, "deferred: {why}");
+                continue;
+            }
         }
         let apply_us = t_apply.elapsed().as_secs_f64() * 1e6;
         let applied_ms = unix_ms(SystemTime::now());
@@ -530,7 +531,7 @@ async fn detect_pools(ctx: &Arc<Ctx>, h: &Header, b: &BlockRef, pools: &[Address
                         let t1 = word([0xd2, 0x12, 0x20, 0xa7]);
                         tracing::info!(%address, spacing, ?fee, "V3 pool registered for prefetch");
                         if let (Some(p), Some(fee), Some(t0), Some(t1)) = (&ctx.predictor, fee, t0, t1) {
-                            p.lock().unwrap().v3.push(crate::predictor::V3Meta {
+                            p.lock().unwrap().v3.push(skim_sim::predictor::V3Meta {
                                 pool,
                                 fee: fee.to(),
                                 token0: Address::from_word(t0.into()),
@@ -557,7 +558,11 @@ fn spawn_prefetch(ctx: &Arc<Ctx>, b: BlockRef) {
     tokio::spawn(async move {
         let at = if ctx.miss_at_parent { ctx.store.block(b.number - 1).unwrap_or(b) } else { b };
         for pool in pools {
-            let rounds = prefetch::refresh_pool(&ctx.store, &ctx.sched, &b, &at, &pool, ctx.v3_words).await;
+            let window = match &ctx.predictor {
+                Some(p) if ctx.adaptive_window => p.lock().unwrap().window(&pool.address),
+                _ => (-ctx.v3_words, ctx.v3_words),
+            };
+            let rounds = prefetch::refresh_pool(&ctx.store, &ctx.sched, &b, &at, &pool, window).await;
             let mut s = ctx.stats.lock().unwrap();
             for r in rounds {
                 s.prefetch_rounds += 1;
@@ -566,33 +571,6 @@ fn spawn_prefetch(ctx: &Arc<Ctx>, b: BlockRef) {
             }
         }
     });
-}
-
-/// Fetches headers and eth/71 BALs for `from..=to` from EL peers and applies them.
-async fn fill_gap(ctx: &Ctx, from: u64, to: u64, headers: &mut HashMap<B256, Header>) -> anyhow::Result<()> {
-    if from > to {
-        return Ok(());
-    }
-    let peers: Vec<_> = ctx.net.peers().into_iter().filter(|(_, p)| p.eth_version >= 71).map(|(id, _)| id).collect();
-    for peer in peers {
-        let Ok(hs) = ctx.net.headers(peer, BlockHashOrNumber::Number(from), to - from + 1).await.0 else { continue };
-        if hs.len() as u64 != to - from + 1 {
-            continue;
-        }
-        let hashes: Vec<B256> = hs.iter().map(|h| h.hash_slow()).collect();
-        let Ok(bals) = ctx.net.bals(peer, hashes).await.0 else { continue };
-        for (h, raw) in hs.iter().zip(bals.0) {
-            let raw = raw.ok_or_else(|| anyhow::anyhow!("BAL unavailable for {}", h.number))?;
-            let bal = skim_bal::decode_verified(&raw, h.block_access_list_hash.unwrap_or_default())?;
-            ctx.store.apply_block(block_ref(h), Arc::new(BlockWrites::from_bal(&bal)))?;
-            headers.insert(h.hash_slow(), h.clone());
-            let mut s = ctx.stats.lock().unwrap();
-            s.blocks += 1;
-            s.from_el_fill += 1;
-        }
-        return Ok(());
-    }
-    anyhow::bail!("no EL peer served headers+BALs")
 }
 
 async fn measure_block(ctx: Arc<Ctx>, h: Header, b: BlockRef, recv_ms: f64, applied_ms: f64) {
@@ -607,7 +585,8 @@ async fn measure_block(ctx: Arc<Ctx>, h: Header, b: BlockRef, recv_ms: f64, appl
     for call in &calls {
         // State Access Predictor: fetch the predicted-but-unknown keys in one wave first.
         if let Some(p) = &ctx.predictor {
-            let (keys, pred) = p.lock().unwrap().predict(call, &snap);
+            let input = skim_sim::CallInput { to: call.to, data: call.data.clone() };
+            let (keys, pred) = p.lock().unwrap().predict(&input, &snap);
             let (accts, slots) = unknown_split(&snap, &keys);
             if !accts.is_empty() || !slots.is_empty() {
                 let r = prefetch::resolve(&ctx.store, &ctx.sched, &at, &accts, &slots, &[]).await;
@@ -671,7 +650,7 @@ async fn measure_block(ctx: Arc<Ctx>, h: Header, b: BlockRef, recv_ms: f64, appl
             ta.dedup();
             ts.sort();
             ts.dedup();
-            p.lock().unwrap().record(call, &ta, &ts);
+            p.lock().unwrap().record(&skim_sim::CallInput { to: call.to, data: call.data.clone() }, &ta, &ts);
         }
         outputs.push(out);
     }
