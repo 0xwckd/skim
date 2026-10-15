@@ -148,7 +148,7 @@ const { result } = await client.simulateContract({
 - **[Docs](docs):** [getting started](docs/guide/getting-started.md), [how it works](docs/guide/how-it-works.md), [configuration](docs/guide/configuration.md), [JSON-RPC](docs/guide/json-rpc.md), [archive](docs/guide/archive.md), [trust](docs/guide/trust-and-correctness.md), [troubleshooting](docs/guide/troubleshooting.md).
 
 **Supported methods:**
-- State and simulation: `eth_call`, `eth_estimateGas`, `eth_getBalance`, `eth_getCode`, `eth_getStorageAt`, `eth_getTransactionCount` (including `pending`)
+- State and simulation: `eth_call` (with state overrides), `eth_simulateV1`, `debug_traceCall` (default, `callTracer`, `prestateTracer`), `eth_estimateGas`, `eth_getBalance`, `eth_getCode`, `eth_getStorageAt`, `eth_getTransactionCount` (including `pending`)
 - Transactions: `eth_sendRawTransaction` (gossiped straight to EL peers), `eth_getTransactionByHash`, `eth_getTransactionReceipt`
 - Logs: `eth_getLogs`. Receipts are fetched only for blocks whose bloom and BAL match, and checked against `receiptsRoot`.
 - Blocks and chain: `eth_getBlockByNumber` / `eth_getBlockByHash`, `eth_blockNumber`, `eth_chainId`, `net_version`, `eth_syncing`, `eth_gasPrice`, `eth_maxPriorityFeePerGas`, `web3_clientVersion`

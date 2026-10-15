@@ -58,6 +58,7 @@ impl From<SimError> for RpcError {
     fn from(e: SimError) -> Self {
         match e {
             SimError::Evm(m) => Self::new(-32000, m),
+            SimError::Unsupported(m) => Self::params(format!("not supported: {m}")),
             other => Self::unavailable(other.to_string()),
         }
     }
@@ -71,6 +72,44 @@ const OUT_OF_SCOPE: &[&str] = &[
     "eth_getFilterChanges",
     "eth_subscribe",
 ];
+
+/// One `eth_simulateV1` block: environment fields and each call's outcome (geth's shape).
+fn simulated_block_json(b: &skim_sim::multi::SimBlockResult) -> Value {
+    let number: u64 = b.env.number.saturating_to();
+    let mut log_index = 0u64;
+    let mut gas_total = 0u64;
+    let calls: Vec<Value> = b
+        .calls
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            gas_total += r.tx_gas_used();
+            let logs: Vec<Value> = r
+                .logs()
+                .iter()
+                .map(|l| {
+                    let v = json!({"address": l.address, "topics": l.topics(), "data": l.data.data, "blockNumber": hex_u64(number),
+                        "transactionIndex": hex_u64(i as u64), "logIndex": hex_u64(log_index), "removed": false});
+                    log_index += 1;
+                    v
+                })
+                .collect();
+            let mut c = json!({"gasUsed": hex_u64(r.tx_gas_used()), "logs": logs,
+                "returnData": r.output().cloned().unwrap_or_default(), "status": if r.is_success() { "0x1" } else { "0x0" }});
+            match r {
+                ExecutionResult::Revert { output, .. } => c["error"] = json!({"code": 3, "message": "execution reverted", "data": output}),
+                ExecutionResult::Halt { reason, .. } => c["error"] = json!({"code": -32015, "message": format!("{reason:?}")}),
+                ExecutionResult::Success { .. } => {}
+            }
+            c
+        })
+        .collect();
+    json!({
+        "number": hex_u64(number), "timestamp": hex_u64(b.env.timestamp.saturating_to()), "gasLimit": hex_u64(b.env.gas_limit),
+        "gasUsed": hex_u64(gas_total), "miner": b.env.beneficiary, "baseFeePerGas": hex_u64(b.env.basefee),
+        "prevRandao": b.env.prevrandao, "calls": calls,
+    })
+}
 
 fn hex_u64(n: u64) -> Value {
     Value::String(format!("{n:#x}"))
@@ -266,12 +305,15 @@ impl Rpc {
                 Ok(json!(B256::from(v)))
             }
             "eth_call" => {
-                if params.get(2).is_some_and(|v| !v.is_null()) {
-                    return Err(RpcError::params("state overrides are not supported yet"));
-                }
                 let req: TransactionRequest = need(params, 0)?;
                 let b = self.resolve_block(param(params, 1)?, latest)?;
                 let header = self.header(&b)?;
+                if let Some(overrides) = param::<alloy_rpc_types_eth::state::StateOverride>(params, 2)? {
+                    // State overrides: the call runs on an overlay; the store is never modified.
+                    let blocks = [skim_sim::multi::SimBlock { block: None, state: Some(overrides), calls: vec![self.tx_env(req, &header)?] }];
+                    let out = sim.simulate(&b, &blocks, skim_sim::multi::Placement::SameBlock).await?;
+                    return Self::exec_result(&out[0].calls[0]);
+                }
                 let out = sim.call(&b, self.tx_env(req, &header)?, Mode::Resolve { max_rounds: 8 }).await?;
                 tracing::debug!(number = b.number, predicted_keys = out.predicted.as_ref().map_or(0, |p| p.keys),
                     predicted_ms = out.predicted.as_ref().map_or(0.0, |p| p.wall_ms), rounds = out.rounds.len(),
@@ -339,6 +381,39 @@ impl Rpc {
                     _ => ChainData::range(&filter, head)?,
                 };
                 Ok(chain.logs(&filter, from, to).await?)
+            }
+            "eth_simulateV1" => {
+                let payload: alloy_rpc_types_eth::simulate::SimulatePayload = need(params, 0)?;
+                if payload.validation {
+                    return Err(RpcError::params("validation: true is not supported (simulations run without nonce/balance/fee checks)"));
+                }
+                if payload.trace_transfers {
+                    return Err(RpcError::params("traceTransfers is not supported yet"));
+                }
+                let b = self.resolve_block(param(params, 1)?, latest)?;
+                let header = self.header(&b)?;
+                let mut blocks = Vec::with_capacity(payload.block_state_calls.len());
+                for blk in payload.block_state_calls {
+                    let mut calls = Vec::with_capacity(blk.calls.len());
+                    for c in blk.calls {
+                        calls.push(self.tx_env(c, &header)?);
+                    }
+                    blocks.push(skim_sim::multi::SimBlock { block: blk.block_overrides, state: blk.state_overrides, calls });
+                }
+                let out = sim.simulate(&b, &blocks, skim_sim::multi::Placement::NextBlocks).await?;
+                Ok(Value::Array(out.iter().map(simulated_block_json).collect()))
+            }
+            "debug_traceCall" => {
+                let req: TransactionRequest = need(params, 0)?;
+                let b = self.resolve_block(param(params, 1)?, latest)?;
+                let opts: alloy_rpc_types_trace::geth::GethDebugTracingCallOptions = param(params, 2)?.unwrap_or_default();
+                if opts.block_overrides.is_some() {
+                    return Err(RpcError::params("blockOverrides in debug_traceCall are not supported yet"));
+                }
+                let header = self.header(&b)?;
+                let tx = self.tx_env(req, &header)?;
+                let trace = sim.trace_call(&b, tx, opts.state_overrides, opts.tracing_options).await?;
+                Ok(serde_json::to_value(trace).unwrap())
             }
             "skim_status" => {
                 let z = sim.store.sizes();

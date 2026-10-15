@@ -8,6 +8,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+revm-inspectors.workspace = true
+alloy-rpc-types-trace.workspace = true
+alloy-rpc-types-eth.workspace = true
 skim-bal.workspace = true
 skim-state.workspace = true
 skim-snap.workspace = true

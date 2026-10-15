@@ -5,7 +5,9 @@ skim serves standard Ethereum JSON-RPC over HTTP and WebSocket on the same addre
 ## Methods
 | Method | Notes |
 |---|---|
-| `eth_call` | Local revm. Unknown state is fetched (verified) first. Honours `gasPrice` / `maxFeePerGas` / `maxPriorityFeePerGas` (0 if omitted, as nodes do), `accessList` and `authorizationList` (EIP-7702). Blob fields and state overrides are rejected (`-32602`), never ignored. |
+| `eth_call` | Local revm. Unknown state is fetched (verified) first. Honours `gasPrice` / `maxFeePerGas` / `maxPriorityFeePerGas` (0 if omitted, as nodes do), `accessList`, `authorizationList` (EIP-7702) and **state overrides** (`balance`, `nonce`, `code`, `state`, `stateDiff`). Blob fields are rejected (`-32602`), never ignored. |
+| `eth_simulateV1` | Sequences of calls across simulated blocks (each call sees earlier calls' writes), with per-block `blockOverrides` (number, time, gas limit, fee recipient, base fee, prevrandao) and `stateOverrides`. Per call: `status`, `returnData`, `gasUsed`, `logs`, `error`. Not yet: `validation: true`, `traceTransfers`. |
+| `debug_traceCall` | geth tracers: default (struct logs), `callTracer`, `prestateTracer`, `noopTracer`, with `stateOverrides`. Not yet: `blockOverrides`, other tracers. |
 | `eth_estimateGas` | Binary search on local execution, once the first run made the state local. |
 | `eth_getBalance`, `eth_getCode`, `eth_getStorageAt` | Tracked: local. Untracked: one verified fetch. |
 | `eth_getTransactionCount` | `pending` adds transactions sent through this skim and not yet included (gap-free nonces only). |
@@ -54,4 +56,10 @@ viem's `watch*` helpers use these automatically with `webSocket(...)`.
 | `-32602` / `-32601` | Bad params / unknown method. |
 
 ## Not yet
-`eth_simulateV1`, `eth_createAccessList`, `debug_traceCall`, `eth_feeHistory`, `eth_getProof`, state overrides, full transactions in blocks, `newPendingTransactions`.
+`eth_createAccessList`, `eth_feeHistory`, `eth_getProof`, `debug_traceTransaction`, full transactions in blocks, `newPendingTransactions`.
+
+## Compatibility notes
+- **Checked against a reference:** state overrides, `eth_simulateV1` and the three tracers were checked against Nethermind at the same block. All were identical (`docs/experiments/tools/sim_trace_check.py`).
+- **Calls without `gas`:** skim uses the block gas limit; nodes differ here (Nethermind: 100M).
+- **EIP-8037 gas breakdown in `callTracer`:** the field names aren't standardized across clients yet. skim says `executionGasUsed`, Nethermind `regularGasUsed`.
+- **Fee recipient in `prestateTracer`:** it is included, as geth and Nethermind do, even though skim's calls charge no fees.

@@ -11,6 +11,7 @@
 pub mod db;
 pub mod env;
 pub mod learned;
+pub mod multi;
 pub mod predictor;
 pub mod prefetch;
 pub mod subscription;
@@ -66,6 +67,8 @@ pub enum SimError {
     NotArchived { block: u64, keys: usize },
     #[error("evm: {0}")]
     Evm(String),
+    #[error("not supported: {0}")]
+    Unsupported(&'static str),
 }
 
 #[derive(Debug)]
