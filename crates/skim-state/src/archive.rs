@@ -45,6 +45,8 @@ pub enum ArchiveError {
     Db(String),
     #[error("block {0} does not extend the archive (last {1:?})")]
     NotNext(u64, Option<u64>),
+    #[error("gap fill does not fit: {0}")]
+    GapMismatch(String),
 }
 
 macro_rules! db_err {
@@ -184,21 +186,63 @@ impl Archive {
                     seg.insert(b.number, b.number)?;
                 }
             }
-            let mut versions = tx.open_table(VERSIONS)?;
-            let mut cov = tx.open_table(COVERAGE)?;
-            let mut journal = Vec::with_capacity(b.writes.len() * K);
-            for (k, v) in b.writes {
-                let ek = encode_key(k);
-                versions.insert(&vkey(&ek, b.number), &v.to_be_bytes::<32>())?;
-                if cov.get(&ek)?.is_none() {
-                    cov.insert(&ek, b.number)?;
-                }
-                journal.extend_from_slice(&ek);
+            Self::write_entries(&tx, b)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn write_entries(tx: &redb::WriteTransaction, b: &ArchiveBlock<'_>) -> Result<(), ArchiveError> {
+        let mut versions = tx.open_table(VERSIONS)?;
+        let mut cov = tx.open_table(COVERAGE)?;
+        let mut journal = Vec::with_capacity(b.writes.len() * K);
+        for (k, v) in b.writes {
+            let ek = encode_key(k);
+            versions.insert(&vkey(&ek, b.number), &v.to_be_bytes::<32>())?;
+            // Coverage starts at the earliest block whose value is known (a gap fill can move it
+            // earlier: a write fixes the value from that block on).
+            let cur = cov.get(&ek)?.map(|g| g.value());
+            if cur.is_none_or(|c| b.number < c) {
+                cov.insert(&ek, b.number)?;
             }
-            tx.open_table(JOURNAL)?.insert(b.number, journal.as_slice())?;
-            tx.open_table(HEADERS)?.insert(b.number, b.header_rlp)?;
-            tx.open_table(HASHES)?.insert(b.number, &b.hash.0)?;
-            tx.open_table(BY_HASH)?.insert(&b.hash.0, b.number)?;
+            journal.extend_from_slice(&ek);
+        }
+        tx.open_table(JOURNAL)?.insert(b.number, journal.as_slice())?;
+        tx.open_table(HEADERS)?.insert(b.number, b.header_rlp)?;
+        tx.open_table(HASHES)?.insert(b.number, &b.hash.0)?;
+        tx.open_table(BY_HASH)?.insert(&b.hash.0, b.number)?;
+        Ok(())
+    }
+
+    /// Fills the gap between two segments with the missing blocks (in order) and merges them.
+    /// `blocks` must start right after a segment's end, end right before the next segment's
+    /// start, and link by hash to both: `first_parent` = hash at the previous end, and the last
+    /// block's hash = parent of the next segment's first header (checked by `next_parent`).
+    pub fn fill_gap(&self, blocks: &[ArchiveBlock<'_>], first_parent: B256, next_parent: B256) -> Result<(), ArchiveError> {
+        let (Some(first), Some(last)) = (blocks.first(), blocks.last()) else { return Ok(()) };
+        let segs = self.segments()?;
+        let prev = segs.iter().find(|(_, e)| *e + 1 == first.number).copied();
+        let next = segs.iter().find(|(s, _)| *s == last.number + 1).copied();
+        let (Some((ps, _)), Some((ns, ne))) = (prev, next) else {
+            return Err(ArchiveError::GapMismatch(format!("{}..={} is not between two segments", first.number, last.number)));
+        };
+        if self.hash(first.number - 1)? != Some(first_parent) {
+            return Err(ArchiveError::GapMismatch("first block does not link to the previous segment".into()));
+        }
+        if last.hash != next_parent {
+            return Err(ArchiveError::GapMismatch("last block does not link to the next segment".into()));
+        }
+        if blocks.windows(2).any(|w| w[1].number != w[0].number + 1) {
+            return Err(ArchiveError::GapMismatch("blocks are not consecutive".into()));
+        }
+        let tx = self.db.begin_write()?;
+        for b in blocks {
+            Self::write_entries(&tx, b)?;
+        }
+        {
+            let mut seg = tx.open_table(SEGMENTS)?;
+            seg.remove(ns)?;
+            seg.insert(ps, ne)?;
         }
         tx.commit()?;
         Ok(())
@@ -399,6 +443,31 @@ mod tests {
         assert!(matches!(a.get(&slot(9), 2).unwrap(), ArchiveRead::NotCovered { from: None }));
         blk(&a, 3, &[(slot(1), 33)]); // the new branch
         assert_eq!(val(&a, slot(1), 3), Some(33));
+    }
+
+    #[test]
+    fn a_late_gap_fill_merges_segments_and_restores_continuity() {
+        let d = tempfile::tempdir().unwrap();
+        let a = Archive::open(d.path().join("a.redb")).unwrap();
+        blk(&a, 10, &[]);
+        a.write_base(&slot(1), 10, U256::from(5), &[]).unwrap();
+        blk(&a, 11, &[]);
+        blk(&a, 15, &[]); // restart: 12..14 missing
+        a.write_base(&slot(1), 15, U256::from(8), &[]).unwrap();
+        assert_eq!(val(&a, slot(1), 13), None);
+        let w13 = [(slot(1), U256::from(8))];
+        let gap = [
+            ArchiveBlock { number: 12, hash: B256::with_last_byte(12), header_rlp: &[0xc0], writes: &[] },
+            ArchiveBlock { number: 13, hash: B256::with_last_byte(13), header_rlp: &[0xc0], writes: &w13 },
+            ArchiveBlock { number: 14, hash: B256::with_last_byte(14), header_rlp: &[0xc0], writes: &[] },
+        ];
+        // Must link on both sides.
+        assert!(a.fill_gap(&gap, B256::with_last_byte(99), B256::with_last_byte(14)).is_err());
+        a.fill_gap(&gap, B256::with_last_byte(11), B256::with_last_byte(14)).unwrap();
+        assert_eq!(a.segments().unwrap(), vec![(10, 15)]);
+        assert_eq!(val(&a, slot(1), 12), Some(5));
+        assert_eq!(val(&a, slot(1), 13), Some(8));
+        assert_eq!(val(&a, slot(1), 15), Some(8));
     }
 
     #[test]

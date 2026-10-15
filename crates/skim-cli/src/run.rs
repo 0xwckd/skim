@@ -139,6 +139,9 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     tracing::info!(subscriptions = subs.status().len(), declared_keys = subs.total_keys(), "state subscriptions loaded");
     let (_cl, mut rx) = ClNode::start(NodeConfig::sepolia(args.cl_port)).await?;
     tokio::spawn(serve(Arc::new(Rpc { sim: sim.clone(), subs: Some(subs.clone()) }), args.rpc));
+    if store.archive().is_some() {
+        spawn_archive_healer(store.clone(), net.clone());
+    }
     let maintaining = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sim2 = sim.clone();
     let store2 = store.clone();
@@ -151,7 +154,6 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         }),
         lookback: 32,
     };
-    let mut archive_gap_checked = false;
     tracing::info!("following Sepolia from CL gossip; RPC answers once the first block is applied");
 
     while let Some(ev) = rx.recv().await {
@@ -167,22 +169,6 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         }
         let Ok(bal) = skim_bal::decode(env.payload.block_access_list) else { continue };
         let number = v.header.number;
-        // After a restart, fill the archive from its last block up to this one, so archived
-        // history stays continuous (eth/71 BALs are retained for ~2 weeks).
-        if !archive_gap_checked {
-            archive_gap_checked = true;
-            if let Some(ar) = store.archive() {
-                if let Some(last) = ar.last_block()? {
-                    if number > last + 1 {
-                        match fill_archive_gap(&store, &net, last + 1, number - 1).await {
-                            Ok(n) => tracing::info!(from = last + 1, to = number - 1, blocks = n, "archive gap filled from eth/71"),
-                            Err(e) => tracing::warn!(from = last + 1, to = number - 1,
-                                "archive gap not filled ({e}); history before {number} stays uncovered for keys written in the gap"),
-                        }
-                    }
-                }
-            }
-        }
         match chain.place(v.header, Arc::new(BlockWrites::from_bal(&bal))).await {
             Placed::Applied { ready, reorged_to, filled } => {
                 tracing::info!(number, changed = ready.changed_keys.len(), ?reorged_to, filled, "state ready");
@@ -203,13 +189,38 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Writes blocks `from..=to` (headers + archived keys' BAL writes) straight into the archive.
-async fn fill_archive_gap(store: &skim_state::Store, net: &ElNet, from: u64, to: u64) -> anyhow::Result<u64> {
+/// Heals gaps between archive segments (e.g. after a restart) from eth/71 headers + BALs,
+/// retrying until EL peers can serve them. Gaps it can't fill stay uncovered, never guessed.
+fn spawn_archive_healer(store: Arc<Store>, net: ElNet) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            let Some(ar) = store.archive() else { return };
+            let Ok(segs) = ar.segments() else { continue };
+            for w in segs.windows(2) {
+                let ((_, a_end), (b_start, _)) = (w[0], w[1]);
+                match heal_gap(&store, &net, a_end + 1, b_start - 1).await {
+                    Ok(()) => tracing::info!(from = a_end + 1, to = b_start - 1, "archive gap healed from eth/71"),
+                    Err(e) => tracing::debug!(from = a_end + 1, to = b_start - 1, "archive gap not healed yet: {e}"),
+                }
+            }
+        }
+    });
+}
+
+async fn heal_gap(store: &Store, net: &ElNet, from: u64, to: u64) -> anyhow::Result<()> {
     use reth_eth_wire_types::BlockHashOrNumber;
     let ar = store.archive().ok_or_else(|| anyhow::anyhow!("no archive"))?;
-    let mut prev = ar.hash(from - 1)?;
-    let mut next = from;
+    let first_parent = ar.hash(from - 1)?.ok_or_else(|| anyhow::anyhow!("no hash at {}", from - 1))?;
+    let next_rlp = ar.header_rlp(to + 1)?.ok_or_else(|| anyhow::anyhow!("no header at {}", to + 1))?;
+    let next_parent = <alloy_consensus::Header as alloy_rlp::Decodable>::decode(&mut next_rlp.as_slice())?.parent_hash;
     let peers: Vec<_> = net.peers().into_iter().filter(|(_, p)| p.eth_version >= 71).map(|(id, _)| id).collect();
+    if peers.is_empty() {
+        anyhow::bail!("no EL peers yet");
+    }
+    // Collect (header, writes, code) for the whole gap, verified, before touching the archive.
+    let mut collected: Vec<(alloy_consensus::Header, Vec<(skim_bal::StateKey, alloy_primitives::U256)>, Vec<u8>)> = Vec::new();
+    let mut next = from;
     'outer: while next <= to {
         let count = (to - next + 1).min(64);
         for &peer in &peers {
@@ -218,26 +229,35 @@ async fn fill_archive_gap(store: &skim_state::Store, net: &ElNet, from: u64, to:
                 continue;
             }
             let hashes: Vec<alloy_primitives::B256> = hs.iter().map(|h| h.hash_slow()).collect();
-            let Ok(bals) = net.bals(peer, hashes.clone()).await.0 else { continue };
-            for ((h, hash), raw) in hs.iter().zip(&hashes).zip(bals.0) {
-                if prev.is_some_and(|p| p != h.parent_hash) {
-                    anyhow::bail!("archive chain does not link at {}", h.number);
-                }
+            let Ok(bals) = net.bals(peer, hashes).await.0 else { continue };
+            for (h, raw) in hs.into_iter().zip(bals.0) {
                 let raw = raw.ok_or_else(|| anyhow::anyhow!("BAL {} unavailable", h.number))?;
                 let bal = skim_bal::decode_verified(&raw, h.block_access_list_hash.unwrap_or_default())?;
                 let w = BlockWrites::from_bal(&bal);
-                let aw: Vec<_> = w.writes.iter().filter(|(k, _)| store.is_archived(k)).copied().collect();
-                let rlp = alloy_rlp::encode(h);
-                ar.write_block(&skim_state::archive::ArchiveBlock { number: h.number, hash: *hash, header_rlp: &rlp, writes: &aw })?;
                 for (ch, c) in &w.code {
-                    ar.put_code(*ch, c)?;
+                    if w.writes.iter().any(|(k, v)| store.is_archived(k) && alloy_primitives::B256::from(*v) == *ch) {
+                        ar.put_code(*ch, c)?;
+                    }
                 }
-                prev = Some(*hash);
+                let aw: Vec<_> = w.writes.iter().filter(|(k, _)| store.is_archived(k)).copied().collect();
+                let rlp = alloy_rlp::encode(&h);
                 next = h.number + 1;
+                collected.push((h, aw, rlp));
             }
             continue 'outer;
         }
         anyhow::bail!("no EL peer served headers+BALs from {next}");
     }
-    Ok(to + 1 - from)
+    // Hash links inside the gap; the archive checks both ends.
+    let mut prev = first_parent;
+    for (h, _, _) in &collected {
+        anyhow::ensure!(h.parent_hash == prev, "gap chain does not link at {}", h.number);
+        prev = h.hash_slow();
+    }
+    let blocks: Vec<skim_state::archive::ArchiveBlock<'_>> = collected
+        .iter()
+        .map(|(h, aw, rlp)| skim_state::archive::ArchiveBlock { number: h.number, hash: h.hash_slow(), header_rlp: rlp, writes: aw })
+        .collect();
+    ar.fill_gap(&blocks, first_parent, next_parent)?;
+    Ok(())
 }

@@ -9,7 +9,7 @@
   <a href="#license"><img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-9AA7C7"></a>
 </p>
 
-<p align="center"><b>Not every app needs a full node.</b></p>
+<p align="center"><b>Not every app needs a full node. Sync (and archive) only what you need.</b></p>
 
 **skim** is an application-specific Ethereum state client. You declare the state your app cares about: accounts, storage slots, or whole simulations. skim keeps exactly that state current, straight from the Ethereum P2P network, and runs your `eth_call`s locally against it in milliseconds. Anything else is fetched on demand, with Merkle proofs verified, only when a request needs it.
 
@@ -57,6 +57,7 @@ state:
         - to: "0xEd1f6473345F45b75F8179591dd5bA1888cf2FB3"
           data: "0xc6a5026a…"
       on_block: true                      # re-run each block; read via skim_subscriptionStatus
+      retention: { mode: archive }        # keep every version on disk (skim run --archive <path>)
   on_demand: { enabled: true, cache_ttl_blocks: 4 }
   limits:    { max_subscribed_keys: 100000 }
 ```
@@ -106,7 +107,7 @@ flowchart LR
 | `skim-cl` | Minimal Gloas gossip listener: discv5, libp2p, envelope parsing, payload verification |
 | `skim-el` | EL networking on reth: eth/71 BALs, snap/2 and a snap/1 client, head following |
 | `skim-snap` | Adaptive request scheduler and SNAP Merkle-proof verification |
-| `skim-state` | Per-key MVCC store: BAL application, base inserts with replay, reorg rollback, retention |
+| `skim-state` | Per-key MVCC store (BAL application, base inserts with replay, reorg rollback, retention) and the selective on-disk archive |
 | `skim-sim` | revm over snapshots, state access predictor, subscriptions |
 | `skim-cli` | `skim run` (JSON-RPC), `skim follow`, probes and benchmarks |
 
@@ -161,7 +162,8 @@ Consensus light-client verification is on the roadmap. Until then, skim trusts t
 - [x] M2: simulator, JSON-RPC adapter, verified state, state access predictor
 - [x] M3: subscriptions (subscribed vs on-demand state)
 - [ ] Resource benchmark vs a Nethermind full node (same workload, same block hashes)
-- [ ] **M4: selective state archiving.** `retention: archive` keeps every BAL-written version of subscribed state on disk, so `eth_getStorageAt` / `eth_call` work at historical blocks for what you subscribed to, from the block each key became known. *Sync and archive only what you need.*
+- [x] **M4: selective state archiving.** `retention: archive` keeps every BAL-written version of subscribed state on disk. `eth_getStorageAt` and `eth_call` then work at historical blocks for what you subscribed to, from the block each key became known (90/90 and 51/51 historical reads matched Infura, restart gaps healed from eth/71; see [M4](docs/m4-archive.md)). *Sync and archive only what you need.*
+- [ ] M4.2: backfill archived keys from retained BALs (~2 weeks) for keys written in that window
 - [ ] Generalized learned patterns (pool + direction + amount bucket + tick range), key and byte bounds
 - [ ] `storage: all` for small contracts; WebSocket pushes for `on_block` subscriptions
 - [ ] Consensus light-client verification; mainnet once Glamsterdam ships there
