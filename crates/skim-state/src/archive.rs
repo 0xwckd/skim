@@ -36,6 +36,9 @@ const HASHES: TableDefinition<u64, &[u8; 32]> = TableDefinition::new("hashes");
 const BY_HASH: TableDefinition<&[u8; 32], u64> = TableDefinition::new("by_hash");
 const CODE: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("code");
 const JOURNAL: TableDefinition<u64, &[u8]> = TableDefinition::new("journal");
+/// Keys whose coverage starts at a BAL **write** (not a base): the value before that write is in
+/// no BAL, so their history can never be extended backwards.
+const WRITE_BOUND: TableDefinition<&[u8; K], ()> = TableDefinition::new("write_bound");
 /// Segments: first block -> last block (inclusive) of each run of consecutive processed blocks.
 const SEGMENTS: TableDefinition<u64, u64> = TableDefinition::new("segments");
 
@@ -95,6 +98,19 @@ fn vkey(k: &[u8; K], block: u64) -> [u8; VK] {
     out
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BackfillReport {
+    pub new_blocks: u64,
+    /// Keys never written in the scanned range: coverage extended to its start.
+    pub keys_unchanged: u64,
+    /// Keys written in the range: coverage extended to their first write.
+    pub keys_written: u64,
+    /// Keys whose coverage starts beyond the scanned range (not extended).
+    pub keys_unscanned: u64,
+    /// Keys whose coverage starts at a write: never extendable.
+    pub keys_write_bound: u64,
+}
+
 /// One processed block for the archive.
 pub struct ArchiveBlock<'a> {
     pub number: u64,
@@ -122,6 +138,7 @@ impl Archive {
         tx.open_table(CODE)?;
         tx.open_table(JOURNAL)?;
         tx.open_table(SEGMENTS)?;
+        tx.open_table(WRITE_BOUND)?;
         tx.commit()?;
         Ok(Self { db })
     }
@@ -204,6 +221,7 @@ impl Archive {
             let cur = cov.get(&ek)?.map(|g| g.value());
             if cur.is_none_or(|c| b.number < c) {
                 cov.insert(&ek, b.number)?;
+                tx.open_table(WRITE_BOUND)?.insert(&ek, ())?;
             }
             journal.extend_from_slice(&ek);
         }
@@ -212,6 +230,132 @@ impl Archive {
         tx.open_table(HASHES)?.insert(b.number, &b.hash.0)?;
         tx.open_table(BY_HASH)?.insert(&b.hash.0, b.number)?;
         Ok(())
+    }
+
+    /// Every archived key with its coverage start, and whether that start is a base value
+    /// (extendable backwards by a BAL scan) rather than a write (never extendable).
+    pub fn coverages(&self) -> Result<Vec<(StateKey, u64, bool)>, ArchiveError> {
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(COVERAGE)?;
+        let wb = tx.open_table(WRITE_BOUND)?;
+        let mut out = Vec::new();
+        for e in t.iter()? {
+            let (k, c) = e?;
+            let extendable = wb.get(k.value())?.is_none();
+            if let Some(key) = decode_key(k.value()) {
+                out.push((key, c.value(), extendable));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Extends history backwards from a **fully scanned** run of BALs (M4.2).
+    ///
+    /// `blocks` are consecutive `[from, scan_end]`, each carrying *all* of that block's writes to
+    /// archived keys. Blocks before the first segment's start `S` are new: their headers are
+    /// recorded, and the last of them must be the parent of `S` (`s_parent`), so the segment
+    /// grows backwards to `from`.
+    ///
+    /// For each archived key whose coverage starts at `c` with `from < c <= scan_end + 1`:
+    /// - **no write in `[from, c)`**: a BAL lists every write, so the value was constant; coverage
+    ///   moves to `from` with the value at `c`
+    /// - **writes**: they are recorded, and coverage moves to the first write (the value before it
+    ///   isn't in any BAL)
+    pub fn backfill(&self, blocks: &[ArchiveBlock<'_>], s_parent: Option<B256>) -> Result<BackfillReport, ArchiveError> {
+        let (Some(first), Some(last)) = (blocks.first(), blocks.last()) else { return Ok(BackfillReport::default()) };
+        if blocks.windows(2).any(|w| w[1].number != w[0].number + 1) {
+            return Err(ArchiveError::GapMismatch("backfill blocks are not consecutive".into()));
+        }
+        let (from, scan_end) = (first.number, last.number);
+        let segs = self.segments()?;
+        let Some(&(s, e)) = segs.first() else {
+            return Err(ArchiveError::GapMismatch("empty archive".into()));
+        };
+        // The scanned part at or after S must lie in the first segment.
+        if scan_end >= s && scan_end > e {
+            return Err(ArchiveError::GapMismatch(format!("scan end {scan_end} beyond the first segment (ends {e})")));
+        }
+        let extends = from < s;
+        if extends {
+            if scan_end + 1 < s {
+                return Err(ArchiveError::GapMismatch(format!("scan {from}..={scan_end} does not reach the segment start {s}")));
+            }
+            let link = blocks.iter().find(|b| b.number == s - 1).map(|b| b.hash);
+            if link.is_none() || link != s_parent {
+                return Err(ArchiveError::GapMismatch("backfill does not link to the first segment".into()));
+            }
+        }
+        // Blocks at or after S must be the ones the archive already holds.
+        for b in blocks.iter().filter(|b| b.number >= s) {
+            if self.hash(b.number)? != Some(b.hash) {
+                return Err(ArchiveError::GapMismatch(format!("block {} differs from the archived chain", b.number)));
+            }
+        }
+        let covs = self.coverages()?;
+        let mut report = BackfillReport::default();
+        let tx = self.db.begin_write()?;
+        {
+            if extends {
+                let mut headers = tx.open_table(HEADERS)?;
+                let mut hashes = tx.open_table(HASHES)?;
+                let mut by_hash = tx.open_table(BY_HASH)?;
+                let mut journal = tx.open_table(JOURNAL)?;
+                for b in blocks.iter().filter(|b| b.number < s) {
+                    headers.insert(b.number, b.header_rlp)?;
+                    hashes.insert(b.number, &b.hash.0)?;
+                    by_hash.insert(&b.hash.0, b.number)?;
+                    journal.insert(b.number, &[][..])?;
+                }
+                report.new_blocks = s - from;
+            }
+            let mut versions = tx.open_table(VERSIONS)?;
+            let mut cov = tx.open_table(COVERAGE)?;
+            let mut wb = tx.open_table(WRITE_BOUND)?;
+            for (k, c, extendable) in covs {
+                if c <= from {
+                    continue;
+                }
+                if !extendable {
+                    // Coverage starts at a write: the value before it is unknowable from BALs.
+                    report.keys_write_bound += 1;
+                    continue;
+                }
+                if c > scan_end + 1 {
+                    report.keys_unscanned += 1;
+                    continue;
+                }
+                let ek = encode_key(&k);
+                let writes: Vec<(u64, U256)> = blocks
+                    .iter()
+                    .filter(|b| b.number < c)
+                    .filter_map(|b| b.writes.iter().find(|(wk, _)| *wk == k).map(|(_, v)| (b.number, *v)))
+                    .collect();
+                if writes.is_empty() {
+                    let at_c = versions.get(&vkey(&ek, c))?.map(|g| *g.value());
+                    let Some(v) = at_c else {
+                        report.keys_unscanned += 1;
+                        continue;
+                    };
+                    versions.insert(&vkey(&ek, from), &v)?;
+                    cov.insert(&ek, from)?;
+                    report.keys_unchanged += 1;
+                } else {
+                    for (n, v) in &writes {
+                        versions.insert(&vkey(&ek, *n), &v.to_be_bytes::<32>())?;
+                    }
+                    cov.insert(&ek, writes[0].0)?;
+                    wb.insert(&ek, ())?;
+                    report.keys_written += 1;
+                }
+            }
+            if extends {
+                let mut seg = tx.open_table(SEGMENTS)?;
+                seg.remove(s)?;
+                seg.insert(from, e)?;
+            }
+        }
+        tx.commit()?;
+        Ok(report)
     }
 
     /// Fills the gap between two segments with the missing blocks (in order) and merges them.
@@ -266,6 +410,7 @@ impl Archive {
             let cur = cov.get(&ek)?.map(|g| g.value());
             if cur.is_none_or(|c| block < c) {
                 cov.insert(&ek, block)?;
+                tx.open_table(WRITE_BOUND)?.remove(&ek)?;
             }
             tx.open_table(ARCHIVED)?.insert(&ek, ())?;
         }
@@ -443,6 +588,59 @@ mod tests {
         assert!(matches!(a.get(&slot(9), 2).unwrap(), ArchiveRead::NotCovered { from: None }));
         blk(&a, 3, &[(slot(1), 33)]); // the new branch
         assert_eq!(val(&a, slot(1), 3), Some(33));
+    }
+
+    #[test]
+    fn backfill_extends_unchanged_keys_fully_and_written_keys_from_their_first_write() {
+        let d = tempfile::tempdir().unwrap();
+        let a = Archive::open(d.path().join("a.redb")).unwrap();
+        // Archive starts at 100: slot 1 = 10, slot 2 = 20 (bases); slot 3 discovered late at 103.
+        blk(&a, 100, &[]);
+        a.write_base(&slot(1), 100, U256::from(10), &[]).unwrap();
+        a.write_base(&slot(2), 100, U256::from(20), &[]).unwrap();
+        for n in 101..=104 {
+            blk(&a, n, &[]);
+        }
+        a.write_base(&slot(3), 103, U256::from(30), &[]).unwrap();
+        // Scan BALs 90..=102: slot 2 written at 95 (=21) and 97 (=20); slot 3 written at 101 (=30).
+        let (w95, w97, w101) = ([(slot(2), U256::from(21))], [(slot(2), U256::from(20))], [(slot(3), U256::from(30))]);
+        let hashes: Vec<B256> = (90..=102u64).map(|n| B256::with_last_byte(n as u8)).collect();
+        let blocks: Vec<ArchiveBlock<'_>> = (90..=102u64)
+            .map(|n| ArchiveBlock {
+                number: n,
+                hash: hashes[(n - 90) as usize],
+                header_rlp: &[0xc0],
+                writes: match n { 95 => &w95, 97 => &w97, 101 => &w101, _ => &[] },
+            })
+            .collect();
+        // Must link to the first segment: block 99 is the parent of 100.
+        assert!(a.backfill(&blocks, Some(B256::with_last_byte(1))).is_err());
+        let r = a.backfill(&blocks, Some(B256::with_last_byte(99))).unwrap();
+        assert_eq!(r, BackfillReport { new_blocks: 10, keys_unchanged: 1, keys_written: 2, keys_unscanned: 0, keys_write_bound: 0 });
+        assert_eq!(a.segments().unwrap(), vec![(90, 104)]);
+        // slot 1: never written -> constant back to 90.
+        assert_eq!(val(&a, slot(1), 90), Some(10));
+        // slot 2: written at 95 and 97 -> known from 95 only.
+        assert_eq!(val(&a, slot(2), 94), None);
+        assert_eq!(val(&a, slot(2), 95), Some(21));
+        assert_eq!(val(&a, slot(2), 96), Some(21));
+        assert_eq!(val(&a, slot(2), 98), Some(20));
+        // slot 3 (late key): its earlier write at 101 now covers 101..103.
+        assert_eq!(val(&a, slot(3), 100), None);
+        assert_eq!(val(&a, slot(3), 101), Some(30));
+        assert_eq!(val(&a, slot(3), 102), Some(30));
+
+        // Regression: a second, deeper backfill must not treat a first *write* as a base and
+        // extend it backwards (its pre-write value is in no BAL).
+        let deeper: Vec<ArchiveBlock<'_>> = (85..=89u64)
+            .map(|n| ArchiveBlock { number: n, hash: B256::with_last_byte(n as u8), header_rlp: &[0xc0], writes: &[] })
+            .collect();
+        let r2 = a.backfill(&deeper, Some(B256::with_last_byte(89))).unwrap();
+        assert_eq!(r2.keys_write_bound, 2);
+        assert_eq!(val(&a, slot(2), 85), None);
+        assert_eq!(val(&a, slot(2), 94), None);
+        assert_eq!(val(&a, slot(3), 100), None);
+        assert_eq!(val(&a, slot(1), 85), Some(10)); // the unchanged key keeps extending
     }
 
     #[test]

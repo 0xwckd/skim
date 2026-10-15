@@ -42,6 +42,11 @@ pub struct Args {
     /// On-disk archive for subscriptions with `retention: { mode: archive }` (M4).
     #[arg(long)]
     archive: Option<std::path::PathBuf>,
+    /// Extend archived history this many blocks back from retained BALs (eth/71 keeps ~2 weeks).
+    /// Keys never written in that range become covered for all of it; written keys from their
+    /// first write. 0 = off.
+    #[arg(long, default_value_t = 0)]
+    archive_backfill: u64,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -140,7 +145,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let (_cl, mut rx) = ClNode::start(NodeConfig::sepolia(args.cl_port)).await?;
     tokio::spawn(serve(Arc::new(Rpc { sim: sim.clone(), subs: Some(subs.clone()) }), args.rpc));
     if store.archive().is_some() {
-        spawn_archive_healer(store.clone(), net.clone());
+        spawn_archive_healer(store.clone(), net.clone(), args.archive_backfill);
     }
     let maintaining = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sim2 = sim.clone();
@@ -191,12 +196,26 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
 
 /// Heals gaps between archive segments (e.g. after a restart) from eth/71 headers + BALs,
 /// retrying until EL peers can serve them. Gaps it can't fill stay uncovered, never guessed.
-fn spawn_archive_healer(store: Arc<Store>, net: ElNet) {
+fn spawn_archive_healer(store: Arc<Store>, net: ElNet, backfill: u64) {
     tokio::spawn(async move {
+        let mut target_from: Option<u64> = None;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
             let Some(ar) = store.archive() else { return };
             let Ok(segs) = ar.segments() else { continue };
+            // M4.2: backfill once segments are contiguous and keys exist. Re-run when keys whose
+            // coverage starts after the target appear (late subscriptions).
+            if backfill > 0 && segs.len() == 1 {
+                let s = segs[0].0;
+                let tf = *target_from.get_or_insert(s.saturating_sub(backfill).max(1));
+                let late = ar.coverages().map(|c| c.iter().any(|(_, c, ext)| *ext && *c > tf)).unwrap_or(false);
+                if late {
+                    match backfill_archive(&store, &net, tf).await {
+                        Ok(r) => tracing::info!(from = tf, ?r, "archive backfilled from retained BALs"),
+                        Err(e) => tracing::debug!(from = tf, "archive backfill not done yet: {e}"),
+                    }
+                }
+            }
             for w in segs.windows(2) {
                 let ((_, a_end), (b_start, _)) = (w[0], w[1]);
                 match heal_gap(&store, &net, a_end + 1, b_start - 1).await {
@@ -260,4 +279,59 @@ async fn heal_gap(store: &Store, net: &ElNet, from: u64, to: u64) -> anyhow::Res
         .collect();
     ar.fill_gap(&blocks, first_parent, next_parent)?;
     Ok(())
+}
+
+/// M4.2: scans BALs from `from` up to the latest coverage start of any archived key and extends
+/// coverage backwards (see `Archive::backfill`).
+async fn backfill_archive(store: &Store, net: &ElNet, from: u64) -> anyhow::Result<skim_state::archive::BackfillReport> {
+    use reth_eth_wire_types::BlockHashOrNumber;
+    let ar = store.archive().ok_or_else(|| anyhow::anyhow!("no archive"))?;
+    let segs = ar.segments()?;
+    let (s, e) = *segs.first().ok_or_else(|| anyhow::anyhow!("empty archive"))?;
+    let c_max = ar.coverages()?.iter().filter(|(_, _, ext)| *ext).map(|(_, c, _)| *c).max().unwrap_or(s);
+    let scan_end = (c_max.saturating_sub(1)).max(s.saturating_sub(1)).min(e);
+    if from > scan_end {
+        return Ok(Default::default());
+    }
+    let s_parent = match ar.header_rlp(s)? {
+        Some(rlp) => Some(<alloy_consensus::Header as alloy_rlp::Decodable>::decode(&mut rlp.as_slice())?.parent_hash),
+        None => None,
+    };
+    let peers: Vec<_> = net.peers().into_iter().filter(|(_, p)| p.eth_version >= 71).map(|(id, _)| id).collect();
+    anyhow::ensure!(!peers.is_empty(), "no EL peers yet");
+    let mut collected: Vec<(u64, alloy_primitives::B256, Vec<u8>, Vec<(skim_bal::StateKey, alloy_primitives::U256)>, alloy_primitives::B256)> = Vec::new();
+    let mut next = from;
+    'outer: while next <= scan_end {
+        let count = (scan_end - next + 1).min(32);
+        for &peer in &peers {
+            let Ok(hs) = net.headers(peer, BlockHashOrNumber::Number(next), count).await.0 else { continue };
+            if hs.is_empty() || hs[0].number != next {
+                continue;
+            }
+            let hashes: Vec<alloy_primitives::B256> = hs.iter().map(|h| h.hash_slow()).collect();
+            let Ok(bals) = net.bals(peer, hashes).await.0 else { continue };
+            let mut progressed = false;
+            for (h, raw) in hs.into_iter().zip(bals.0) {
+                let Some(raw) = raw else { break }; // pruned or truncated: retry from here
+                let bal = skim_bal::decode_verified(&raw, h.block_access_list_hash.unwrap_or_default())?;
+                let w = BlockWrites::from_bal(&bal);
+                let aw: Vec<_> = w.writes.iter().filter(|(k, _)| store.is_archived(k)).copied().collect();
+                next = h.number + 1;
+                progressed = true;
+                collected.push((h.number, h.hash_slow(), alloy_rlp::encode(&h), aw, h.parent_hash));
+            }
+            if progressed {
+                continue 'outer;
+            }
+        }
+        anyhow::bail!("no EL peer served headers+BALs from {next}");
+    }
+    for w in collected.windows(2) {
+        anyhow::ensure!(w[1].4 == w[0].1, "backfill chain does not link at {}", w[1].0);
+    }
+    let blocks: Vec<skim_state::archive::ArchiveBlock<'_>> = collected
+        .iter()
+        .map(|(n, h, rlp, aw, _)| skim_state::archive::ArchiveBlock { number: *n, hash: *h, header_rlp: rlp, writes: aw })
+        .collect();
+    Ok(ar.backfill(&blocks, s_parent)?)
 }

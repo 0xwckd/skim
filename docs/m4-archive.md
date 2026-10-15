@@ -28,3 +28,14 @@ The fix:
 - A read at block N answers only if N lies in a segment of consecutively processed blocks, the key's coverage started at or before N, and the newest version at or before N lies in that segment. Anything else is `NotCovered`, which RPC returns as `-32002`.
 - Reorgs truncate exactly what orphaned blocks wrote (a per-block journal).
 - Historical `eth_call` uses the archived header and BLOCKHASH, and never fetches over SNAP (old roots aren't served). If any key the call reads is uncovered, it returns `-32002` with the count.
+
+## M4.2: backfill from retained BALs
+`skim run --archive-backfill N` scans the BALs of the N blocks before the archive's first block, plus any later block up to a late key's coverage start, using eth/71 (BALs are retained for about 2 weeks). It then extends history backwards:
+- **No write to a key in the scanned range:** a BAL lists every write, so the value was constant. Coverage moves to the start of the range.
+- **Writes:** recorded. Coverage moves to the **first write** and is marked *write-bound*, because the value before that write is in no BAL and can never be recovered.
+
+**Bug found and fixed during verification.** The first implementation re-ran for keys whose coverage now started at a write, read that write as if it were a base, and extended its *post*-value backwards. Coverage now records whether it starts at a base (extendable) or a write (never extendable). Regression: `backfill_extends_unchanged_keys_fully_and_written_keys_from_their_first_write` (second, deeper backfill).
+
+**Live result (fresh archive, `--archive-backfill 300`):**
+- 37 keys extended 300 blocks *before* the subscription existed; 2 keys covered from their first write
+- Over the backfilled range, compared with Infura: **102 match, 3 refused (`-32002`, before a write-bound key's first write), 0 wrong**
