@@ -210,3 +210,22 @@ fn archive_follows_reorgs() {
     assert_eq!(ar.get(&slot(1), 12).unwrap(), archive::ArchiveRead::Value(U256::from(99)));
     assert_eq!(ar.get(&slot(1), 11).unwrap(), archive::ArchiveRead::Value(U256::from(11)));
 }
+
+#[test]
+fn code_is_cached_only_for_tracked_accounts() {
+    let s = Store::new(64);
+    let b = Address::repeat_byte(0xbb);
+    s.watch_key(StateKey::CodeHash(A));
+    let (ca, cb) = (Bytes::from_static(b"code-a"), Bytes::from_static(b"code-b"));
+    let w = BlockWrites {
+        writes: vec![
+            (StateKey::CodeHash(A), U256::from_be_bytes(keccak256(&ca).0)),
+            (StateKey::CodeHash(b), U256::from_be_bytes(keccak256(&cb).0)),
+        ],
+        code: vec![(keccak256(&ca), ca.clone()), (keccak256(&cb), cb)],
+        ..Default::default()
+    };
+    s.apply_block(blk(1, 0), Arc::new(w)).unwrap();
+    assert_eq!(s.code(&keccak256(&ca)), Some(ca));
+    assert_eq!(s.sizes().code, 1); // the untracked deployment isn't cached
+}

@@ -280,8 +280,18 @@ impl Store {
                     changed.push(k);
                 }
             }
+            // Keep code only for tracked accounts: every contract deployed on the chain shows up
+            // in some BAL, and caching all of it grows without bound.
+            let tracked_code: HashSet<B256> = writes
+                .writes
+                .iter()
+                .filter(|(k, _)| matches!(k, StateKey::CodeHash(_)) && st.tracked(k))
+                .map(|(_, v)| B256::from(*v))
+                .collect();
             for (h, c) in &writes.code {
-                st.code.insert(*h, c.clone());
+                if tracked_code.contains(h) {
+                    st.code.insert(*h, c.clone());
+                }
             }
             let touched = writes.touched.iter().filter(|a| !st.watched_addresses.contains(*a)).count();
             if let Some(ar) = &self.archive {
@@ -296,8 +306,10 @@ impl Store {
                 });
                 self.archive_try(r);
                 for (h, c) in &writes.code {
-                    let r = ar.put_code(*h, c);
-                    self.archive_try(r);
+                    if aw.iter().any(|(k, v)| matches!(k, StateKey::CodeHash(_)) && B256::from(*v) == *h) {
+                        let r = ar.put_code(*h, c);
+                        self.archive_try(r);
+                    }
                 }
             }
             st.chain.insert(block.number, block);
