@@ -87,9 +87,8 @@
 @keyframes a55{0.000%{opacity:0;transform:translateY(14px)} 83.438%{opacity:0;transform:translateY(14px)} 85.312%{opacity:1;transform:translateY(0)} 98.438%{opacity:1;transform:translateY(0)} 99.688%{opacity:0;transform:translateY(0)} 100.000%{opacity:0}} .a55{animation:a55 32.0s ease-in-out infinite;}
 @keyframes a56{0.000%{opacity:0;transform:translateY(14px)} 85.000%{opacity:0;transform:translateY(14px)} 86.875%{opacity:1;transform:translateY(0)} 98.438%{opacity:1;transform:translateY(0)} 99.688%{opacity:0;transform:translateY(0)} 100.000%{opacity:0}} .a56{animation:a56 32.0s ease-in-out infinite;}
 @keyframes a57{0.000%{opacity:0;transform:translateY(14px)} 86.562%{opacity:0;transform:translateY(14px)} 88.438%{opacity:1;transform:translateY(0)} 98.438%{opacity:1;transform:translateY(0)} 99.688%{opacity:0;transform:translateY(0)} 100.000%{opacity:0}} .a57{animation:a57 32.0s ease-in-out infinite;}
-@keyframes a58{0.000%{opacity:0;transform:translateY(14px)} 88.750%{opacity:0;transform:translateY(14px)} 90.625%{opacity:1;transform:translateY(0)} 98.438%{opacity:1;transform:translateY(0)} 99.688%{opacity:0;transform:translateY(0)} 100.000%{opacity:0}} .a58{animation:a58 32.0s ease-in-out infinite;}
-@keyframes a59{0.000%{opacity:0;transform:translateY(14px)} 91.250%{opacity:0;transform:translateY(14px)} 93.125%{opacity:1;transform:translateY(0)} 98.438%{opacity:1;transform:translateY(0)} 99.688%{opacity:0;transform:translateY(0)} 100.000%{opacity:0}} .a59{animation:a59 32.0s ease-in-out infinite;}
-@keyframes a60{0.000%{opacity:0;transform:translateY(14px)} 93.125%{opacity:0;transform:translateY(14px)} 95.000%{opacity:1;transform:translateY(0)} 98.438%{opacity:1;transform:translateY(0)} 99.688%{opacity:0;transform:translateY(0)} 100.000%{opacity:0}} .a60{animation:a60 32.0s ease-in-out infinite;}</style>
+@keyframes a58{0.000%{opacity:0;transform:translateY(14px)} 91.250%{opacity:0;transform:translateY(14px)} 93.125%{opacity:1;transform:translateY(0)} 98.438%{opacity:1;transform:translateY(0)} 99.688%{opacity:0;transform:translateY(0)} 100.000%{opacity:0}} .a58{animation:a58 32.0s ease-in-out infinite;}
+@keyframes a59{0.000%{opacity:0;transform:translateY(14px)} 93.125%{opacity:0;transform:translateY(14px)} 95.000%{opacity:1;transform:translateY(0)} 98.438%{opacity:1;transform:translateY(0)} 99.688%{opacity:0;transform:translateY(0)} 100.000%{opacity:0}} .a59{animation:a59 32.0s ease-in-out infinite;}</style>
 <rect width="1280" height="720" fill="url(#bg)"/>
 <g class="a1">
 <text x="640" y="92" class="h1" text-anchor="middle">Today, your app borrows someone else's node</text>
@@ -193,9 +192,8 @@
 <g class="a54"><rect x="100" y="200" width="240" height="170" rx="18" class="card"/><text x="220" y="285" class="big" text-anchor="middle">~90 MB</text><text x="220" y="325" class="bs" text-anchor="middle">memory</text></g>
 <g class="a55"><rect x="380" y="200" width="240" height="170" rx="18" class="card"/><text x="500" y="285" class="big" text-anchor="middle">0 bytes</text><text x="500" y="325" class="bs" text-anchor="middle">on disk</text></g>
 <g class="a56"><rect x="660" y="200" width="240" height="170" rx="18" class="card"/><text x="780" y="285" class="big" text-anchor="middle">~3 ms</text><text x="780" y="325" class="bs" text-anchor="middle">eth_call, local</text></g>
-<g class="a57"><rect x="940" y="200" width="240" height="170" rx="18" class="card"/><text x="1060" y="285" class="big" text-anchor="middle">= Infura</text><text x="1060" y="325" class="bs" text-anchor="middle">byte for byte</text></g>
-<text x="640" y="450" class="cap a58" text-anchor="middle">vs. a synced Sepolia full node: 337 GB on disk</text>
-<text x="640" y="540" class="tag2 a59" text-anchor="middle">No more RPC subscriptions. P2P, with verification.</text>
-<text x="640" y="610" class="url a60" text-anchor="middle">github.com/leekt/skim</text>
+<g class="a57"><rect x="940" y="200" width="240" height="170" rx="18" class="card"/><text x="1060" y="285" class="big" text-anchor="middle">0.16 ms</text><text x="1060" y="325" class="bs" text-anchor="middle">to apply a block</text></g>
+<text x="640" y="540" class="tag2 a58" text-anchor="middle">No more RPC subscriptions. P2P, with verification.</text>
+<text x="640" y="610" class="url a59" text-anchor="middle">github.com/leekt/skim</text>
 </g>
 </svg>

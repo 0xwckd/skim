@@ -29,7 +29,7 @@ block 11919451: 1 WETH -> 44546.304171 USDC  (3.0 ms)
 subscription quote-1-weth: ready=true block=11919451 keys=39
 subscription weth-usdc-0.3%: ready=true block=11919451 keys=5
 ```
-- **Every number matches Infura**: the same script with `SKIM_RPC=<infura url>` prints identical values.
+- **Every number matches a reference node**: the same script pointed at another Sepolia RPC (`SKIM_RPC=<url>`) prints identical values.
 - **The 12.5 WETH quote** crossed 24 ticks it had never seen and still took 3 ms. The V3 predictor in `skim.yaml` keeps the tick window around the price warm.
 
 **What the config does:**

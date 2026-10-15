@@ -79,13 +79,12 @@ All numbers are from Sepolia, measured from one home connection over public peer
 
 | | Result |
 |---|---|
-| **Correctness** | Every completed run matched Infura byte for byte at the same block hash. Totals: 1,753 calls in a 1-hour soak; 2,700 calls with randomized, never-seen Uniswap V3 quotes; 866 with proof verification on; 36/36 JSON-RPC requests ([P0](docs/experiments/m2-p0-miss-tail.md), [verified state](docs/experiments/m2-verified-state.md)). |
+| **Correctness** | Every completed run matched a reference archive node byte for byte at the same block hash. Totals: 1,753 calls in a 1-hour soak; 2,700 calls with randomized, never-seen Uniswap V3 quotes; 866 with proof verification on; 36/36 JSON-RPC requests ([P0](docs/experiments/m2-p0-miss-tail.md), [verified state](docs/experiments/m2-verified-state.md)). |
 | **State ready after a new block** | BAL applied **0.16 ms** after the payload arrives. State ready at about **880 ms** P50 after slot start, bounded by gossip arrival ([M1](docs/experiments/m1-follower.md)). |
 | **Warm simulation** | 7 calls (incl. Uniswap V3 quotes) in **3.8 ms** total; JSON-RPC `eth_call` in 0.5–6 ms |
 | **Fetch reliability** | 298,084 SNAP jobs over public peers, **0 failed**, 126 disconnects absorbed ([soak](docs/experiments/m0-soak.md)) |
 | **Unseen inputs** | Background prefetch had **99.9%** of predicted keys ready at call time. Worst on-path fetch: 1.6 s ([P1](docs/experiments/m2-p0-miss-tail.md)). |
-| **Footprint** | ~120 MB RSS, ~0.25 CPU core, **0 bytes of disk** (a synced Sepolia full node used 337 GB) |
-| **vs. a hosted RPC** | First answer for a new block: **tie** with Infura (P50 difference 0 ms). Every call after that is local. |
+| **Footprint** | ~120 MB RSS, ~0.25 CPU core, **0 bytes of disk** |
 
 What skim is **not**: faster than an in-process full node on raw execution, or a trustless light client (yet). It saves *resources* while keeping simulation quality close to a node's. Part of the saving is work that public SNAP peers do on skim's behalf.
 
@@ -141,7 +140,7 @@ const { result } = await client.simulateContract({
   functionName: 'quoteExactInputSingle',
   args: [['0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14', '0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238', parseEther('1'), 3000, 0n]],
 })
-// answered locally in a few ms; identical to what a full node returns
+// answered locally in a few ms
 ```
 
 **Next steps:**
@@ -183,9 +182,9 @@ Consensus light-client verification is on the roadmap. Until then, skim trusts t
 - [x] M2: simulator, JSON-RPC adapter, verified state, state access predictor
 - [x] M3: subscriptions (subscribed vs on-demand state)
 - [ ] Resource benchmark vs a Nethermind full node (same workload, same block hashes)
-- [x] **M4: selective state archiving.** `retention: archive` keeps every BAL-written version of subscribed state on disk. `eth_getStorageAt` and `eth_call` then work at historical blocks for what you subscribed to, from the block each key became known (90/90 and 51/51 historical reads matched Infura, restart gaps healed from eth/71; see [M4](docs/experiments/m4-archive.md)). *Sync and archive only what you need.*
-- [x] **M4.2: backfill from retained BALs.** `--archive-backfill N` extends archived history up to about 2 weeks before a subscription existed. Unchanged keys are covered for the whole range; written keys are covered from their first write. Live: 102 historical reads matched Infura, 3 were correctly refused, 0 were wrong.
-- [x] **M5:** generalized learned patterns (exact args + amount buckets) with key/byte bounds. The V3 predictor is configurable in `skim run`: calls that needed the network fell from 51 to 19 out of 400. Added `eth_sendRawTransaction`, receipts and `eth_getLogs`, all identical to Infura in every check ([M5](docs/experiments/m5-predictors-and-chain-data.md)).
+- [x] **M4: selective state archiving.** `retention: archive` keeps every BAL-written version of subscribed state on disk. `eth_getStorageAt` and `eth_call` then work at historical blocks for what you subscribed to, from the block each key became known (90/90 and 51/51 historical reads matched a reference archive node, restart gaps healed from eth/71; see [M4](docs/experiments/m4-archive.md)). *Sync and archive only what you need.*
+- [x] **M4.2: backfill from retained BALs.** `--archive-backfill N` extends archived history up to about 2 weeks before a subscription existed. Unchanged keys are covered for the whole range; written keys are covered from their first write. Live: 102 historical reads matched a reference archive node, 3 were correctly refused, 0 were wrong.
+- [x] **M5:** generalized learned patterns (exact args + amount buckets) with key/byte bounds. The V3 predictor is configurable in `skim run`: calls that needed the network fell from 51 to 19 out of 400. Added `eth_sendRawTransaction`, receipts and `eth_getLogs`, all identical to a reference node in every check ([M5](docs/experiments/m5-predictors-and-chain-data.md)).
 - [ ] `storage: all` for small contracts; WebSocket pushes for `on_block` subscriptions
 - [ ] Consensus light-client verification; mainnet once Glamsterdam ships there
 

@@ -128,12 +128,11 @@ add('</g>')
 S4 = show(25.7, 31.9)
 add(f'<g class="{S4}">')
 add('<text x="640" y="110" class="h1" text-anchor="middle">Sync (and archive) only what you need</text>')
-stats = [("~90 MB", "memory", 26.2), ("0 bytes", "on disk", 26.7), ("~3 ms", "eth_call, local", 27.2), ("= Infura", "byte for byte", 27.7)]
+stats = [("~90 MB", "memory", 26.2), ("0 bytes", "on disk", 26.7), ("~3 ms", "eth_call, local", 27.2), ("0.16 ms", "to apply a block", 27.7)]
 for i, (big, small, t) in enumerate(stats):
     x = 220 + i * 280
     add(f'<g class="{rise(t, 31.9)}"><rect x="{x-120}" y="200" width="240" height="170" rx="18" class="card"/>'
         f'<text x="{x}" y="285" class="big" text-anchor="middle">{big}</text><text x="{x}" y="325" class="bs" text-anchor="middle">{small}</text></g>')
-add(f'<text x="640" y="450" class="cap {rise(28.4, 31.9)}" text-anchor="middle">vs. a synced Sepolia full node: 337 GB on disk</text>')
 add(f'<text x="640" y="540" class="tag2 {rise(29.2, 31.9)}" text-anchor="middle">No more RPC subscriptions. P2P, with verification.</text>')
 add(f'<text x="640" y="610" class="url {rise(29.8, 31.9)}" text-anchor="middle">github.com/leekt/skim</text>')
 add('</g>')
