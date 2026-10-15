@@ -152,7 +152,8 @@ const { result } = await client.simulateContract({
 - Transactions: `eth_sendRawTransaction` (gossiped straight to EL peers), `eth_getTransactionByHash`, `eth_getTransactionReceipt`
 - Logs: `eth_getLogs`. Receipts are fetched only for blocks whose bloom and BAL match, and checked against `receiptsRoot`.
 - Blocks and chain: `eth_getBlockByNumber` / `eth_getBlockByHash`, `eth_blockNumber`, `eth_chainId`, `net_version`, `eth_syncing`, `eth_gasPrice`, `eth_maxPriorityFeePerGas`, `web3_clientVersion`
-- `skim_subscriptionStatus`
+- `skim_subscriptionStatus`, `skim_status`
+- WebSocket on the same port: `eth_subscribe` for `newHeads`, `logs` and `skim_subscriptions`
 
 **Errors:**
 - Out-of-scope methods (`eth_sendTransaction`, since skim holds no keys, and filters and subscriptions) return `-32004`.
@@ -185,7 +186,7 @@ Consensus light-client verification is on the roadmap. Until then, skim trusts t
 - [x] **M4: selective state archiving.** `retention: archive` keeps every BAL-written version of subscribed state on disk. `eth_getStorageAt` and `eth_call` then work at historical blocks for what you subscribed to, from the block each key became known (90/90 and 51/51 historical reads matched a reference archive node, restart gaps healed from eth/71; see [M4](docs/experiments/m4-archive.md)). *Sync and archive only what you need.*
 - [x] **M4.2: backfill from retained BALs.** `--archive-backfill N` extends archived history up to about 2 weeks before a subscription existed. Unchanged keys are covered for the whole range; written keys are covered from their first write. Live: 102 historical reads matched a reference archive node, 3 were correctly refused, 0 were wrong.
 - [x] **M5:** generalized learned patterns (exact args + amount buckets) with key/byte bounds. The V3 predictor is configurable in `skim run`: calls that needed the network fell from 51 to 19 out of 400. Added `eth_sendRawTransaction`, receipts and `eth_getLogs`, all identical to a reference node in every check ([M5](docs/experiments/m5-predictors-and-chain-data.md)).
-- [ ] `storage: all` for small contracts; WebSocket pushes for `on_block` subscriptions
+- [x] `storage: all`: a contract's whole storage, downloaded and verified against its storage root, then kept current from BALs (Uniswap V3 pool: 3,677 slots; 29/29 sampled slots identical to a reference node). WebSocket JSON-RPC: `newHeads`, `logs`, and `skim_subscriptions` pushes with every block's `on_block` results
 - [x] **M6: correctness and bounds.** Review fixes with regression tests. 2 h chaos soak (kills, restarts, key-set switches): 3,465 matches, 23 refusals, 0 wrong. Verified restart snapshots, warm `eth_call` 3× faster ([M6](docs/experiments/m6-correctness-and-bounds.md))
 - [ ] Consensus light-client verification: implemented and unit-tested, waiting on consensus clients to serve Gloas light-client data
 - [ ] Mainnet once Glamsterdam ships there

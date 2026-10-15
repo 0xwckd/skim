@@ -50,6 +50,8 @@ pub enum StateError {
     Reorged { number: u64, hash: B256 },
     #[error("block {0} is outside the retained window")]
     OutOfWindow(u64),
+    #[error("{0} slots would exceed the subscribed-key limit")]
+    LimitReached(usize),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -67,6 +69,8 @@ pub struct StoreSizes {
     pub admissions_refused: u64,
     /// On-demand keys evicted early because `max_on_demand` was reached.
     pub on_demand_evicted: u64,
+    /// Slots held for fully downloaded contracts (`storage: all`).
+    pub complete_slots: usize,
     /// Estimated bytes held by the recent-BAL index (all writes of the last `window` blocks,
     /// needed to replay fetched values to the head). Scales with chain activity, not with
     /// your keys; `--window` bounds it.
@@ -113,6 +117,15 @@ struct Inner {
     /// when the state window is shorter. Filled from applied blocks, their parent hashes, and
     /// hash-linked ancestor headers ([`Store::insert_ancestor_hashes`]).
     hashes: BTreeMap<u64, B256>,
+    /// Contracts whose whole storage is known (`storage: all`): every slot at `block`, keyed by
+    /// keccak(slot) as the trie stores it. Later writes are ordinary versions on top.
+    complete: HashMap<Address, Complete>,
+}
+
+#[derive(Clone)]
+struct Complete {
+    block: u64,
+    slots: Arc<HashMap<B256, U256>>,
 }
 
 impl Inner {
@@ -245,8 +258,9 @@ impl Store {
 
     /// Whether `k` may become subscribed (already is, or there's room).
     fn admit(&self, st: &Inner, k: &StateKey) -> bool {
+        let complete: usize = st.complete.values().map(|c| c.slots.len()).sum();
         let ok = st.watched_keys.contains(k)
-            || st.watched_keys.len() < self.max_subscribed.load(std::sync::atomic::Ordering::Relaxed);
+            || st.watched_keys.len() + complete < self.max_subscribed.load(std::sync::atomic::Ordering::Relaxed);
         if !ok {
             self.admissions_refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -428,6 +442,8 @@ impl Store {
         }
         st.chain.retain(|n, _| *n <= number);
         st.hashes.retain(|n, _| *n <= number);
+        // A download taken at a block that's now orphaned is no longer this chain's state.
+        st.complete.retain(|_, c| c.block <= number);
         st.recent.retain(|n, _| *n <= number);
         for v in st.versions.values_mut() {
             v.retain(|(n, _)| *n <= number);
@@ -522,6 +538,7 @@ impl Store {
             code_bytes: st.code.values().map(|c| c.len()).sum(),
             admissions_refused: self.admissions_refused.load(std::sync::atomic::Ordering::Relaxed),
             on_demand_evicted: self.on_demand_evicted.load(std::sync::atomic::Ordering::Relaxed),
+            complete_slots: st.complete.values().map(|c| c.slots.len()).sum(),
             recent_bal_bytes: st.recent.values().map(|w| (w.writes.len() + w.touched.len() + w.storage_reads.len()) * BAL_ENTRY_BYTES).sum(),
         }
     }
@@ -618,6 +635,39 @@ impl Store {
         }
         let _ = expect_hash;
         added
+    }
+
+    /// Installs a contract's whole storage, downloaded and verified at block `at` (keccak-keyed
+    /// slots). The address must already be watched, so writes after `at` are recorded; writes
+    /// between `at` and now that are in the BAL index are replayed here. Counts toward the
+    /// subscribed-key limit as one key per slot.
+    pub fn install_complete_storage(&self, at: &BlockRef, a: Address, slots: Vec<(B256, U256)>) -> Result<(), StateError> {
+        let mut st = self.inner.write();
+        if st.chain.get(&at.number).map(|b| b.hash) != Some(at.hash) {
+            return Err(StateError::Reorged { number: at.number, hash: at.hash });
+        }
+        let max = self.max_subscribed.load(std::sync::atomic::Ordering::Relaxed);
+        let others: usize = st.complete.iter().filter(|(x, _)| **x != a).map(|(_, c)| c.slots.len()).sum();
+        if st.watched_keys.len() + others + slots.len() > max {
+            self.admissions_refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(StateError::LimitReached(slots.len()));
+        }
+        st.watched_addresses.insert(a);
+        let later: Vec<(u64, StateKey, U256)> = st
+            .recent
+            .range(at.number + 1..)
+            .flat_map(|(n, w)| w.writes.iter().filter(|(k, _)| matches!(k, StateKey::Storage(x, _) if *x == a)).map(move |(k, v)| (*n, *k, *v)))
+            .collect();
+        for (n, k, v) in later {
+            st.put(k, n, v);
+        }
+        st.complete.insert(a, Complete { block: at.number, slots: Arc::new(slots.into_iter().collect()) });
+        Ok(())
+    }
+
+    /// The block a contract's whole storage is known from, if it is.
+    pub fn complete_storage_block(&self, a: &Address) -> Option<u64> {
+        self.inner.read().complete.get(a).map(|c| c.block)
     }
 
     /// Number of a block hash on the in-memory chain.
@@ -734,13 +784,22 @@ impl Snapshot {
         if st.chain.get(&self.block.number).map(|b| b.hash) != Some(self.block.hash) {
             return Err(StateError::Reorged { number: self.block.number, hash: self.block.hash });
         }
-        Ok(match st.versions.get(key) {
-            Some(v) => {
-                let i = v.partition_point(|(n, _)| *n <= self.block.number);
-                if i == 0 { StateValue::Unknown } else { StateValue::Known(v[i - 1].1) }
+        if let Some(v) = st.versions.get(key) {
+            let i = v.partition_point(|(n, _)| *n <= self.block.number);
+            if i > 0 {
+                return Ok(StateValue::Known(v[i - 1].1));
             }
-            None => StateValue::Unknown,
-        })
+        }
+        // A slot of a fully downloaded contract that no write since the download touched: its
+        // value is in the verified trie, or it is a proven zero.
+        if let StateKey::Storage(a, slot) = key
+            && let Some(c) = st.complete.get(a)
+            && c.block <= self.block.number
+        {
+            let h = keccak256(slot.to_be_bytes::<32>());
+            return Ok(StateValue::Known(c.slots.get(&h).copied().unwrap_or_default()));
+        }
+        Ok(StateValue::Unknown)
     }
 }
 

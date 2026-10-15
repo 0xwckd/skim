@@ -267,12 +267,14 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let light = crate::light::Light::new(cl.clone(), persist.clone());
     light.start(args.checkpoint, args.checkpoint_url.clone());
     let chaindata = crate::chaindata::ChainData::new(net.clone(), args.max_logs_range);
+    let (ws_events, _) = tokio::sync::broadcast::channel::<crate::rpc::WsEvent>(256);
     tokio::spawn(serve(Arc::new(Rpc {
         sim: sim.clone(),
         subs: Some(subs.clone()),
         chain: Some(chaindata.clone()),
         light: Some(light.clone()),
         require_verified: args.require_verified,
+        events: ws_events.clone(),
     }), args.rpc));
     if store.archive().is_some() {
         spawn_archive_healer(store.clone(), net.clone(), args.archive_backfill);
@@ -339,6 +341,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             Placed::Applied { ready, reorged_to, filled } => {
                 tracing::info!(number, arrival_ms = arrival_ms as i64, changed = ready.changed_keys.len(), ?reorged_to, filled, "state ready");
                 light.on_block(&store);
+                let _ = ws_events.send(crate::rpc::WsEvent::NewHead(ready.block));
                 if let Some(s) = saved.take() {
                     // Subscriptions wait for the restore: fetching the same keys over SNAP in
                     // parallel would only compete for (often absent) EL peers.
@@ -359,9 +362,10 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                 }
                 // Keep subscriptions current and their readiness fresh (one pass at a time).
                 if !restoring.load(std::sync::atomic::Ordering::SeqCst) && !maintaining.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                    let (sim, subs, flag, b) = (sim.clone(), subs.clone(), maintaining.clone(), ready.block);
+                    let (sim, subs, flag, b, events) = (sim.clone(), subs.clone(), maintaining.clone(), ready.block, ws_events.clone());
                     tokio::spawn(async move {
                         subs.maintain(&sim, &b).await;
+                        let _ = events.send(crate::rpc::WsEvent::Subscriptions(b.number));
                         flag.store(false, std::sync::atomic::Ordering::SeqCst);
                     });
                 }

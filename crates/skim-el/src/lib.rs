@@ -374,6 +374,31 @@ impl ElNet {
         }
     }
 
+    /// `GetStorageRanges` for one account from `start` to the end of its trie (one page of up to
+    /// `response_bytes`; a non-empty proof means the page is partial).
+    pub async fn storage_range_from(
+        &self,
+        peer: PeerId,
+        root: B256,
+        account_hash: B256,
+        start: B256,
+        response_bytes: u64,
+    ) -> Timed<StorageRangesMessage> {
+        let msg = SnapProtocolMessage::GetStorageRanges(GetStorageRangesMessage {
+            request_id: 0,
+            root_hash: root,
+            account_hashes: vec![account_hash],
+            starting_hash: RangeBound::from(start),
+            limit_hash: RangeBound::from(B256::repeat_byte(0xff)),
+            response_bytes,
+        });
+        match self.snap_any(peer, msg).await {
+            (Ok(SnapResponse::StorageRanges(m)), d) => (Ok(m), d),
+            (Ok(_), d) => (Err(ReqError::Unexpected), d),
+            (Err(e), d) => (Err(e), d),
+        }
+    }
+
     /// Narrow `GetStorageRanges` for one account starting at `slot_hash`.
     pub async fn storage_range(
         &self,

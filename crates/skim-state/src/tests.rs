@@ -373,3 +373,43 @@ fn on_demand_keys_are_capped() {
     // The newest key is always kept (the call that fetched it can run).
     assert_eq!(known(&s.snapshot(&blk(1, 0)).unwrap(), slot(999)), Some(999));
 }
+
+#[test]
+fn complete_storage_answers_every_slot_and_follows_writes() {
+    let s = Store::new(64);
+    s.apply_block(blk(1, 0), writes(&[])).unwrap();
+    s.watch_address(A);
+    s.apply_block(blk(2, 0), writes(&[(slot(5), 55)])).unwrap(); // a write after the download block
+    // Downloaded at block 1: slot 1 = 10, slot 5 = 50; everything else absent.
+    let h = |i: u64| keccak256(U256::from(i).to_be_bytes::<32>());
+    s.install_complete_storage(&blk(1, 0), A, vec![(h(1), U256::from(10)), (h(5), U256::from(50))]).unwrap();
+    let at1 = s.snapshot(&blk(1, 0)).unwrap();
+    let at2 = s.snapshot(&blk(2, 0)).unwrap();
+    assert_eq!(known(&at1, slot(1)), Some(10));
+    assert_eq!(known(&at1, slot(5)), Some(50));
+    assert_eq!(known(&at2, slot(5)), Some(55)); // the later write wins
+    assert_eq!(known(&at2, slot(999)), Some(0)); // absent from a complete trie: proven zero
+    s.apply_block(blk(3, 0), writes(&[(slot(7), 70)])).unwrap(); // a brand-new slot
+    assert_eq!(known(&s.snapshot(&blk(3, 0)).unwrap(), slot(7)), Some(70));
+    assert_eq!(s.sizes().complete_slots, 2);
+    // Other contracts are unaffected: unknown stays unknown.
+    assert_eq!(known(&at2, StateKey::Storage(Address::repeat_byte(0xcc), U256::from(1))), None);
+}
+
+#[test]
+fn complete_storage_is_dropped_when_its_block_is_reorged_out_and_counts_toward_the_limit() {
+    let s = Store::new(64);
+    s.apply_block(blk(1, 0), writes(&[])).unwrap();
+    s.apply_block(blk(2, 0), writes(&[])).unwrap();
+    s.watch_address(A);
+    let h = |i: u64| keccak256(U256::from(i).to_be_bytes::<32>());
+    s.install_complete_storage(&blk(2, 0), A, vec![(h(1), U256::from(10))]).unwrap();
+    s.rollback_to(1);
+    s.apply_block(blk(2, 1), writes(&[])).unwrap();
+    assert_eq!(s.complete_storage_block(&A), None);
+    assert_eq!(known(&s.snapshot(&blk(2, 1)).unwrap(), slot(1)), None); // unknown again, not 10
+    // Limit: 3 slots don't fit under a limit of 2.
+    s.set_max_subscribed(2);
+    let r = s.install_complete_storage(&blk(2, 1), A, (1..=3).map(|i| (h(i), U256::from(i))).collect());
+    assert!(matches!(r, Err(StateError::LimitReached(3))));
+}

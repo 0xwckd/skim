@@ -11,7 +11,8 @@ state:
     - name: <unique name>
       address: "0x…"                  # needed for account/storage
       account: true                   # balance, nonce, code hash (and the code)
-      storage: ["0x0", "0x4"]         # explicit slots (hex strings)
+      storage: ["0x0", "0x4"]         # explicit slots (hex strings), or "all" (whole storage, see below)
+      max_slots: 50000                # storage: all only: refuse bigger contracts
       calls:                          # simulations whose access sets stay ready
         - to: "0x…"
           data: "0x…"                 # full calldata
@@ -39,7 +40,7 @@ predictors:
 |---|---|
 | `account: true` | Subscribes balance, nonce and code hash. Code is cached for tracked accounts. |
 | `storage: [slots]` | Subscribes exactly these slots. Use `cast index` / `cast storage` to find mapping slots, or subscribe a call instead. |
-| `storage: all` | **Not supported yet:** rejected at startup. |
+| `storage: all` | Downloads the contract's entire storage over SNAP once, and accepts it only if every downloaded slot together rebuilds the account's proven storage root. The contract is then tracked by address, so every BAL write keeps it current, and any slot is answered locally. A slot absent from the verified trie is a proven zero. For contracts up to `max_slots` (default 50,000); the slots count toward `max_subscribed_keys`. Can't be combined with archive retention yet. A reorg below the download block discards it, and it is downloaded again. |
 | `calls` | Each call runs every block (local, ~ms). Every key it reads becomes a required key of the subscription, so the call itself and any call reading the same state stay warm. |
 | `on_block: true` | Keeps each call's latest output (hex) or error in `skim_subscriptionStatus.results`. |
 | `retention: { mode: archive }` | Stores every BAL-written version of this subscription's keys (including learned keys) in the `--archive` file, so historical `eth_getStorageAt` / `eth_call` work for them. See [archive](archive.md). |

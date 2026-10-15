@@ -1,6 +1,6 @@
 # JSON-RPC reference
 
-skim serves standard Ethereum JSON-RPC over HTTP (`--rpc`, default `127.0.0.1:8545`), with single and batch requests. Unmodified viem, ethers, web3.py and Foundry (`cast`, `forge script --rpc-url`) work against it.
+skim serves standard Ethereum JSON-RPC over HTTP and WebSocket on the same address (`--rpc`, default `127.0.0.1:8545`; `ws://` for WebSocket), with single and batch requests. Unmodified viem, ethers, web3.py and Foundry (`cast`, `forge script --rpc-url`) work against it.
 
 ## Methods
 | Method | Notes |
@@ -19,6 +19,17 @@ skim serves standard Ethereum JSON-RPC over HTTP (`--rpc`, default `127.0.0.1:85
 | `eth_gasPrice`, `eth_maxPriorityFeePerGas` | Head base fee + 1 gwei tip, and the 1 gwei tip. |
 | `skim_subscriptionStatus` | Per subscription: `ready`, `block`, `required_keys`, `missing_keys`, `truncated`, `calls_ok`, `error`, `results` (for `on_block` calls). |
 | `skim_status` | Head, real store sizes (subscribed / on-demand keys, bytecode, refused admissions), peer counts, light-client status. |
+
+## WebSocket subscriptions
+Every method works over WebSocket too. In addition, `eth_subscribe` / `eth_unsubscribe` support:
+
+| Subscription | Pushes |
+|---|---|
+| `newHeads` | the header of each block whose state is ready |
+| `logs` (with an `address` / `topics` filter) | each matching log of each new block, one notification per log |
+| `skim_subscriptions` | after each block: every subscription's `ready`, `missing_keys`, `calls_ok`, `error` and latest `on_block` `results` |
+
+viem's `watch*` helpers use these automatically with `webSocket(...)`.
 
 ## Block parameters
 | Tag | Meaning |
@@ -43,4 +54,4 @@ skim serves standard Ethereum JSON-RPC over HTTP (`--rpc`, default `127.0.0.1:85
 | `-32602` / `-32601` | Bad params / unknown method. |
 
 ## Not yet
-`eth_simulateV1`, `eth_createAccessList`, `debug_traceCall`, `eth_feeHistory`, `eth_subscribe` (WebSocket), `eth_getProof`, state overrides, full transactions in blocks.
+`eth_simulateV1`, `eth_createAccessList`, `debug_traceCall`, `eth_feeHistory`, `eth_getProof`, state overrides, full transactions in blocks, `newPendingTransactions`.

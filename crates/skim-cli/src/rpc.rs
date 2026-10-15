@@ -94,6 +94,17 @@ pub struct Rpc {
     pub light: Option<Arc<crate::light::Light>>,
     /// `latest` = highest block the sync committee signed off on.
     pub require_verified: bool,
+    /// Pushes for WebSocket subscriptions.
+    pub events: tokio::sync::broadcast::Sender<WsEvent>,
+}
+
+/// What WebSocket subscribers are told about.
+#[derive(Debug, Clone)]
+pub enum WsEvent {
+    /// A block's state is ready.
+    NewHead(BlockRef),
+    /// Subscriptions were maintained at this block (readiness and `on_block` results).
+    Subscriptions(u64),
 }
 
 impl From<DataError> for RpcError {
@@ -373,12 +384,19 @@ impl Rpc {
     }
 }
 
+impl Rpc {
+    /// The block `latest` means for this request (the head, or the verified head).
+    fn latest(&self) -> Option<BlockRef> {
+        if self.require_verified {
+            self.light.as_ref().and_then(|l| l.status().verified_block).and_then(|n| self.sim.store.block(n))
+        } else {
+            self.sim.store.head()
+        }
+    }
+}
+
 async fn handle(State(rpc): State<Arc<Rpc>>, Json(body): Json<Value>) -> Json<Value> {
-    let latest = if rpc.require_verified {
-        rpc.light.as_ref().and_then(|l| l.status().verified_block).and_then(|n| rpc.sim.store.block(n))
-    } else {
-        rpc.sim.store.head()
-    };
+    let latest = rpc.latest();
     match body {
         Value::Array(reqs) => {
             let mut out = Vec::with_capacity(reqs.len());
@@ -392,9 +410,136 @@ async fn handle(State(rpc): State<Arc<Rpc>>, Json(body): Json<Value>) -> Json<Va
 }
 
 pub async fn serve(rpc: Arc<Rpc>, addr: std::net::SocketAddr) -> anyhow::Result<()> {
-    let app = Router::new().route("/", post(handle)).with_state(rpc);
+    // HTTP POST and WebSocket on the same address.
+    let app = Router::new().route("/", post(handle).get(ws_upgrade)).with_state(rpc);
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, "JSON-RPC listening");
+    tracing::info!(%addr, "JSON-RPC listening (HTTP and WebSocket)");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn ws_upgrade(State(rpc): State<Arc<Rpc>>, ws: axum::extract::ws::WebSocketUpgrade) -> axum::response::Response {
+    ws.on_upgrade(move |socket| ws_session(rpc, socket))
+}
+
+/// One WebSocket connection: ordinary JSON-RPC requests (single or batch), plus
+/// `eth_subscribe` / `eth_unsubscribe` for:
+/// - `newHeads`: each block whose state is ready
+/// - `logs` (with a filter): that block's matching logs
+/// - `skim_subscriptions`: readiness and the latest `on_block` results after each block
+async fn ws_session(rpc: Arc<Rpc>, socket: axum::extract::ws::WebSocket) {
+    use axum::extract::ws::Message;
+    use futures::{SinkExt, StreamExt};
+    let (mut tx, mut rx) = socket.split();
+    let mut events = rpc.events.subscribe();
+    let mut subs: std::collections::HashMap<String, Sub> = Default::default();
+    let mut next_id = 1u64;
+    loop {
+        tokio::select! {
+            msg = rx.next() => {
+                let Some(Ok(msg)) = msg else { break };
+                let text = match msg {
+                    Message::Text(t) => t.to_string(),
+                    Message::Close(_) => break,
+                    _ => continue,
+                };
+                let Ok(body) = serde_json::from_str::<Value>(&text) else {
+                    let _ = tx.send(Message::Text(json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "parse error"}}).to_string().into())).await;
+                    continue;
+                };
+                let latest = rpc.latest();
+                let mut one = |req: &Value| -> Option<Value> {
+                    let method = req.get("method").and_then(Value::as_str)?;
+                    let id = req.get("id").cloned().unwrap_or(Value::Null);
+                    let params = req.get("params").cloned().unwrap_or(json!([]));
+                    match method {
+                        "eth_subscribe" => {
+                            let kind = params.get(0).and_then(Value::as_str).unwrap_or("");
+                            let sub = match kind {
+                                "newHeads" => Sub::NewHeads,
+                                "skim_subscriptions" => Sub::Skim,
+                                "logs" => match serde_json::from_value::<alloy_rpc_types_eth::Filter>(params.get(1).cloned().unwrap_or(json!({}))) {
+                                    Ok(f) => Sub::Logs(Box::new(f)),
+                                    Err(e) => return Some(json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32602, "message": format!("logs filter: {e}")}})),
+                                },
+                                other => return Some(json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32602, "message": format!("unsupported subscription {other:?} (newHeads, logs, skim_subscriptions)")}})),
+                            };
+                            let sid = format!("{:#x}", next_id);
+                            next_id += 1;
+                            subs.insert(sid.clone(), sub);
+                            Some(json!({"jsonrpc": "2.0", "id": id, "result": sid}))
+                        }
+                        "eth_unsubscribe" => {
+                            let sid = params.get(0).and_then(Value::as_str).unwrap_or("");
+                            Some(json!({"jsonrpc": "2.0", "id": id, "result": subs.remove(sid).is_some()}))
+                        }
+                        _ => None, // handled below (async)
+                    }
+                };
+                let reply = match &body {
+                    Value::Array(reqs) => {
+                        let mut out = Vec::with_capacity(reqs.len());
+                        for r in reqs {
+                            match one(r) {
+                                Some(v) => out.push(v),
+                                None => out.push(rpc.one(r, &latest).await),
+                            }
+                        }
+                        Value::Array(out)
+                    }
+                    req => match one(req) {
+                        Some(v) => v,
+                        None => rpc.one(req, &latest).await,
+                    },
+                };
+                if tx.send(Message::Text(reply.to_string().into())).await.is_err() {
+                    break;
+                }
+            }
+            ev = events.recv() => {
+                let ev = match ev {
+                    Ok(ev) => ev,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                };
+                for (sid, sub) in &subs {
+                    // Logs: one notification per log, as clients expect.
+                    if let (Sub::Logs(f), WsEvent::NewHead(b), Some(c)) = (sub, &ev, &rpc.chain) {
+                        if let Ok(Value::Array(logs)) = c.logs(f, b.number, b.number).await {
+                            for log in logs {
+                                let msg = json!({"jsonrpc": "2.0", "method": "eth_subscription", "params": {"subscription": sid, "result": log}});
+                                if tx.send(Message::Text(msg.to_string().into())).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    let result = match (sub, &ev) {
+                        (Sub::NewHeads, WsEvent::NewHead(b)) => match rpc.sim.header_arc(b) {
+                            Some(h) => serde_json::to_value(alloy_rpc_types_eth::Header::new((*h).clone())).ok(),
+                            None => None,
+                        },
+                        (Sub::Skim, WsEvent::Subscriptions(n)) => rpc
+                            .subs
+                            .as_ref()
+                            .map(|s| json!({"block": format!("{n:#x}"), "subscriptions": s.status()})),
+                        _ => None,
+                    };
+                    if let Some(result) = result {
+                        let msg = json!({"jsonrpc": "2.0", "method": "eth_subscription", "params": {"subscription": sid, "result": result}});
+                        if tx.send(Message::Text(msg.to_string().into())).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+enum Sub {
+    NewHeads,
+    Logs(Box<alloy_rpc_types_eth::Filter>),
+    Skim,
 }

@@ -26,7 +26,8 @@ use crate::{Mode, Simulator, prefetch};
 #[serde(untagged)]
 pub enum StorageSpec {
     Slots(Vec<U256>),
-    /// `"all"`: the whole storage trie. Not supported yet (needs SNAP range download).
+    /// `"all"`: the whole storage trie, downloaded over SNAP and verified against the account's
+    /// storage root, then kept current from every block's BAL.
     All(String),
 }
 
@@ -56,6 +57,17 @@ pub struct SubscriptionSpec {
     /// `{ mode: archive }` keeps every version of this subscription's keys on disk (M4).
     #[serde(default)]
     pub retention: Option<RetentionSpec>,
+    /// `storage: all`: refuse contracts with more slots than this (default 50,000).
+    #[serde(default)]
+    pub max_slots: Option<usize>,
+}
+
+pub const DEFAULT_MAX_SLOTS: usize = 50_000;
+
+impl SubscriptionSpec {
+    fn storage_all(&self) -> bool {
+        matches!(&self.storage, Some(StorageSpec::All(_)))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -97,8 +109,10 @@ pub struct Subscriptions {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("subscription {0}: storage \"all\" is not supported yet")]
+    #[error("subscription {0}: storage must be a list of slots or \"all\"")]
     StorageAll(String),
+    #[error("subscription {0}: storage \"all\" can't be archived yet (the archive is keyed by slot number)")]
+    StorageAllArchive(String),
     #[error("subscription {0}: storage/account needs an address")]
     NoAddress(String),
     #[error("{0} declared keys exceed limits.max_subscribed_keys = {1}")]
@@ -128,7 +142,9 @@ impl Subscriptions {
                     keys.extend(account_keys(a));
                 }
                 match &s.storage {
-                    Some(StorageSpec::All(_)) => return Err(ConfigError::StorageAll(s.name.clone())),
+                    Some(StorageSpec::All(v)) if v != "all" => return Err(ConfigError::StorageAll(s.name.clone())),
+                    Some(StorageSpec::All(_)) if s.archive() => return Err(ConfigError::StorageAllArchive(s.name.clone())),
+                    Some(StorageSpec::All(_)) => keys.extend(account_keys(a)), // code and balance too
                     Some(StorageSpec::Slots(v)) => keys.extend(v.iter().map(|slot| StateKey::Storage(a, *slot))),
                     None => {}
                 }
@@ -177,6 +193,43 @@ impl Subscriptions {
                 let at = if sim.miss_at_parent { sim.store.block(head.number.saturating_sub(1)).unwrap_or(*head) } else { *head };
                 prefetch::resolve_retained(&sim.store, &sim.sched, &at, &accts, &slots, &[], skim_snap::Priority::High, Retention::Subscribed)
                     .await;
+            }
+        }
+
+        // 1b. `storage: all`: download each contract's whole storage once (verified against its
+        //     storage root), then BALs keep it current. A reorg below the download drops it.
+        for spec in self.specs.iter().filter(|s| s.storage_all()) {
+            let Some(a) = spec.address else { continue };
+            sim.store.watch_address(a);
+            if sim.store.complete_storage_block(&a).is_some() {
+                continue;
+            }
+            let at = if sim.miss_at_parent { sim.store.block(head.number.saturating_sub(1)).unwrap_or(*head) } else { *head };
+            let max = spec.max_slots.unwrap_or(DEFAULT_MAX_SLOTS);
+            let tr = sim.sched.transport();
+            let mut err = Some("no peer served the storage yet".to_string());
+            for peer in tr.net.peers().into_iter().filter(|(_, p)| p.snap1 || p.snap2).map(|(id, _)| id).take(4) {
+                match tr.storage_all(peer, at.state_root, a, max).await {
+                    Ok(skim_snap::el::StorageAll::Complete { slots, .. }) => {
+                        let n = slots.len();
+                        err = match sim.store.install_complete_storage(&at, a, slots) {
+                            Ok(()) => {
+                                tracing::info!(subscription = %spec.name, address = %a, slots = n, block = at.number, "storage: all downloaded and verified");
+                                None
+                            }
+                            Err(e) => Some(e.to_string()),
+                        };
+                        break;
+                    }
+                    Ok(skim_snap::el::StorageAll::TooLarge(n)) => {
+                        err = Some(format!("more than {max} slots ({n}+); raise max_slots"));
+                        break;
+                    }
+                    Ok(skim_snap::el::StorageAll::Unavailable) | Err(_) => continue,
+                }
+            }
+            if let Some(e) = err {
+                self.status.write().entry(spec.name.clone()).or_default().error = Some(e);
             }
         }
 
@@ -266,7 +319,16 @@ impl Subscriptions {
             s.block = Some(head.number);
             s.required_keys = keys.len();
             s.missing_keys = missing;
-            s.ready = is_ready(head_ok, missing, spec.calls.is_empty() || s.calls_ok, s.truncated);
+            let mut calls_ok = spec.calls.is_empty() || s.calls_ok;
+            if spec.storage_all() {
+                // The whole storage must be known at (or before) this block.
+                let have = spec.address.and_then(|a| sim.store.complete_storage_block(&a));
+                calls_ok &= have.is_some_and(|b| b <= head.number);
+                if have.is_some() && spec.calls.is_empty() {
+                    s.error = None;
+                }
+            }
+            s.ready = is_ready(head_ok, missing, calls_ok, s.truncated);
         }
     }
 }
@@ -309,8 +371,12 @@ mod tests {
         let specs: Vec<SubscriptionSpec> = serde_yaml_ng::from_str(y).unwrap();
         let subs = Subscriptions::new(specs, 1000).unwrap();
         assert_eq!(subs.total_keys(), 5); // 3 account keys + 2 slots; calls learn later
-        let bad: Vec<SubscriptionSpec> = serde_yaml_ng::from_str("- name: x\n  address: \"0x0000000000000000000000000000000000000001\"\n  storage: all\n").unwrap();
+        let all: Vec<SubscriptionSpec> = serde_yaml_ng::from_str("- name: x\n  address: \"0x0000000000000000000000000000000000000001\"\n  storage: all\n").unwrap();
+        assert!(Subscriptions::new(all, 10).is_ok());
+        let bad: Vec<SubscriptionSpec> = serde_yaml_ng::from_str("- name: x\n  address: \"0x0000000000000000000000000000000000000001\"\n  storage: everything\n").unwrap();
         assert!(matches!(Subscriptions::new(bad, 10), Err(ConfigError::StorageAll(_))));
+        let archived: Vec<SubscriptionSpec> = serde_yaml_ng::from_str("- name: x\n  address: \"0x0000000000000000000000000000000000000001\"\n  storage: all\n  retention: { mode: archive }\n").unwrap();
+        assert!(matches!(Subscriptions::new(archived, 10), Err(ConfigError::StorageAllArchive(_))));
         let noaddr: Vec<SubscriptionSpec> = serde_yaml_ng::from_str("- name: y\n  account: true\n").unwrap();
         assert!(matches!(Subscriptions::new(noaddr, 10), Err(ConfigError::NoAddress(_))));
     }

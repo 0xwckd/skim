@@ -11,6 +11,7 @@ cd examples && npm install                              # viem 2.57.1, pinned
 |---|---|
 | [`uniswap-v3/`](uniswap-v3) | pool state, quotes for any amount, a quote every block, `Swap` logs, readiness |
 | [`uniswap-v4/`](uniswap-v4) | `StateView` pool state, V4 quoter in both directions, `PoolManager` logs filtered by pool id |
+| [`websocket/`](websocket) | live pushes over WebSocket: new blocks, `Swap` logs, and every block's subscription readiness and `on_block` quote |
 | [`send-transaction/`](send-transaction) | sign locally, `sendTransaction` → skim gossips it → `waitForTransactionReceipt` |
 
 ## Uniswap V3
@@ -50,6 +51,18 @@ quote 5 USDC -> 0.000109838320618968 ETH  (170.1 ms)
 3 Swap events for this pool in the last 2,000 blocks (3674.4 ms)
 ```
 V4 keeps every pool inside one `PoolManager`, so there's no pool address to subscribe. The config **subscribes the calls**: `StateView.getSlot0(poolId)` and a quote. skim learns which `PoolManager` slots they read (this pool's state, bitmap and ticks) and keeps only those current. The `5 USDC → ETH` quote goes the other direction, so it needed one fetch (170 ms) the first time; repeat it and it's local.
+
+## WebSocket pushes
+skim serves WebSocket on the same address as HTTP:
+```bash
+npm run ws
+```
+```text
+block 11921517 ready
+  quote-1-weth: ready=true, 1 WETH -> 44291.088036 USDC
+  weth-usdc-0.3%: ready=true
+```
+viem's `watchBlockNumber`, `watchBlocks`, `watchEvent` and `watchContractEvent` use `eth_subscribe` over WebSocket with no changes. `skim_subscriptions` is skim's own subscription: after every block, it pushes each subscription's readiness and its latest `on_block` results.
 
 ## Sending a transaction
 ```bash

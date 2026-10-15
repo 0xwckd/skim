@@ -61,7 +61,72 @@ pub struct ElTransport {
     accounts: Arc<Mutex<HashMap<(B256, Address, PeerId), AccountCell>>>,
 }
 
+/// A contract's whole storage at a root.
+#[derive(Debug)]
+pub enum StorageAll {
+    /// Every slot (hashed key, value), rebuilt to the account's storage root.
+    Complete { slots: Vec<(B256, U256)>, storage_root: B256 },
+    /// More than the allowed number of slots.
+    TooLarge(usize),
+    /// The peer couldn't serve it, or what it served didn't rebuild to the root.
+    Unavailable,
+}
+
 impl ElTransport {
+    /// Downloads a contract's entire storage at `root` from one peer, page by page, and accepts
+    /// it only if all leaves together rebuild the account's (proven) storage root. Pages are not
+    /// trusted individually; the end-to-end root check covers them all.
+    pub async fn storage_all(&self, peer: PeerId, root: B256, address: Address, max_slots: usize) -> Result<StorageAll, TransportError> {
+        let storage_root = match self.account_shared(peer, root, address).await? {
+            None => return Ok(StorageAll::Unavailable),
+            Some(None) => return Ok(StorageAll::Complete { slots: Vec::new(), storage_root: EMPTY_ROOT_HASH }),
+            Some(Some(a)) if a.storage_root == EMPTY_ROOT_HASH => {
+                return Ok(StorageAll::Complete { slots: Vec::new(), storage_root: EMPTY_ROOT_HASH });
+            }
+            Some(Some(a)) => a.storage_root,
+        };
+        let ah = keccak256(address);
+        let mut leaves: Vec<(B256, Bytes)> = Vec::new();
+        let mut start = B256::ZERO;
+        loop {
+            let m = self.net.storage_range_from(peer, root, ah, start, 512 * 1024).await.0.map_err(map_err)?;
+            self.rejections.traffic(alloy_rlp::Encodable::length(&m));
+            let page = m.slots.into_iter().next().unwrap_or_default();
+            if page.is_empty() && m.proof.is_empty() {
+                self.rejections.root_unavailable.fetch_add(1, Ordering::Relaxed);
+                return Ok(StorageAll::Unavailable);
+            }
+            let last = page.last().map(|d| d.hash);
+            leaves.extend(page.into_iter().map(|d| (d.hash, d.data)));
+            if leaves.len() > max_slots {
+                return Ok(StorageAll::TooLarge(leaves.len()));
+            }
+            // No proof: this page reached the end of the trie. With a proof: more may follow.
+            match (m.proof.is_empty(), last) {
+                (true, _) | (false, None) => break,
+                (false, Some(h)) => {
+                    let next = U256::from_be_bytes(h.0).checked_add(U256::from(1u8));
+                    match next {
+                        Some(n) => start = B256::from(n.to_be_bytes::<32>()),
+                        None => break,
+                    }
+                }
+            }
+        }
+        if proof::root_of(leaves.clone()) != storage_root {
+            self.rejections.bad_proof.fetch_add(1, Ordering::Relaxed);
+            return Ok(StorageAll::Unavailable);
+        }
+        let mut slots = Vec::with_capacity(leaves.len());
+        for (h, v) in leaves {
+            match U256::decode(&mut v.as_ref()) {
+                Ok(v) => slots.push((h, v)),
+                Err(_) => return Ok(StorageAll::Unavailable),
+            }
+        }
+        Ok(StorageAll::Complete { slots, storage_root })
+    }
+
     pub fn new(net: ElNet) -> Self {
         Self { net, excluded: Default::default(), rejections: Default::default(), accounts: Default::default() }
     }
