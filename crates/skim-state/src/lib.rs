@@ -62,6 +62,8 @@ pub struct StoreSizes {
     pub watched_addresses: usize,
     pub code: usize,
     pub code_bytes: usize,
+    /// Subscriptions refused because the subscribed-key limit was reached (kept on demand).
+    pub admissions_refused: u64,
 }
 
 /// How long a fetched value is kept current.
@@ -84,6 +86,9 @@ pub struct StateReady {
     pub touched: usize,
 }
 
+/// `BLOCKHASH` covers the 256 blocks before the executing block.
+pub const BLOCKHASH_DEPTH: u64 = 257;
+
 #[derive(Default)]
 struct Inner {
     chain: BTreeMap<u64, BlockRef>,
@@ -97,6 +102,10 @@ struct Inner {
     pending_headers: HashMap<B256, Vec<u8>>,
     recent: BTreeMap<u64, Arc<BlockWrites>>,
     code: HashMap<B256, Bytes>,
+    /// Canonical hashes for `BLOCKHASH`: the last 256 below the head must stay answerable even
+    /// when the state window is shorter. Filled from applied blocks, their parent hashes, and
+    /// hash-linked ancestor headers ([`Store::insert_ancestor_hashes`]).
+    hashes: BTreeMap<u64, B256>,
 }
 
 impl Inner {
@@ -134,7 +143,13 @@ pub struct Store {
     /// Selective archive (M4): every version of archived keys, on disk.
     archive: Option<Arc<archive::Archive>>,
     archive_errors: std::sync::atomic::AtomicU64,
+    /// Hard limit on subscribed keys, enforced where keys are admitted (not just counted).
+    max_subscribed: std::sync::atomic::AtomicUsize,
+    admissions_refused: std::sync::atomic::AtomicU64,
 }
+
+/// What an over-limit subscription becomes: an on-demand key with this TTL.
+const REFUSED_TTL: u64 = 4;
 
 impl Store {
     /// `window`: blocks of history (chain entries, BAL index, versions) kept for reads, lazy
@@ -146,6 +161,8 @@ impl Store {
             events: broadcast::channel(1024).0,
             archive: None,
             archive_errors: Default::default(),
+            max_subscribed: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            admissions_refused: Default::default(),
         })
     }
 
@@ -159,6 +176,8 @@ impl Store {
             events: broadcast::channel(1024).0,
             archive: Some(Arc::new(archive)),
             archive_errors: Default::default(),
+            max_subscribed: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            admissions_refused: Default::default(),
         }))
     }
 
@@ -185,6 +204,32 @@ impl Store {
         if self.archive.is_some() {
             self.inner.write().pending_headers.insert(hash, rlp);
         }
+    }
+
+    /// Caps subscribed keys (watched keys, including archived ones). Keys already subscribed
+    /// stay; new subscriptions beyond the cap are refused and kept on demand instead.
+    pub fn set_max_subscribed(&self, n: usize) {
+        self.max_subscribed.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether `k` may become subscribed (already is, or there's room).
+    fn admit(&self, st: &Inner, k: &StateKey) -> bool {
+        let ok = st.watched_keys.contains(k)
+            || st.watched_keys.len() < self.max_subscribed.load(std::sync::atomic::Ordering::Relaxed);
+        if !ok {
+            self.admissions_refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        ok
+    }
+
+    /// Archives `k` (a subscription that keeps every version on disk). Returns false if the
+    /// subscribed-key limit refused it.
+    pub fn archive_key_checked(&self, k: StateKey) -> bool {
+        if !self.admit(&self.inner.read(), &k) {
+            return false;
+        }
+        self.archive_key(k);
+        true
     }
 
     /// Subscribes `k` and archives every version of it from now on. Versions already held in
@@ -223,10 +268,15 @@ impl Store {
         self.inner.write().watched_addresses.insert(a);
     }
 
-    pub fn watch_key(&self, k: StateKey) {
+    /// Subscribes `k`. Returns false (and changes nothing) if the subscribed-key limit refuses it.
+    pub fn watch_key(&self, k: StateKey) -> bool {
         let mut st = self.inner.write();
+        if !self.admit(&st, &k) {
+            return false;
+        }
         st.temp.remove(&k);
         st.watched_keys.insert(k);
+        true
     }
 
     /// Stops keeping `k` current (unless covered by a watched address) and drops its versions.
@@ -313,6 +363,10 @@ impl Store {
                 }
             }
             st.chain.insert(block.number, block);
+            st.hashes.insert(block.number, block.hash);
+            if let Some(p) = block.number.checked_sub(1) {
+                st.hashes.insert(p, block.parent_hash);
+            }
             st.recent.insert(block.number, writes);
             self.gc(&mut st);
             StateReady { block, changed_keys: Arc::new(changed), touched }
@@ -329,6 +383,7 @@ impl Store {
         }
         let mut st = self.inner.write();
         st.chain.retain(|n, _| *n <= number);
+        st.hashes.retain(|n, _| *n <= number);
         st.recent.retain(|n, _| *n <= number);
         for v in st.versions.values_mut() {
             v.retain(|(n, _)| *n <= number);
@@ -348,6 +403,10 @@ impl Store {
         if st.chain.get(&at.number).map(|b| b.hash) != Some(at.hash) {
             return Err(StateError::Reorged { number: at.number, hash: at.hash });
         }
+        let retention = match retention {
+            Retention::Subscribed if !self.admit(&st, &key) => Retention::Ttl(REFUSED_TTL),
+            r => r,
+        };
         match retention {
             Retention::Subscribed => {
                 st.temp.remove(&key);
@@ -399,6 +458,7 @@ impl Store {
             watched_addresses: st.watched_addresses.len(),
             code: st.code.len(),
             code_bytes: st.code.values().map(|c| c.len()).sum(),
+            admissions_refused: self.admissions_refused.load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -446,12 +506,54 @@ impl Store {
         ))
     }
 
-    /// Block hash by number: the in-memory chain, then the archive.
+    /// Block hash by number: the in-memory chain, the `BLOCKHASH` ring, then the archive.
+    /// `None` means unknown, never zero.
     pub fn block_hash(&self, number: u64) -> Option<B256> {
-        if let Some(b) = self.inner.read().chain.get(&number) {
-            return Some(b.hash);
+        {
+            let st = self.inner.read();
+            if let Some(b) = st.chain.get(&number) {
+                return Some(b.hash);
+            }
+            if let Some(h) = st.hashes.get(&number) {
+                return Some(*h);
+            }
         }
         self.archive.as_ref().and_then(|a| a.hash(number).ok().flatten())
+    }
+
+    /// The lowest block whose hash is known in memory, as `(number, hash)`. Its parent hash
+    /// comes with the header, so ancestor walks start from here.
+    pub fn oldest_known_hash(&self) -> Option<(u64, B256)> {
+        self.inner.read().hashes.first_key_value().map(|(n, h)| (*n, *h))
+    }
+
+    /// Adds ancestor hashes that link to the oldest known hash: `chain` is ordered newest
+    /// first, and each entry's hash must be the parent hash of the one before it (callers pass
+    /// `(number, hash, parent_hash)` from headers they hashed themselves). Stops at the first
+    /// break; returns how many were accepted.
+    pub fn insert_ancestor_hashes(&self, chain: &[(u64, B256, B256)]) -> usize {
+        let mut st = self.inner.write();
+        let Some((mut n, mut expect_hash)) = st.hashes.first_key_value().map(|(n, h)| (*n, *h)) else { return 0 };
+        let mut added = 0;
+        // The entry at `n` is known; its header's parent hash is the next expected hash.
+        let Some(mut parent) = chain.iter().find(|(m, h, _)| *m == n && *h == expect_hash).map(|c| c.2).or_else(|| {
+            st.chain.get(&n).map(|b| b.parent_hash)
+        }) else {
+            return 0;
+        };
+        for &(m, h, p) in chain {
+            if m >= n {
+                continue;
+            }
+            if m != n - 1 || h != parent {
+                break;
+            }
+            st.hashes.insert(m, h);
+            (n, expect_hash, parent) = (m, h, p);
+            added += 1;
+        }
+        let _ = expect_hash;
+        added
     }
 
     /// Number of an archived block hash.
@@ -478,6 +580,18 @@ impl Store {
         for k in expired {
             st.temp.remove(&k);
             st.versions.remove(&k);
+        }
+        // Bytecode lives only as long as some tracked account's code hash points at it.
+        let referenced: HashSet<B256> = st
+            .versions
+            .iter()
+            .filter(|(k, _)| matches!(k, StateKey::CodeHash(_)))
+            .flat_map(|(_, v)| v.iter().map(|(_, h)| B256::from(*h)))
+            .collect();
+        st.code.retain(|h, _| referenced.contains(h));
+        // BLOCKHASH reaches back 256 blocks from the next block: keep head-256..=head.
+        if let Some(c) = head.checked_sub(BLOCKHASH_DEPTH) {
+            st.hashes.retain(|n, _| *n >= c);
         }
         let Some(cut) = head.checked_sub(self.window) else { return };
         st.chain.retain(|n, _| *n > cut);

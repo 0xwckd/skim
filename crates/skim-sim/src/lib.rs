@@ -195,18 +195,27 @@ impl Simulator {
                 Mode::WarmOnly if snap.is_archived() => {
                     return Err(SimError::NotArchived {
                         block: b.number,
-                        keys: access.miss_accounts.len() + access.miss_storage.len() + access.miss_code.len(),
+                        keys: access.miss_accounts.len()
+                            + access.miss_storage.len()
+                            + access.miss_code.len()
+                            + access.miss_block_hashes.len(),
                     });
                 }
                 Mode::WarmOnly => {
                     return Err(SimError::StateUnavailable(
-                        access.miss_accounts.len() + access.miss_storage.len() + access.miss_code.len(),
+                        access.miss_accounts.len()
+                            + access.miss_storage.len()
+                            + access.miss_code.len()
+                            + access.miss_block_hashes.len(),
                     ));
                 }
                 Mode::Resolve { max_rounds } => max_rounds,
             };
             if rounds.len() >= max {
                 return Err(SimError::Incomplete(rounds.len()));
+            }
+            if let Some(&lowest) = access.miss_block_hashes.first() {
+                self.resolve_block_hashes(lowest).await;
             }
             let mut slots = access.miss_storage.clone();
             let extra = self.predictor.lock().expand(&snap, &slots);
@@ -226,6 +235,33 @@ impl Simulator {
                 )
                 .await,
             );
+        }
+    }
+
+    /// Makes canonical hashes down to `lowest` known, walking back by hash from the oldest
+    /// known one: each header from a peer is hashed locally and must be the parent of the one
+    /// after it. Unverifiable answers are ignored, so a `BLOCKHASH` miss stays a miss.
+    pub async fn resolve_block_hashes(&self, lowest: u64) {
+        let net = &self.sched.transport().net;
+        for _ in 0..4 {
+            let Some((oldest, hash)) = self.store.oldest_known_hash() else { return };
+            if oldest <= lowest {
+                return;
+            }
+            let want = oldest - lowest + 1;
+            let peers: Vec<_> = net.peers().into_iter().filter(|(_, p)| p.eth_version >= 69).map(|(id, _)| id).take(4).collect();
+            let mut progressed = false;
+            for p in peers {
+                let (Ok(hs), _) = net.headers_falling(p, hash.into(), want).await else { continue };
+                let chain: Vec<(u64, B256, B256)> = hs.iter().map(|h| (h.number, h.hash_slow(), h.parent_hash)).collect();
+                if self.store.insert_ancestor_hashes(&chain) > 0 {
+                    progressed = true;
+                    break;
+                }
+            }
+            if !progressed {
+                return;
+            }
         }
     }
 

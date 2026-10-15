@@ -14,6 +14,8 @@ pub struct Access {
     pub miss_accounts: Vec<Address>,
     pub miss_storage: Vec<(Address, U256)>,
     pub miss_code: Vec<B256>,
+    /// `BLOCKHASH(n)` for blocks whose hash skim doesn't know. Never answered as zero.
+    pub miss_block_hashes: Vec<u64>,
     pub accounts: Vec<Address>,
     pub storage: Vec<(Address, U256)>,
     pub block_hashes: Vec<u64>,
@@ -21,7 +23,10 @@ pub struct Access {
 
 impl Access {
     pub fn has_misses(&self) -> bool {
-        !(self.miss_accounts.is_empty() && self.miss_storage.is_empty() && self.miss_code.is_empty())
+        !(self.miss_accounts.is_empty()
+            && self.miss_storage.is_empty()
+            && self.miss_code.is_empty()
+            && self.miss_block_hashes.is_empty())
     }
 
     pub fn dedup(&mut self) {
@@ -35,6 +40,8 @@ impl Access {
         }
         self.miss_code.sort();
         self.miss_code.dedup();
+        self.miss_block_hashes.sort();
+        self.miss_block_hashes.dedup();
     }
 }
 
@@ -98,7 +105,15 @@ impl DatabaseRef for SnapDb<'_> {
     }
 
     fn block_hash_ref(&self, n: u64) -> Result<B256, Self::Error> {
-        self.access.lock().unwrap().block_hashes.push(n);
-        Ok((self.block_hash)(n).unwrap_or_default())
+        let mut a = self.access.lock().unwrap();
+        a.block_hashes.push(n);
+        match (self.block_hash)(n) {
+            Some(h) => Ok(h),
+            None => {
+                // The run is discarded (has_misses); the placeholder never reaches a caller.
+                a.miss_block_hashes.push(n);
+                Ok(B256::ZERO)
+            }
+        }
     }
 }

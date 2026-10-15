@@ -24,7 +24,7 @@ state:
     cache_ttl_blocks: 4               # unsubscribed state stays current this many blocks after use
 
   limits:
-    max_subscribed_keys: 100000       # cap on declared + learned keys; excess is reported as `truncated`
+    max_subscribed_keys: 100000       # hard cap on subscribed keys in the store (see below)
 
 predictors:
   uniswap_v3:                         # input-aware prefetch for QuoterV2.quoteExactInputSingle
@@ -43,7 +43,18 @@ predictors:
 | `on_block: true` | Keeps each call's latest output (hex) or error in `skim_subscriptionStatus.results`. |
 | `retention: { mode: archive }` | Stores every BAL-written version of this subscription's keys (including learned keys) in the `--archive` file, so historical `eth_getStorageAt` / `eth_call` work for them. See [archive](archive.md). |
 
-**Readiness** (`skim_subscriptionStatus`): `ready: true` means the head block's BAL is applied **and** every required key is known at the head. `missing_keys` counts the rest. `truncated: true` means `max_subscribed_keys` cut the learned set.
+**Readiness** (`skim_subscriptionStatus`): `ready: true` requires all of the following:
+- the head block's BAL is applied
+- every required key is known at the head (`missing_keys` counts the rest)
+- for simulation subscriptions, every call ran at that block without error or unresolved misses (`calls_ok`)
+- the key limit cut nothing (`truncated: false`)
+
+**`max_subscribed_keys` is enforced where keys enter the store, not just counted.**
+- **Startup:** declared keys over the limit fail at startup.
+- **Learned keys:** a simulation's learned keys are subscribed only while there is room. The rest stay on-demand, with a TTL, and the subscription reports `truncated: true`.
+- **Background prefetch:** the V3 predictor's subscribed keys count toward the same limit.
+- **Dropped keys:** keys a call stops reading are unsubscribed. Archived ones are the exception, because their history must stay continuous.
+- **Bytecode:** code is dropped when no tracked account points at it any more.
 
 ### Choosing between slots and calls
 - **You know the layout** (an ERC-20 balance, a V3 `slot0`): list slots. It's the cheapest option.
@@ -67,5 +78,5 @@ predictors:
 
 ## Sizing
 - **Memory:** tracked keys, their versions inside `--window`, and contract code. Measured: ~120 MB RSS for a few pools, tokens and quotes, following Sepolia.
-- **Network:** applying blocks costs nothing extra (gossip carries the BAL). Fetches happen only for state skim hasn't seen.
+- **Network and CPU:** skim receives and checks every block's full payload and BAL, so this part follows the whole chain's activity, not just your keys. What scales with your app is the state it keeps and the fetches it makes.
 - **Disk:** none, unless `--archive`.

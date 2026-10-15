@@ -229,3 +229,74 @@ fn code_is_cached_only_for_tracked_accounts() {
     assert_eq!(s.code(&keccak256(&ca)), Some(ca));
     assert_eq!(s.sizes().code, 1); // the untracked deployment isn't cached
 }
+
+#[test]
+fn blockhash_ring_outlives_a_short_window() {
+    // Review finding: with the window holding the head, H-256 was gone after GC, and an unknown
+    // hash read as zero. The ring keeps every hash BLOCKHASH can ask for.
+    let s = Store::new(16);
+    for n in 1..=300 {
+        s.apply_block(blk(n, 0), writes(&[])).unwrap();
+    }
+    assert_eq!(s.block_hash(300 - 256), Some(blk(300 - 256, 0).hash));
+    assert_eq!(s.block_hash(299), Some(blk(299, 0).hash));
+    assert_eq!(s.block_hash(300 - 258), None); // out of BLOCKHASH range: unknown, not zero
+}
+
+#[test]
+fn ancestor_hashes_are_accepted_only_when_hash_linked() {
+    let s = Store::new(16);
+    for n in 100..=105 {
+        s.apply_block(blk(n, 0), writes(&[])).unwrap();
+    }
+    // The ring knows 99 (parent of 100) but nothing older.
+    assert_eq!(s.oldest_known_hash(), Some((99, blk(99, 0).hash)));
+    assert_eq!(s.block_hash(98), None);
+    let h = |n: u64| blk(n, 0).hash;
+    let forged = B256::repeat_byte(0xee);
+    let chain = [(99, h(99), h(98)), (98, h(98), h(97)), (97, forged, h(96)), (96, h(96), h(95))];
+    assert_eq!(s.insert_ancestor_hashes(&chain), 1); // 98 links; 97 doesn't, so the walk stops
+    assert_eq!(s.block_hash(98), Some(h(98)));
+    assert_eq!(s.block_hash(97), None);
+    assert_eq!(s.block_hash(96), None);
+}
+
+#[test]
+fn subscribed_key_limit_is_enforced_at_admission() {
+    // Review finding: the limit only trimmed bookkeeping; fetched keys were already subscribed.
+    let s = Store::new(64);
+    s.set_max_subscribed(2);
+    s.apply_block(blk(1, 0), writes(&[])).unwrap();
+    assert!(s.watch_key(slot(1)));
+    s.insert_base(&blk(1, 0), slot(2), U256::from(2)).unwrap(); // Subscribed: admitted (2/2)
+    assert!(!s.watch_key(slot(3))); // over the limit: refused
+    s.insert_base(&blk(1, 0), slot(4), U256::from(4)).unwrap(); // Subscribed fetch: kept on demand
+    assert!(s.is_subscribed(&slot(2)));
+    assert!(!s.is_subscribed(&slot(3)));
+    assert!(!s.is_subscribed(&slot(4)));
+    assert_eq!(s.sizes().watched_keys, 2);
+    assert_eq!(s.sizes().admissions_refused, 2);
+    assert!(s.watch_key(slot(1))); // already subscribed: always fine
+    // The refused key is still correct while cached, then expires instead of growing the store.
+    assert_eq!(known(&s.snapshot(&blk(1, 0)).unwrap(), slot(4)), Some(4));
+    for n in 2..=10 {
+        s.apply_block(blk(n, 0), writes(&[])).unwrap();
+    }
+    assert_eq!(s.sizes().temp_keys, 0);
+}
+
+#[test]
+fn bytecode_is_dropped_with_its_last_account() {
+    let s = Store::new(64);
+    s.apply_block(blk(1, 0), writes(&[])).unwrap();
+    let c = Bytes::from_static(b"some-code");
+    let h = s.insert_code(c.clone());
+    s.insert_base_with(&blk(1, 0), StateKey::CodeHash(A), U256::from_be_bytes(h.0), Retention::Ttl(2)).unwrap();
+    s.apply_block(blk(2, 0), writes(&[])).unwrap();
+    assert_eq!(s.code(&h), Some(c));
+    for n in 3..=6 {
+        s.apply_block(blk(n, 0), writes(&[])).unwrap();
+    }
+    assert_eq!(s.code(&h), None);
+    assert_eq!(s.sizes().code, 0);
+}

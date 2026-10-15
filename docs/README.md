@@ -30,5 +30,6 @@ Every result in the README comes from one of these runs, on Sepolia over public 
 | [M3 2-hour soak](experiments/m3-soak-2h.md) | subscriptions vs on-demand, 0 disagreements |
 | [M4 archive](experiments/m4-archive.md) | selective archive, restart healing, BAL backfill |
 | [M5 predictors and chain data](experiments/m5-predictors-and-chain-data.md) | learned patterns, V3 predictor in `skim run`, transactions/receipts/logs |
+| [P3 full-node baseline](experiments/p3-full-node-baseline.md) | same workload and block hashes as a full node: answers, latency, resources |
 
 Tools used by these runs live in [`experiments/tools`](experiments/tools).

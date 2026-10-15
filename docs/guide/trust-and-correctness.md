@@ -13,12 +13,20 @@ skim is built so that it can be **slow or unavailable, but not wrong** about the
 | Bodies (older transactions) | Rebuild `transactionsRoot` |
 | Headers before skim started | Hash-linked to a known header |
 
+## Two different guarantees
+| Guarantee | Status |
+|---|---|
+| **A value matches the block it claims to be from** (state root, receipts root, block hash) | Checked, for every value skim serves |
+| **That block is on the canonical chain** | **Not checked yet.** skim trusts the gossiped head. |
+
+A Merkle proof shows that a value belongs to a root. It doesn't show that the root belongs to the right chain. Until consensus verification lands, a network that feeds skim a well-formed but non-canonical block can make it serve that block's (correctly proven) state.
+
 ## What skim does not verify (yet)
 - **Consensus.** skim trusts that the gossiped head is the canonical chain. Proof-of-stake fork choice, finality and BLS signatures are not checked, as in an optimistic light client. A consensus light-client sync is on the roadmap.
 - **Execution of the block itself.** skim takes the BAL's post-values as given, because they are committed by the block hash. A block that is valid by hash but whose BAL disagrees with its own execution would be invalid under consensus, and is out of scope here.
 
 ## Rules that hold everywhere
-1. **Unknown is never zero.** A value is used only if a BAL wrote it or a proof established it.
+1. **Unknown is never zero.** A value is used only if a BAL wrote it or a proof established it. The same holds for `BLOCKHASH`: an unknown hash is a miss, resolved from hash-linked ancestor headers or refused, never read as zero.
 2. **Fetch at the parent, replay to the head.** At gossip time most peers haven't executed block N yet. skim reads at N−1's root and applies BAL(N) itself.
 3. **Reorgs roll back to the common ancestor only** (in memory and in the archive), then replay.
 4. **Errors instead of guesses.** If a read can't be proven, the RPC answers `-32002`.

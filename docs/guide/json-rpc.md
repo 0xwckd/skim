@@ -5,7 +5,7 @@ skim serves standard Ethereum JSON-RPC over HTTP (`--rpc`, default `127.0.0.1:85
 ## Methods
 | Method | Notes |
 |---|---|
-| `eth_call` | Local revm. Unknown state is fetched (verified) first. State overrides: not yet (`-32602`). |
+| `eth_call` | Local revm. Unknown state is fetched (verified) first. Honours `gasPrice` / `maxFeePerGas` / `maxPriorityFeePerGas` (0 if omitted, as nodes do), `accessList` and `authorizationList` (EIP-7702). Blob fields and state overrides are rejected (`-32602`), never ignored. |
 | `eth_estimateGas` | Binary search on local execution, once the first run made the state local. |
 | `eth_getBalance`, `eth_getCode`, `eth_getStorageAt` | Tracked: local. Untracked: one verified fetch. |
 | `eth_getTransactionCount` | `pending` adds transactions sent through this skim and not yet included (gap-free nonces only). |

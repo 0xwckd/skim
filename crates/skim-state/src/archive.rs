@@ -209,6 +209,19 @@ impl Archive {
         Ok(())
     }
 
+    /// Records that `ek` has a version at `block`, so a reorg below `block` removes it. Every
+    /// version the archive stores must be journaled: BAL writes, bases, replayed writes and
+    /// backfilled values alike.
+    fn journal_add(tx: &redb::WriteTransaction, block: u64, ek: &[u8; K]) -> Result<(), ArchiveError> {
+        let mut j = tx.open_table(JOURNAL)?;
+        let mut cur = j.get(block)?.map(|g| g.value().to_vec()).unwrap_or_default();
+        if !cur.chunks_exact(K).any(|c| c == ek) {
+            cur.extend_from_slice(ek);
+            j.insert(block, cur.as_slice())?;
+        }
+        Ok(())
+    }
+
     fn write_entries(tx: &redb::WriteTransaction, b: &ArchiveBlock<'_>) -> Result<(), ArchiveError> {
         let mut versions = tx.open_table(VERSIONS)?;
         let mut cov = tx.open_table(COVERAGE)?;
@@ -337,11 +350,13 @@ impl Archive {
                         continue;
                     };
                     versions.insert(&vkey(&ek, from), &v)?;
+                    Self::journal_add(&tx, from, &ek)?;
                     cov.insert(&ek, from)?;
                     report.keys_unchanged += 1;
                 } else {
                     for (n, v) in &writes {
                         versions.insert(&vkey(&ek, *n), &v.to_be_bytes::<32>())?;
+                        Self::journal_add(&tx, *n, &ek)?;
                     }
                     cov.insert(&ek, writes[0].0)?;
                     wb.insert(&ek, ())?;
@@ -405,6 +420,11 @@ impl Archive {
             }
             for (n, v) in later {
                 versions.insert(&vkey(&ek, *n), &v.to_be_bytes::<32>())?;
+            }
+            drop(versions);
+            Self::journal_add(&tx, block, &ek)?;
+            for (n, _) in later {
+                Self::journal_add(&tx, *n, &ek)?;
             }
             let mut cov = tx.open_table(COVERAGE)?;
             let cur = cov.get(&ek)?.map(|g| g.value());
@@ -473,6 +493,16 @@ impl Archive {
                 if let Some(h) = hashes.remove(*b)? {
                     by_hash.remove(h.value())?;
                 }
+            }
+            // Coverage that starts above `n` describes forgotten blocks, whatever wrote it.
+            let stale: Vec<[u8; K]> = cov
+                .iter()?
+                .filter_map(|e| e.ok())
+                .filter(|(_, c)| c.value() > n)
+                .map(|(k, _)| *k.value())
+                .collect();
+            for ek in &stale {
+                cov.remove(ek)?;
             }
             let mut seg = tx.open_table(SEGMENTS)?;
             let open: Vec<(u64, u64)> = seg.iter()?.map(|e| e.map(|(s, e)| (s.value(), e.value()))).collect::<Result<_, _>>()?;
@@ -588,6 +618,26 @@ mod tests {
         assert!(matches!(a.get(&slot(9), 2).unwrap(), ArchiveRead::NotCovered { from: None }));
         blk(&a, 3, &[(slot(1), 33)]); // the new branch
         assert_eq!(val(&a, slot(1), 3), Some(33));
+    }
+
+    #[test]
+    fn reorg_removes_late_base_and_replayed_versions() {
+        // Review finding: versions written by write_base (a key archived after the fact, with
+        // the writes replayed since) were not journaled, so a reorg kept the old fork's value.
+        let d = tempfile::tempdir().unwrap();
+        let a = Archive::open(d.path().join("a.redb")).unwrap();
+        blk(&a, 100, &[]);
+        blk(&a, 101, &[]);
+        a.write_base(&slot(1), 100, U256::from(10), &[(101, U256::from(20))]).unwrap();
+        assert_eq!(val(&a, slot(1), 101), Some(20));
+        a.truncate_above(100).unwrap();
+        blk(&a, 101, &[]); // 101' doesn't touch the key
+        assert_eq!(val(&a, slot(1), 101), Some(10));
+        // A base above the rollback point is withdrawn entirely, not left dangling.
+        a.write_base(&slot(2), 101, U256::from(5), &[]).unwrap();
+        a.truncate_above(100).unwrap();
+        blk(&a, 101, &[]);
+        assert_eq!(val(&a, slot(2), 101), None);
     }
 
     #[test]

@@ -50,6 +50,12 @@ pub struct Args {
     /// Largest block range one `eth_getLogs` request may scan.
     #[arg(long, default_value_t = 2048)]
     max_logs_range: u64,
+    /// Consensus-layer gossip mesh degree (more = more eager-push paths for new payloads).
+    #[arg(long, default_value_t = 12)]
+    cl_mesh: usize,
+    /// Consensus-layer peers to keep (more = better odds of being close to each publisher).
+    #[arg(long, default_value_t = 80)]
+    cl_peers: usize,
     /// Disable the learned-set pattern tier (A/B measurements).
     #[arg(long)]
     no_learned_patterns: bool,
@@ -184,8 +190,22 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     }
     *sim.on_demand.write() = skim_state::Retention::Ttl(if cfg.state.on_demand.enabled { cfg.state.on_demand.cache_ttl_blocks } else { 1 });
     let subs = Arc::new(skim_sim::subscription::Subscriptions::new(cfg.state.subscriptions, cfg.state.limits.max_subscribed_keys)?);
+    // The limit is enforced by the store itself, for every path that subscribes keys.
+    store.set_max_subscribed(cfg.state.limits.max_subscribed_keys);
     tracing::info!(subscriptions = subs.status().len(), declared_keys = subs.total_keys(), "state subscriptions loaded");
-    let (_cl, mut rx) = ClNode::start(NodeConfig::sepolia(args.cl_port)).await?;
+    let mut ncfg = NodeConfig::sepolia(args.cl_port);
+    ncfg.mesh_n = args.cl_mesh;
+    ncfg.target_peers = args.cl_peers;
+    ncfg.max_peers = args.cl_peers + args.cl_peers / 4;
+    let (cl, mut rx) = ClNode::start(ncfg).await?;
+    let cl_stats = cl.stats.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let s = cl_stats.lock().unwrap();
+            tracing::info!(peers = s.connected, outbound = s.outbound, mesh = ?s.mesh, topic_peers = ?s.topic_peers, "CL gossip");
+        }
+    });
     let chaindata = crate::chaindata::ChainData::new(net.clone(), args.max_logs_range);
     tokio::spawn(serve(Arc::new(Rpc { sim: sim.clone(), subs: Some(subs.clone()), chain: Some(chaindata.clone()) }), args.rpc));
     if store.archive().is_some() {
@@ -213,7 +233,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     tracing::info!("following Sepolia from CL gossip; RPC answers once the first block is applied");
 
     while let Some(ev) = rx.recv().await {
-        let ClEvent::Gossip { topic, data, .. } = ev else { continue };
+        let ClEvent::Gossip { topic, data, received, .. } = ev else { continue };
         if topic != "execution_payload" {
             continue;
         }
@@ -225,6 +245,11 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         }
         let Ok(bal) = skim_bal::decode(env.payload.block_access_list) else { continue };
         let number = v.header.number;
+        // Payload arrival relative to the start of its slot (the block timestamp).
+        let arrival_ms = received
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64() * 1e3 - v.header.timestamp as f64 * 1e3)
+            .unwrap_or(f64::NAN);
         let writes = BlockWrites::from_bal(&bal);
         chaindata.note_payload(
             number,
@@ -234,7 +259,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         );
         match chain.place(v.header, Arc::new(writes)).await {
             Placed::Applied { ready, reorged_to, filled } => {
-                tracing::info!(number, changed = ready.changed_keys.len(), ?reorged_to, filled, "state ready");
+                tracing::info!(number, arrival_ms = arrival_ms as i64, changed = ready.changed_keys.len(), ?reorged_to, filled, "state ready");
                 if let Some(v) = &v3 {
                     tokio::spawn(v3_tick(sim.clone(), v.clone(), v3_state.clone(), ready.block));
                 }

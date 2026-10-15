@@ -83,6 +83,8 @@ struct Ep {
     ok: u64,
     err: u64,
     throughput: HashMap<usize, Vec<f64>>,
+    /// Blocks this endpoint didn't have within 12 s of the driver.
+    unavailable_blocks: u64,
 }
 
 pub async fn run(args: Args) -> anyhow::Result<()> {
@@ -150,8 +152,30 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         let mut all = calls();
         all.extend(random_quotes(n, args.random_quotes));
         let mut per_call: Vec<HashMap<String, Option<String>>> = vec![HashMap::new(); all.len()];
+        // Each endpoint is queried only once it has this block (an endpoint that sees the block
+        // later answers "unavailable", which is a refusal, not a disagreement). The wait is
+        // recorded; an endpoint that doesn't have the block within 12 s is skipped for it.
+        let mut avail_ms: HashMap<String, Option<f64>> = HashMap::new();
+        for (name, url) in &eps {
+            let t = Instant::now();
+            let mut got = None;
+            while t.elapsed() < Duration::from_secs(12) {
+                if let Ok(v) = rpc(&client, url, "eth_getBlockByHash", serde_json::json!([hash, false])).await
+                    && v["result"].is_object()
+                {
+                    got = Some(t.elapsed().as_secs_f64() * 1e3);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            avail_ms.insert(name.clone(), got);
+        }
         for (name, url) in &eps {
             let st = stats.get_mut(name).unwrap();
+            if avail_ms[name].is_none() {
+                st.unavailable_blocks += 1;
+                continue;
+            }
             for (i, c) in all.iter().enumerate() {
                 let (ms, h) = call_at(&client, url, c, &hash).await;
                 st.latency.push_ms(ms);
@@ -159,13 +183,13 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                 per_call[i].insert(name.clone(), h);
             }
         }
-        if eps.len() > 1 {
+        if eps.len() > 1 && avail_ms.values().all(Option::is_some) {
             for m in &per_call {
                 let vals: Vec<_> = m.values().collect();
                 if vals.iter().all(|v| v.is_some() && *v == vals[0]) { agree += 1 } else { disagree += 1 }
             }
         }
-        let _ = writeln!(out, "{}", serde_json::json!({"number": n, "hash": hash, "slot": (ts - GENESIS) / 12, "results": per_call}));
+        let _ = writeln!(out, "{}", serde_json::json!({"number": n, "hash": hash, "slot": (ts - GENESIS) / 12, "avail_ms": avail_ms, "results": per_call}));
         let _ = out.flush();
 
         // Concurrency sweep.
@@ -213,7 +237,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         .map(|(n, s)| {
             let p99 = s.latency.pct(99.0);
             (n.clone(), serde_json::json!({
-                "eth_call": s.latency.json(), "eth_call_p99_ms": p99, "ok": s.ok, "err": s.err,
+                "eth_call": s.latency.json(), "eth_call_p99_ms": p99, "ok": s.ok, "err": s.err, "unavailable_blocks": s.unavailable_blocks,
                 "readiness_after_block_timestamp": s.readiness.json(),
                 "throughput_rps_median": s.throughput.iter().map(|(c, v)| {
                     let mut v = v.clone();

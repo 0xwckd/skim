@@ -78,6 +78,8 @@ pub struct Status {
     pub required_keys: usize,
     pub missing_keys: usize,
     pub truncated: bool,
+    /// Every call of the subscription ran without error and without unresolved misses at `block`.
+    pub calls_ok: bool,
     pub error: Option<String>,
     /// Latest results of `calls` (hex output, or an error), when `on_block` is set.
     pub results: Vec<String>,
@@ -86,7 +88,9 @@ pub struct Status {
 pub struct Subscriptions {
     specs: Vec<SubscriptionSpec>,
     max_keys: usize,
-    /// Required keys per subscription (declared + learned).
+    /// Keys each subscription declares explicitly (account / storage).
+    declared: BTreeMap<String, HashSet<StateKey>>,
+    /// Required keys per subscription (declared + admitted learned keys).
     required: RwLock<BTreeMap<String, HashSet<StateKey>>>,
     status: RwLock<BTreeMap<String, Status>>,
 }
@@ -97,6 +101,14 @@ pub enum ConfigError {
     StorageAll(String),
     #[error("subscription {0}: storage/account needs an address")]
     NoAddress(String),
+    #[error("{0} declared keys exceed limits.max_subscribed_keys = {1}")]
+    TooManyKeys(usize, usize),
+}
+
+/// Readiness: the head is current, every required key is known, every call ran cleanly at
+/// this block, and the key limit cut nothing. An empty key set from a failed run is not ready.
+fn is_ready(head_ok: bool, missing: usize, calls_ok: bool, truncated: bool) -> bool {
+    head_ok && missing == 0 && calls_ok && !truncated
 }
 
 fn account_keys(a: Address) -> [StateKey; 3] {
@@ -123,8 +135,12 @@ impl Subscriptions {
             }
             required.insert(s.name.clone(), keys);
         }
+        let total: usize = required.values().map(HashSet::len).sum();
+        if total > max_keys {
+            return Err(ConfigError::TooManyKeys(total, max_keys));
+        }
         let status = specs.iter().map(|s| (s.name.clone(), Status { name: s.name.clone(), ..Default::default() })).collect();
-        Ok(Self { specs, max_keys, required: RwLock::new(required), status: RwLock::new(status) })
+        Ok(Self { specs, max_keys, declared: required.clone(), required: RwLock::new(required), status: RwLock::new(status) })
     }
 
     pub fn total_keys(&self) -> usize {
@@ -137,15 +153,23 @@ impl Subscriptions {
 
     /// Per block: subscribe declared keys (fetching unknown ones), run/learn the calls,
     /// then compute readiness at `head`.
+    ///
+    /// Limits are enforced where keys enter the store: calls run with on-demand retention, and
+    /// only keys admitted under `max_keys` become subscribed. Keys a call no longer reads are
+    /// unsubscribed (except archived ones, whose history must stay continuous).
     pub async fn maintain(&self, sim: &Simulator, head: &BlockRef) {
+        sim.store.set_max_subscribed(self.max_keys);
         // 1. Declared keys: subscribe (or archive) and fetch whatever is unknown.
-        let declared: Vec<StateKey> = self.required.read().values().flat_map(|k| k.iter().copied()).collect();
-        let archived: HashSet<StateKey> = {
-            let req = self.required.read();
-            self.specs.iter().filter(|s| s.archive()).flat_map(|s| req.get(&s.name).into_iter().flatten().copied()).collect()
-        };
-        for k in &declared {
-            if archived.contains(k) { sim.store.archive_key(*k) } else { sim.store.watch_key(*k) }
+        let declared: Vec<StateKey> = self.declared.values().flat_map(|k| k.iter().copied()).collect();
+        let archived_specs: HashSet<&str> = self.specs.iter().filter(|s| s.archive()).map(|s| s.name.as_str()).collect();
+        for (name, keys) in &self.declared {
+            for k in keys {
+                if archived_specs.contains(name.as_str()) {
+                    sim.store.archive_key_checked(*k);
+                } else {
+                    sim.store.watch_key(*k);
+                }
+            }
         }
         if let Ok(snap) = sim.store.snapshot(head) {
             let (accts, slots) = crate::unknown_split(&snap, &declared);
@@ -156,12 +180,16 @@ impl Subscriptions {
             }
         }
 
-        // 2. Calls: run with subscribed retention; their access sets become required keys.
+        // 2. Calls: run at this block (fetched state is on demand until admitted).
         for spec in self.specs.iter().filter(|s| !s.calls.is_empty()) {
             let mut results = Vec::new();
             let mut learned = HashSet::new();
+            let mut first_error = None;
             for c in &spec.calls {
-                let Some(header) = sim.header(head) else { break };
+                let Some(header) = sim.header(head) else {
+                    first_error.get_or_insert_with(|| format!("no header for block {}", head.number));
+                    break;
+                };
                 let tx = TxEnv::builder()
                     .caller(c.from.unwrap_or_default())
                     .kind(TxKind::Call(c.to))
@@ -170,7 +198,7 @@ impl Subscriptions {
                     .gas_price(0)
                     .build()
                     .unwrap_or_default();
-                match sim.call_retained(head, tx, Mode::Resolve { max_rounds: 8 }, Retention::Subscribed).await {
+                match sim.call(head, tx, Mode::Resolve { max_rounds: 8 }).await {
                     Ok(o) => {
                         for a in &o.access.accounts {
                             learned.extend(account_keys(*a));
@@ -181,54 +209,64 @@ impl Subscriptions {
                             other => format!("error: {other:?}"),
                         });
                     }
-                    Err(e) => results.push(format!("error: {e}")),
+                    Err(e) => {
+                        first_error.get_or_insert_with(|| e.to_string());
+                        results.push(format!("error: {e}"));
+                    }
                 }
             }
-            let mut req = self.required.write();
-            let declared_len = req.get(&spec.name).map_or(0, |k| k.len());
-            let room = self.max_keys.saturating_sub(req.values().map(HashSet::len).sum::<usize>() - declared_len);
-            let entry = req.entry(spec.name.clone()).or_default();
+            // Admit learned keys under the global limit. A failed run keeps the previous set:
+            // its access set is incomplete, and the subscription is reported not ready.
+            let archive = spec.archive();
             let mut truncated = false;
-            for k in learned {
-                if entry.len() >= room && !entry.contains(&k) {
-                    truncated = true;
-                    continue;
+            if first_error.is_none() {
+                let declared = self.declared.get(&spec.name).cloned().unwrap_or_default();
+                let mut admitted: HashSet<StateKey> = declared.clone();
+                let mut sorted: Vec<StateKey> = learned.into_iter().collect();
+                sorted.sort();
+                for k in sorted {
+                    let ok = if archive { sim.store.archive_key_checked(k) } else { sim.store.watch_key(k) };
+                    if ok {
+                        admitted.insert(k);
+                    } else {
+                        truncated = true;
+                    }
                 }
-                entry.insert(k);
+                let old = self.required.write().insert(spec.name.clone(), admitted.clone()).unwrap_or_default();
+                if !archive {
+                    let req = self.required.read();
+                    for k in old.difference(&admitted) {
+                        if !req.values().any(|ks| ks.contains(k)) {
+                            sim.store.unwatch_key(k);
+                        }
+                    }
+                }
             }
-            drop(req);
             let mut st = self.status.write();
             let s = st.entry(spec.name.clone()).or_default();
             s.truncated = truncated;
+            s.calls_ok = first_error.is_none();
+            s.error = first_error;
             if spec.on_block {
                 s.results = results;
             }
         }
 
-        // Archive keys learned this block too (their history starts now).
-        {
-            let req = self.required.read();
-            for spec in self.specs.iter().filter(|s| s.archive()) {
-                for k in req.get(&spec.name).into_iter().flatten() {
-                    if !sim.store.is_archived(k) {
-                        sim.store.archive_key(*k);
-                    }
-                }
-            }
-        }
-
-        // 3. Readiness at the head.
+        // 3. Readiness at the head: required keys known, every call ran cleanly at this block,
+        //    and nothing was cut by the key limit.
         let Ok(snap) = sim.store.snapshot(head) else { return };
+        let head_ok = sim.store.head().is_some_and(|h| h.hash == head.hash);
         let req = self.required.read();
         let mut st = self.status.write();
-        for (name, keys) in req.iter() {
+        for spec in &self.specs {
+            let keys = req.get(&spec.name).cloned().unwrap_or_default();
             let missing = keys.iter().filter(|k| !matches!(snap.get(k), Ok(StateValue::Known(_)))).count();
-            let s = st.entry(name.clone()).or_default();
-            s.name = name.clone();
+            let s = st.entry(spec.name.clone()).or_default();
+            s.name = spec.name.clone();
             s.block = Some(head.number);
             s.required_keys = keys.len();
             s.missing_keys = missing;
-            s.ready = missing == 0 && sim.store.head().is_some_and(|h| h.hash == head.hash);
+            s.ready = is_ready(head_ok, missing, spec.calls.is_empty() || s.calls_ok, s.truncated);
         }
     }
 }
@@ -236,6 +274,24 @@ impl Subscriptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_or_truncated_simulations_are_never_ready() {
+        // Review finding: a call that failed learned no keys, so "0 missing" read as ready.
+        assert!(is_ready(true, 0, true, false));
+        assert!(!is_ready(true, 0, false, false)); // the call failed: empty key set is not ready
+        assert!(!is_ready(true, 0, true, true)); // learned set cut by the limit
+        assert!(!is_ready(false, 0, true, false)); // not at the head
+        assert!(!is_ready(true, 1, true, false));
+    }
+
+    #[test]
+    fn declared_keys_over_the_limit_are_rejected_at_startup() {
+        let y = "- name: big\n  address: \"0x0000000000000000000000000000000000000001\"\n  account: true\n  storage: [\"0x1\", \"0x2\"]\n";
+        let specs: Vec<SubscriptionSpec> = serde_yaml_ng::from_str(y).unwrap();
+        assert!(matches!(Subscriptions::new(specs.clone(), 4), Err(ConfigError::TooManyKeys(5, 4))));
+        assert!(Subscriptions::new(specs, 5).is_ok());
+    }
 
     #[test]
     fn parses_yaml_and_rejects_unsupported() {

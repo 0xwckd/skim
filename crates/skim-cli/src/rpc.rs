@@ -136,18 +136,43 @@ impl Rpc {
         self.sim.header(b).ok_or_else(|| RpcError::unavailable(format!("no header for block {}", b.number)))
     }
 
-    fn tx_env(&self, req: TransactionRequest, header: &Header) -> TxEnv {
+    /// Builds the execution for a call request. Every field that changes execution is honoured
+    /// (fees, access list, EIP-7702 authorizations) or the request is rejected: nothing is
+    /// silently dropped.
+    fn tx_env(&self, req: TransactionRequest, header: &Header) -> Result<TxEnv, RpcError> {
+        if req.blob_versioned_hashes.as_ref().is_some_and(|v| !v.is_empty()) || req.max_fee_per_blob_gas.is_some() || req.sidecar.is_some() {
+            return Err(RpcError::params("blob transaction fields are not supported in calls"));
+        }
+        if req.gas_price.is_some() && (req.max_fee_per_gas.is_some() || req.max_priority_fee_per_gas.is_some()) {
+            return Err(RpcError::params("both gasPrice and (maxFeePerGas or maxPriorityFeePerGas) specified"));
+        }
         let gas = req.gas.unwrap_or(header.gas_limit).min(header.gas_limit.max(30_000_000));
         let data = req.input.input().cloned().unwrap_or_default();
-        TxEnv::builder()
+        let mut b = TxEnv::builder()
             .caller(req.from.unwrap_or_default())
             .kind(req.to.unwrap_or(TxKind::Create))
             .data(data)
             .value(req.value.unwrap_or_default())
             .gas_limit(gas)
-            .gas_price(0)
-            .build()
-            .unwrap_or_default()
+            .chain_id(Some(skim_sim::env::SEPOLIA_CHAIN_ID));
+        // Fees: as nodes do for eth_call, 0 unless given (GASPRICE then sees the given price).
+        b = match (req.gas_price, req.max_fee_per_gas, req.max_priority_fee_per_gas) {
+            (Some(p), _, _) => b.gas_price(p),
+            (None, None, None) => b.gas_price(0),
+            (None, max, prio) => {
+                let max = max.unwrap_or(0);
+                b.gas_price(max).gas_priority_fee(Some(prio.unwrap_or(0).min(max)))
+            }
+        };
+        if let Some(al) = req.access_list {
+            b = b.access_list(al);
+        }
+        if let Some(auth) = req.authorization_list {
+            if !auth.is_empty() {
+                b = b.authorization_list_signed(auth);
+            }
+        }
+        b.build().map_err(|e| RpcError::params(format!("invalid call: {e:?}")))
     }
 
     fn exec_result(r: &ExecutionResult) -> R {
@@ -222,7 +247,7 @@ impl Rpc {
                 let req: TransactionRequest = need(params, 0)?;
                 let b = self.resolve_block(param(params, 1)?, latest)?;
                 let header = self.header(&b)?;
-                let out = sim.call(&b, self.tx_env(req, &header), Mode::Resolve { max_rounds: 8 }).await?;
+                let out = sim.call(&b, self.tx_env(req, &header)?, Mode::Resolve { max_rounds: 8 }).await?;
                 tracing::debug!(number = b.number, predicted_keys = out.predicted.as_ref().map_or(0, |p| p.keys),
                     predicted_ms = out.predicted.as_ref().map_or(0.0, |p| p.wall_ms), rounds = out.rounds.len(),
                     round_keys = out.rounds.iter().map(|r| r.keys).sum::<usize>(), "eth_call fetches");
@@ -233,7 +258,7 @@ impl Rpc {
                 let b = self.resolve_block(param(params, 1)?, latest)?;
                 let header = self.header(&b)?;
                 let cap = req.gas.unwrap_or(header.gas_limit);
-                let mut tx = self.tx_env(req, &header);
+                let mut tx = self.tx_env(req, &header)?;
                 tx.gas_limit = cap;
                 let first = sim.call(&b, tx.clone(), Mode::Resolve { max_rounds: 8 }).await?;
                 Self::exec_result(&first.result)?;
@@ -289,6 +314,20 @@ impl Rpc {
                     _ => ChainData::range(&filter, head)?,
                 };
                 Ok(chain.logs(&filter, from, to).await?)
+            }
+            "skim_status" => {
+                let z = sim.store.sizes();
+                let peers = sim.sched.transport().net.peers();
+                Ok(json!({
+                    "head": sim.store.head().map(|h| h.number),
+                    "store": {
+                        "chain": z.chain, "recent_bals": z.recent_bals, "keys": z.keys, "versions": z.versions,
+                        "subscribed_keys": z.watched_keys, "on_demand_keys": z.temp_keys,
+                        "code": z.code, "code_bytes": z.code_bytes, "admissions_refused": z.admissions_refused,
+                    },
+                    "el_peers": peers.len(),
+                    "snap_peers": peers.iter().filter(|(_, p)| p.snap1 || p.snap2).count(),
+                }))
             }
             "skim_subscriptionStatus" => Ok(serde_json::to_value(self.subs.as_ref().map(|s| s.status()).unwrap_or_default()).unwrap()),
             m if OUT_OF_SCOPE.contains(&m) => Err(RpcError::unsupported(m)),

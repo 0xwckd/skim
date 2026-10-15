@@ -65,6 +65,9 @@ pub struct NodeConfig {
     pub quic_port: u16,
     pub target_peers: usize,
     pub max_peers: usize,
+    /// Gossipsub mesh degree (D) per topic; D_lo = 2D/3, D_hi = 3D/2. More mesh peers means more
+    /// eager-push paths, so a payload arrives over the fastest of more routes.
+    pub mesh_n: usize,
     pub bootnodes: Vec<String>,
     /// Status to advertise before any peer's status has been learned.
     pub initial_status: Option<Status>,
@@ -87,8 +90,9 @@ impl NodeConfig {
             genesis_time: SEPOLIA_GENESIS_TIME,
             port,
             quic_port: port + 1,
-            target_peers: 50,
-            max_peers: 70,
+            target_peers: 80,
+            max_peers: 100,
+            mesh_n: 12,
             bootnodes: SEPOLIA_BOOTNODES.iter().map(|s| s.to_string()).collect(),
             initial_status: None,
             topics: vec!["beacon_block".into(), "execution_payload".into()],
@@ -287,9 +291,10 @@ impl ClNode {
         let gcfg = gossipsub::ConfigBuilder::default()
             .max_transmit_size(gossip::MAX_PAYLOAD_SIZE)
             .heartbeat_interval(Duration::from_millis(700))
-            .mesh_n(8)
-            .mesh_n_low(6)
-            .mesh_n_high(12)
+            .mesh_n(cfg.mesh_n)
+            .mesh_n_low((cfg.mesh_n * 2 / 3).max(1))
+            .mesh_n_high(cfg.mesh_n * 3 / 2)
+            .mesh_outbound_min((cfg.mesh_n / 3).max(1))
             .gossip_lazy(6)
             .fanout_ttl(Duration::from_secs(60))
             .history_length(12)
