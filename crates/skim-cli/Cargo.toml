@@ -33,5 +33,6 @@ skim-snap.workspace = true
 skim-state.workspace = true
 skim-sim.workspace = true
 axum.workspace = true
+serde_yaml_ng.workspace = true
 alloy-rpc-types-eth.workspace = true
 skim-cl.workspace = true

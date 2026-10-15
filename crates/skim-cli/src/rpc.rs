@@ -88,6 +88,7 @@ fn need<T: serde::de::DeserializeOwned>(params: &Value, i: usize) -> Result<T, R
 
 pub struct Rpc {
     pub sim: Arc<Simulator>,
+    pub subs: Option<Arc<skim_sim::subscription::Subscriptions>>,
 }
 
 impl Rpc {
@@ -221,6 +222,7 @@ impl Rpc {
                 let tip = 1_000_000_000u128;
                 Ok(json!(U256::from(if method == "eth_gasPrice" { base + tip } else { tip })))
             }
+            "skim_subscriptionStatus" => Ok(serde_json::to_value(self.subs.as_ref().map(|s| s.status()).unwrap_or_default()).unwrap()),
             m if OUT_OF_SCOPE.contains(&m) => Err(RpcError::unsupported(m)),
             m => Err(RpcError::new(-32601, format!("method {m} not found"))),
         }

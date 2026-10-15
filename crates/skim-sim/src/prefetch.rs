@@ -16,7 +16,7 @@ use alloy_primitives::{Address, B256, Bytes, I256, U256, keccak256};
 use revm::primitives::KECCAK_EMPTY;
 use skim_bal::StateKey;
 use skim_snap::{FetchMeta, Key, Priority, Scheduler, Value, el::ElTransport};
-use skim_state::{BlockRef, Snapshot, StateValue, Store};
+use skim_state::{BlockRef, Retention, Snapshot, StateValue, Store};
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct Resolve {
@@ -52,6 +52,20 @@ pub async fn resolve(
     resolve_with(store, sched, at, accounts, storage, code, Priority::High).await
 }
 
+/// [`resolve_with`] that commits values with an explicit retention (on-demand TTL vs subscribed).
+pub async fn resolve_retained(
+    store: &Store,
+    sched: &Scheduler<ElTransport>,
+    at: &BlockRef,
+    accounts: &[Address],
+    storage: &[(Address, U256)],
+    code: &[B256],
+    prio: Priority,
+    retention: Retention,
+) -> Resolve {
+    resolve_inner(store, sched, at, accounts, storage, code, prio, retention).await
+}
+
 /// [`resolve`] at a given scheduler priority (background prefetch uses `Low`).
 pub async fn resolve_with(
     store: &Store,
@@ -61,6 +75,20 @@ pub async fn resolve_with(
     storage: &[(Address, U256)],
     code: &[B256],
     prio: Priority,
+) -> Resolve {
+    resolve_inner(store, sched, at, accounts, storage, code, prio, Retention::Subscribed).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_inner(
+    store: &Store,
+    sched: &Scheduler<ElTransport>,
+    at: &BlockRef,
+    accounts: &[Address],
+    storage: &[(Address, U256)],
+    code: &[B256],
+    prio: Priority,
+    retention: Retention,
 ) -> Resolve {
     let t = std::time::Instant::now();
     let root = at.state_root;
@@ -77,15 +105,15 @@ pub async fn resolve_with(
                     Some(a) => (a.balance, U256::from(a.nonce), a.code_hash),
                     None => (U256::ZERO, U256::ZERO, KECCAK_EMPTY),
                 };
-                let _ = store.insert_base(at, StateKey::Balance(*address), bal);
-                let _ = store.insert_base(at, StateKey::Nonce(*address), nonce);
-                let _ = store.insert_base(at, StateKey::CodeHash(*address), U256::from_be_bytes(ch.0));
+                let _ = store.insert_base_with(at, StateKey::Balance(*address), bal, retention);
+                let _ = store.insert_base_with(at, StateKey::Nonce(*address), nonce, retention);
+                let _ = store.insert_base_with(at, StateKey::CodeHash(*address), U256::from_be_bytes(ch.0), retention);
                 if ch != KECCAK_EMPTY && store.code(&ch).is_none() {
                     chained.push(Key::Code(ch));
                 }
             }
             (Key::Storage { address, slot, .. }, Ok(Value::Storage(v))) => {
-                let _ = store.insert_base(at, StateKey::Storage(*address, *slot), v);
+                let _ = store.insert_base_with(at, StateKey::Storage(*address, *slot), v, retention);
             }
             (Key::Code(_), Ok(Value::Code(c))) => {
                 store.insert_code(c);

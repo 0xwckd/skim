@@ -13,6 +13,7 @@ pub mod env;
 pub mod learned;
 pub mod predictor;
 pub mod prefetch;
+pub mod subscription;
 
 use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
@@ -27,7 +28,8 @@ use revm::{
 };
 use skim_bal::StateKey;
 use skim_snap::{Scheduler, el::ElTransport};
-use skim_state::{BlockRef, Snapshot, StateError, StateValue, Store};
+use skim_state::{BlockRef, Retention, Snapshot, StateError, StateValue, Store};
+use skim_snap::Priority;
 
 pub use db::Access;
 pub use prefetch::Resolve;
@@ -80,6 +82,9 @@ pub struct Simulator {
     headers: RwLock<BTreeMap<u64, Header>>,
     /// Resolve misses at the parent root (peers may not have executed the head yet).
     pub miss_at_parent: bool,
+    /// Retention for state fetched on demand (unsubscribed): `Ttl(n)` keeps it current for n
+    /// blocks, then evicts it. `Subscribed` keeps everything ever read (pre-M3 behaviour).
+    pub on_demand: RwLock<Retention>,
 }
 
 impl Simulator {
@@ -90,6 +95,7 @@ impl Simulator {
             predictor: Mutex::new(predictor),
             headers: RwLock::default(),
             miss_at_parent: true,
+            on_demand: RwLock::new(Retention::Ttl(4)),
         })
     }
 
@@ -131,8 +137,14 @@ impl Simulator {
         res.map(|r| (r, access))
     }
 
-    /// Runs `tx` on the post-state of `b`.
+    /// Runs `tx` on the post-state of `b`; fetched state gets the on-demand retention.
     pub async fn call(&self, b: &BlockRef, tx: TxEnv, mode: Mode) -> Result<CallOutcome, SimError> {
+        let retention = *self.on_demand.read();
+        self.call_retained(b, tx, mode, retention).await
+    }
+
+    /// [`Self::call`] committing fetched state with `retention` (subscriptions use `Subscribed`).
+    pub async fn call_retained(&self, b: &BlockRef, tx: TxEnv, mode: Mode, retention: Retention) -> Result<CallOutcome, SimError> {
         let snap = self.store.snapshot(b)?;
         let header = self.header(b).ok_or(SimError::NoHeader(b.number))?;
         let at = self.fetch_at(b);
@@ -145,7 +157,9 @@ impl Simulator {
             let (keys, _) = self.predictor.lock().predict(input, &snap);
             let (accts, slots) = unknown_split(&snap, &keys);
             if !accts.is_empty() || !slots.is_empty() {
-                predicted = Some(prefetch::resolve(&self.store, &self.sched, &at, &accts, &slots, &[]).await);
+                predicted = Some(
+                    prefetch::resolve_retained(&self.store, &self.sched, &at, &accts, &slots, &[], Priority::High, retention).await,
+                );
             }
         }
         let mut rounds = Vec::new();
@@ -157,6 +171,14 @@ impl Simulator {
             if !access.has_misses() {
                 if let Some(input) = &input {
                     self.predictor.lock().record(input, &access.accounts, &access.storage);
+                }
+                if let Retention::Ttl(n) = retention {
+                    // Recently used on-demand keys stay cached for another TTL.
+                    let mut keys: Vec<StateKey> = access.storage.iter().map(|(a, s)| StateKey::Storage(*a, *s)).collect();
+                    for a in &access.accounts {
+                        keys.extend([StateKey::Balance(*a), StateKey::Nonce(*a), StateKey::CodeHash(*a)]);
+                    }
+                    self.store.touch_ttl(&keys, n);
                 }
                 return Ok(CallOutcome { result, access, predicted, rounds, exec_us });
             }
@@ -177,7 +199,17 @@ impl Simulator {
             slots.sort();
             slots.dedup();
             rounds.push(
-                prefetch::resolve(&self.store, &self.sched, &at, &access.miss_accounts, &slots, &access.miss_code).await,
+                prefetch::resolve_retained(
+                    &self.store,
+                    &self.sched,
+                    &at,
+                    &access.miss_accounts,
+                    &slots,
+                    &access.miss_code,
+                    Priority::High,
+                    retention,
+                )
+                .await,
             );
         }
     }
@@ -189,10 +221,13 @@ impl Simulator {
             return Ok(v);
         }
         let at = self.fetch_at(b);
+        let ret = *self.on_demand.read();
         let r = match key {
-            StateKey::Storage(a, s) => prefetch::resolve(&self.store, &self.sched, &at, &[], &[(a, s)], &[]).await,
+            StateKey::Storage(a, s) => {
+                prefetch::resolve_retained(&self.store, &self.sched, &at, &[], &[(a, s)], &[], Priority::High, ret).await
+            }
             StateKey::Balance(a) | StateKey::Nonce(a) | StateKey::CodeHash(a) => {
-                prefetch::resolve(&self.store, &self.sched, &at, &[a], &[], &[]).await
+                prefetch::resolve_retained(&self.store, &self.sched, &at, &[a], &[], &[], Priority::High, ret).await
             }
         };
         match snap.get(&key)? {

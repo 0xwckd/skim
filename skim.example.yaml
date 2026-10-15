@@ -1,0 +1,25 @@
+# skim.yaml: sync only what you need (PROJECT.md §7.5)
+network: sepolia
+state:
+  subscriptions:
+    # Account + explicit slots: kept current from every block's BAL, always ready.
+    - name: weth
+      address: "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14"
+      account: true
+      storage: []
+    - name: weth-usdc-0.3%
+      address: "0x6Ce0896eAE6D4BD668fDe41BB784548fb8F59b50"
+      account: true
+      storage: ["0x0", "0x4"]        # slot0, liquidity
+    # Simulation subscription: the calls' access sets are learned and kept warm;
+    # on_block re-runs them every block (latest results via skim_subscriptionStatus).
+    - name: my-quoter
+      calls:
+        - to: "0xEd1f6473345F45b75F8179591dd5bA1888cf2FB3"   # QuoterV2.quoteExactInputSingle(WETH->USDC, 1 WETH, 0.3%)
+          data: "0xc6a5026a000000000000000000000000fff9976782d46cc05630d1f6ebab18b2324d6b140000000000000000000000001c7d4b196cb0c7b01d743fbc6116a902379c72380000000000000000000000000000000000000000000000000de0b6b3a76400000000000000000000000000000000000000000000000000000000000000000bb80000000000000000000000000000000000000000000000000000000000000000"
+      on_block: true
+  on_demand:
+    enabled: true
+    cache_ttl_blocks: 4          # unsubscribed state is cached (and kept current) this long
+  limits:
+    max_subscribed_keys: 100000

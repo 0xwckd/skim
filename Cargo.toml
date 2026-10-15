@@ -36,6 +36,7 @@ thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml_ng = "0.10"
 parking_lot = "0.12"
 revm = { version = "43.0.3", default-features = false, features = ["std", "dev", "optional_fee_charge"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

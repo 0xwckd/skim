@@ -56,9 +56,20 @@ pub struct StoreSizes {
     pub keys: usize,
     pub versions: usize,
     pub watched_keys: usize,
+    pub temp_keys: usize,
     pub watched_addresses: usize,
     pub code: usize,
     pub code_bytes: usize,
+}
+
+/// How long a fetched value is kept current.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retention {
+    /// Subscribed: kept current from every BAL until unsubscribed.
+    Subscribed,
+    /// On-demand: kept current for this many blocks past the head, then evicted with its
+    /// versions (it reads as Unknown again and is refetched when needed).
+    Ttl(u64),
 }
 
 /// Emitted after each applied block.
@@ -77,6 +88,8 @@ struct Inner {
     versions: HashMap<StateKey, Vec<(u64, U256)>>,
     watched_addresses: HashSet<Address>,
     watched_keys: HashSet<StateKey>,
+    /// On-demand keys and the block after which they expire (tracked until then).
+    temp: HashMap<StateKey, u64>,
     recent: BTreeMap<u64, Arc<BlockWrites>>,
     code: HashMap<B256, Bytes>,
 }
@@ -90,7 +103,14 @@ impl Inner {
         let a = match k {
             StateKey::Balance(a) | StateKey::Nonce(a) | StateKey::CodeHash(a) | StateKey::Storage(a, _) => a,
         };
-        self.watched_addresses.contains(a) || self.watched_keys.contains(k)
+        self.watched_addresses.contains(a) || self.watched_keys.contains(k) || self.temp.contains_key(k)
+    }
+
+    fn tracked_by_address(&self, k: &StateKey) -> bool {
+        let a = match k {
+            StateKey::Balance(a) | StateKey::Nonce(a) | StateKey::CodeHash(a) | StateKey::Storage(a, _) => a,
+        };
+        self.watched_addresses.contains(a)
     }
 
     fn put(&mut self, key: StateKey, number: u64, value: U256) {
@@ -125,7 +145,35 @@ impl Store {
     }
 
     pub fn watch_key(&self, k: StateKey) {
-        self.inner.write().watched_keys.insert(k);
+        let mut st = self.inner.write();
+        st.temp.remove(&k);
+        st.watched_keys.insert(k);
+    }
+
+    /// Stops keeping `k` current (unless covered by a watched address) and drops its versions.
+    pub fn unwatch_key(&self, k: &StateKey) {
+        let mut st = self.inner.write();
+        st.watched_keys.remove(k);
+        st.temp.remove(k);
+        if !st.tracked_by_address(k) {
+            st.versions.remove(k);
+        }
+    }
+
+    /// Extends on-demand keys that were just used (`cache_ttl_blocks` from the head).
+    pub fn touch_ttl(&self, keys: &[StateKey], n: u64) {
+        let mut st = self.inner.write();
+        let Some(head) = st.head().map(|h| h.number) else { return };
+        for k in keys {
+            if let Some(e) = st.temp.get_mut(k) {
+                *e = (*e).max(head + n);
+            }
+        }
+    }
+
+    pub fn is_subscribed(&self, k: &StateKey) -> bool {
+        let st = self.inner.read();
+        st.watched_keys.contains(k) || st.tracked_by_address(k)
     }
 
     pub fn head(&self) -> Option<BlockRef> {
@@ -179,11 +227,30 @@ impl Store {
     /// Commits a value fetched at `at` (e.g. via SNAP at `at.state_root`), then replays later
     /// indexed writes to `key`, so a stale fetch never hides a newer BAL write. Tracks the key.
     pub fn insert_base(&self, at: &BlockRef, key: StateKey, value: U256) -> Result<(), StateError> {
+        self.insert_base_with(at, key, value, Retention::Subscribed)
+    }
+
+    /// [`Self::insert_base`] with an explicit retention. A TTL never downgrades a key that is
+    /// already subscribed.
+    pub fn insert_base_with(&self, at: &BlockRef, key: StateKey, value: U256, retention: Retention) -> Result<(), StateError> {
         let mut st = self.inner.write();
         if st.chain.get(&at.number).map(|b| b.hash) != Some(at.hash) {
             return Err(StateError::Reorged { number: at.number, hash: at.hash });
         }
-        st.watched_keys.insert(key);
+        match retention {
+            Retention::Subscribed => {
+                st.temp.remove(&key);
+                st.watched_keys.insert(key);
+            }
+            Retention::Ttl(n) => {
+                let subscribed = st.watched_keys.contains(&key) || st.tracked_by_address(&key);
+                if !subscribed {
+                    let head = st.head().map_or(at.number, |h| h.number);
+                    let e = st.temp.entry(key).or_insert(0);
+                    *e = (*e).max(head + n);
+                }
+            }
+        }
         // Keep an existing version at `at` (a BAL write at that block is authoritative).
         let has_at = st.versions.get(&key).is_some_and(|v| v.iter().any(|(n, _)| *n == at.number));
         if !has_at {
@@ -209,6 +276,7 @@ impl Store {
             keys: st.versions.len(),
             versions: st.versions.values().map(Vec::len).sum(),
             watched_keys: st.watched_keys.len(),
+            temp_keys: st.temp.len(),
             watched_addresses: st.watched_addresses.len(),
             code: st.code.len(),
             code_bytes: st.code.values().map(|c| c.len()).sum(),
@@ -249,6 +317,12 @@ impl Store {
 
     fn gc(&self, st: &mut Inner) {
         let Some(head) = st.head().map(|h| h.number) else { return };
+        // Expire on-demand keys: stop tracking and forget their versions.
+        let expired: Vec<StateKey> = st.temp.iter().filter(|(_, e)| **e < head).map(|(k, _)| *k).collect();
+        for k in expired {
+            st.temp.remove(&k);
+            st.versions.remove(&k);
+        }
         let Some(cut) = head.checked_sub(self.window) else { return };
         st.chain.retain(|n, _| *n > cut);
         st.recent.retain(|n, _| *n > cut);

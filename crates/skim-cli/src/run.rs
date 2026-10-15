@@ -36,6 +36,61 @@ pub struct Args {
     /// against skim on the same host. Repeatable.
     #[arg(long = "exclude-snap-peer")]
     exclude_snap_peer: Vec<alloy_primitives::B512>,
+    /// skim.yaml: state subscriptions, on-demand cache TTL, limits (PROJECT.md §7.5).
+    #[arg(long)]
+    config: Option<std::path::PathBuf>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct Config {
+    #[serde(default)]
+    state: StateConfig,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct StateConfig {
+    #[serde(default)]
+    subscriptions: Vec<skim_sim::subscription::SubscriptionSpec>,
+    #[serde(default)]
+    on_demand: OnDemand,
+    #[serde(default)]
+    limits: Limits,
+}
+
+#[derive(serde::Deserialize)]
+struct OnDemand {
+    #[serde(default = "yes")]
+    enabled: bool,
+    #[serde(default = "four")]
+    cache_ttl_blocks: u64,
+}
+
+impl Default for OnDemand {
+    fn default() -> Self {
+        Self { enabled: true, cache_ttl_blocks: 4 }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct Limits {
+    #[serde(default = "hundred_k")]
+    max_subscribed_keys: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self { max_subscribed_keys: 100_000 }
+    }
+}
+
+fn yes() -> bool {
+    true
+}
+fn four() -> u64 {
+    4
+}
+fn hundred_k() -> usize {
+    100_000
 }
 
 pub async fn run(args: Args) -> anyhow::Result<()> {
@@ -61,8 +116,19 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         sched,
         Predictor { learned: Learned::new(8, 0.5, 256), v3: vec![], base_words: 2, reach: Default::default() },
     );
+    let cfg: Config = match &args.config {
+        Some(p) => serde_yaml_ng::from_str(&std::fs::read_to_string(p)?)?,
+        None => Config::default(),
+    };
+    if !cfg.state.on_demand.enabled {
+        tracing::warn!("on_demand.enabled=false: unsubscribed state is still fetched for correctness, with a 1-block TTL");
+    }
+    *sim.on_demand.write() = skim_state::Retention::Ttl(if cfg.state.on_demand.enabled { cfg.state.on_demand.cache_ttl_blocks } else { 1 });
+    let subs = Arc::new(skim_sim::subscription::Subscriptions::new(cfg.state.subscriptions, cfg.state.limits.max_subscribed_keys)?);
+    tracing::info!(subscriptions = subs.status().len(), declared_keys = subs.total_keys(), "state subscriptions loaded");
     let (_cl, mut rx) = ClNode::start(NodeConfig::sepolia(args.cl_port)).await?;
-    tokio::spawn(serve(Arc::new(Rpc { sim: sim.clone() }), args.rpc));
+    tokio::spawn(serve(Arc::new(Rpc { sim: sim.clone(), subs: Some(subs.clone()) }), args.rpc));
+    let maintaining = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sim2 = sim.clone();
     let chain = Chain { store: store.clone(), net: net.clone(), on_header: Box::new(move |h| sim2.insert_header(h.clone())), lookback: 32 };
     tracing::info!("following Sepolia from CL gossip; RPC answers once the first block is applied");
@@ -82,7 +148,15 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         let number = v.header.number;
         match chain.place(v.header, Arc::new(BlockWrites::from_bal(&bal))).await {
             Placed::Applied { ready, reorged_to, filled } => {
-                tracing::info!(number, changed = ready.changed_keys.len(), ?reorged_to, filled, "state ready")
+                tracing::info!(number, changed = ready.changed_keys.len(), ?reorged_to, filled, "state ready");
+                // Keep subscriptions current and their readiness fresh (one pass at a time).
+                if !maintaining.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    let (sim, subs, flag, b) = (sim.clone(), subs.clone(), maintaining.clone(), ready.block);
+                    tokio::spawn(async move {
+                        subs.maintain(&sim, &b).await;
+                        flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                    });
+                }
             }
             Placed::Reanchored(_) => tracing::warn!(number, "re-anchored"),
             Placed::Duplicate => {}

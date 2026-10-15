@@ -130,3 +130,40 @@ async fn emits_state_ready() {
     assert_eq!(ev.block.number, 1);
     assert_eq!(*ev.changed_keys, vec![slot(3)]);
 }
+
+#[test]
+fn on_demand_keys_stay_current_during_ttl_then_expire() {
+    let s = Store::new(64);
+    s.apply_block(blk(1, 0), writes(&[])).unwrap();
+    s.insert_base_with(&blk(1, 0), slot(4), U256::from(1), Retention::Ttl(2)).unwrap();
+    // Within the TTL, BAL writes keep it current (no stale reuse).
+    s.apply_block(blk(2, 0), writes(&[(slot(4), 2)])).unwrap();
+    assert_eq!(known(&s.snapshot(&blk(2, 0)).unwrap(), slot(4)), Some(2));
+    s.apply_block(blk(3, 0), writes(&[])).unwrap();
+    assert_eq!(known(&s.snapshot(&blk(3, 0)).unwrap(), slot(4)), Some(2));
+    // Past head+TTL it is evicted entirely: Unknown again, not stale.
+    s.apply_block(blk(4, 0), writes(&[])).unwrap();
+    assert_eq!(known(&s.snapshot(&blk(4, 0)).unwrap(), slot(4)), None);
+    assert_eq!(known(&s.snapshot(&blk(2, 0)).unwrap(), slot(4)), None);
+    // And no longer tracked: a later write is ignored.
+    s.apply_block(blk(5, 0), writes(&[(slot(4), 5)])).unwrap();
+    assert_eq!(known(&s.snapshot(&blk(5, 0)).unwrap(), slot(4)), None);
+    assert_eq!(s.sizes().temp_keys, 0);
+}
+
+#[test]
+fn ttl_never_downgrades_a_subscription_and_promotion_sticks() {
+    let s = Store::new(64);
+    s.apply_block(blk(1, 0), writes(&[])).unwrap();
+    s.watch_key(slot(1));
+    s.insert_base_with(&blk(1, 0), slot(1), U256::from(7), Retention::Ttl(1)).unwrap();
+    s.insert_base_with(&blk(1, 0), slot(2), U256::from(8), Retention::Ttl(1)).unwrap();
+    s.watch_key(slot(2)); // promote
+    for n in 2..=6 {
+        s.apply_block(blk(n, 0), writes(&[])).unwrap();
+    }
+    let snap = s.snapshot(&blk(6, 0)).unwrap();
+    assert_eq!(known(&snap, slot(1)), Some(7));
+    assert_eq!(known(&snap, slot(2)), Some(8));
+    assert!(s.is_subscribed(&slot(2)));
+}
