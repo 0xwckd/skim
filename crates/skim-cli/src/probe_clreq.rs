@@ -12,6 +12,9 @@ pub struct Args {
     root: Option<alloy_primitives::B256>,
     #[arg(long, default_value_t = 12)]
     attempts: usize,
+    /// Save received envelopes (raw SSZ) here, e.g. as fuzzing seeds.
+    #[arg(long)]
+    dump: Option<std::path::PathBuf>,
 }
 
 pub async fn run(args: Args) -> anyhow::Result<()> {
@@ -22,7 +25,15 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     for i in 0..args.attempts {
         let start = slot - 40;
         match cl.envelopes_by_range(start, 8).await {
-            Ok(v) => println!("envelopes {start}..+8 attempt {i}: {} chunks, sizes {:?}", v.len(), v.iter().map(Vec::len).collect::<Vec<_>>()),
+            Ok(v) => {
+                println!("envelopes {start}..+8 attempt {i}: {} chunks, sizes {:?}", v.len(), v.iter().map(Vec::len).collect::<Vec<_>>());
+                if let Some(d) = &args.dump {
+                    std::fs::create_dir_all(d)?;
+                    for (j, e) in v.iter().enumerate() {
+                        std::fs::write(d.join(format!("envelope-{start}-{j}.ssz")), e)?;
+                    }
+                }
+            }
             Err(e) => println!("envelopes {start}..+8 attempt {i}: {e}"),
         }
         if let Some(r) = args.root {

@@ -113,7 +113,7 @@ impl ElTransport {
                 }
             }
         }
-        if proof::root_of(leaves.clone()) != storage_root {
+        if proof::root_of(leaves.clone()) != Some(storage_root) {
             self.rejections.bad_proof.fetch_add(1, Ordering::Relaxed);
             return Ok(StorageAll::Unavailable);
         }
@@ -250,7 +250,7 @@ impl Transport for ElTransport {
                 return Ok(SlotAnswer::Unavailable);
             }
             let leaves: Vec<(B256, Bytes)> = slots.iter().map(|d| (d.hash, d.data.clone())).collect();
-            if proof::root_of(leaves) != storage_root {
+            if proof::root_of(leaves) != Some(storage_root) {
                 r.no_proof.fetch_add(1, Ordering::Relaxed);
                 return Ok(SlotAnswer::Unavailable);
             }

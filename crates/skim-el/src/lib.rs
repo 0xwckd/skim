@@ -40,6 +40,12 @@ use tokio::sync::oneshot;
 
 pub use reth_network_api::PeerId as Peer;
 
+/// Fuzzing entry: decodes a raw snap/1 response as skim does for Geth peers (never panics).
+#[doc(hidden)]
+pub fn fuzz_snap1_response(raw: &[u8]) -> bool {
+    snap1::fuzz_decode(raw)
+}
+
 /// A signed transaction as gossiped on the EL (no blob sidecars).
 pub type SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>;
 /// A receipt as served by `GetReceipts` (the bloom is recomputed locally).

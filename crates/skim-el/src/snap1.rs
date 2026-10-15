@@ -163,6 +163,10 @@ fn frame(id: u8, msg: &impl Encodable) -> BytesMut {
     buf
 }
 
+pub(crate) fn fuzz_decode(raw: &[u8]) -> bool {
+    decode_response(raw).is_some()
+}
+
 fn decode_response(raw: &[u8]) -> Option<(u64, Snap1Response)> {
     let (&id, mut body) = raw.split_first()?;
     let r = match id {

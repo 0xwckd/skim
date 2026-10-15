@@ -143,6 +143,13 @@ pub struct Committee {
     pubkeys: Vec<PublicKey>,
 }
 
+impl Committee {
+    /// A committee from 512 validated public keys (tests, fuzzing).
+    pub fn from_pubkeys(period: u64, pubkeys: Vec<PublicKey>) -> Option<Self> {
+        (pubkeys.len() == SYNC_COMMITTEE_SIZE).then_some(Self { period, pubkeys })
+    }
+}
+
 /// Verifies a `LightClientBootstrap` against a trusted checkpoint block root and returns the
 /// checkpoint header and its sync committee.
 pub fn bootstrap(b: &[u8], trusted_root: B256) -> Result<(LcHeader, Committee), LcError> {

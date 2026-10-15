@@ -4,3 +4,7 @@
 .env
 .claude/
 node_modules/
+fuzz/target/
+fuzz/artifacts/
+fuzz/coverage/
+fuzz/corpus/

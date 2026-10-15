@@ -73,15 +73,19 @@ pub fn lookup(root: B256, key: B256, proof: &[Bytes]) -> Result<Option<Vec<u8>>,
 }
 
 /// Root of a trie holding exactly `leaves` (hashed key, RLP value). Used when a peer returns a
-/// whole small trie without proof: the response is accepted only if this equals the expected
-/// root.
-pub fn root_of(mut leaves: Vec<(B256, Bytes)>) -> B256 {
+/// whole trie without proof: the response is accepted only if this equals the expected root.
+/// `None` if a key repeats: peers control these keys, and a repeated key is never a valid trie
+/// (the hash builder would panic on it).
+pub fn root_of(mut leaves: Vec<(B256, Bytes)>) -> Option<B256> {
     leaves.sort_by(|a, b| a.0.cmp(&b.0));
+    if leaves.windows(2).any(|w| w[0].0 == w[1].0) {
+        return None;
+    }
     let mut hb = HashBuilder::default();
     for (k, v) in &leaves {
         hb.add_leaf(Nibbles::unpack(k), v);
     }
-    hb.root()
+    Some(hb.root())
 }
 
 #[cfg(test)]
@@ -151,9 +155,18 @@ mod tests {
     fn empty_root_proves_absence_and_full_trie_root_check() {
         assert_eq!(lookup(EMPTY_ROOT_HASH, key(1), &[]).unwrap(), None);
         let (root, leaves, _) = trie(5, &[]);
-        assert_eq!(root_of(leaves.clone()), root);
+        assert_eq!(root_of(leaves.clone()), Some(root));
         let mut tampered = leaves;
         tampered[0].1 = alloy_rlp::encode(U256::from(999)).into();
-        assert_ne!(root_of(tampered), root);
+        assert_ne!(root_of(tampered), Some(root));
+    }
+
+    #[test]
+    fn repeated_keys_from_a_peer_are_rejected_not_a_panic() {
+        // Found by fuzzing (fuzz/fuzz_targets/snap_proof.rs): a response repeating a slot hash
+        // made HashBuilder::add_leaf assert and panic.
+        let k = keccak256([1u8]);
+        let leaves = vec![(k, Bytes::from_static(&[0x01])), (k, Bytes::from_static(&[0x02]))];
+        assert_eq!(root_of(leaves), None);
     }
 }

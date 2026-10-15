@@ -1,0 +1,73 @@
+[package]
+name = "skim-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+skim-cl = { path = "../crates/skim-cl" }
+skim-bal = { path = "../crates/skim-bal" }
+skim-snap = { path = "../crates/skim-snap" }
+skim-el = { path = "../crates/skim-el" }
+alloy-primitives = "1.6.1"
+alloy-rlp = "0.3.16"
+blst = "0.3.17"
+
+# Not part of the main workspace (needs nightly + sanitizers).
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "envelope"
+path = "fuzz_targets/envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "beacon_block"
+path = "fuzz_targets/beacon_block.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bal"
+path = "fuzz_targets/bal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rpc_chunks"
+path = "fuzz_targets/rpc_chunks.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "light_client"
+path = "fuzz_targets/light_client.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snap_proof"
+path = "fuzz_targets/snap_proof.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snap1_response"
+path = "fuzz_targets/snap1_response.rs"
+test = false
+doc = false
+bench = false
