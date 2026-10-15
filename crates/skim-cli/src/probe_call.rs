@@ -72,6 +72,13 @@ pub struct Args {
     /// Learned sets: cap on core keys in the first wave.
     #[arg(long, default_value_t = 256)]
     core_cap: usize,
+    /// Peer-dependency experiment: after this many iterations, stop using the peer that has
+    /// served the most requests so far.
+    #[arg(long)]
+    drop_top_after: Option<usize>,
+    /// Per-run JSONL (hinted/cold runs, peer snapshots).
+    #[arg(long)]
+    out: Option<String>,
 }
 
 fn to_misses(keys: &[AccessKey]) -> Misses {
@@ -441,7 +448,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let sched = Scheduler::new(
-        ElTransport(net.clone()),
+        ElTransport::new(net.clone()),
         skim_snap::Config {
             per_peer_inflight: args.per_peer_inflight,
             max_peers: args.max_peers,
@@ -454,6 +461,16 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let mut res: Vec<PerCall> = calls.iter().map(|_| PerCall::default()).collect();
     // Learned access sets per call shape (union over inputs and blocks), and the bytecode cache.
     let mut learned = Learned::new(8, args.min_freq, args.core_cap);
+    let mut out = args.out.as_ref().map(|p| std::io::BufWriter::new(std::fs::File::create(p).unwrap()));
+    let mut log = |v: serde_json::Value| {
+        if let Some(o) = out.as_mut() {
+            use std::io::Write;
+            let _ = serde_json::to_writer(&mut *o, &v);
+            let _ = o.write_all(b"\n");
+            let _ = o.flush();
+        }
+    };
+    let mut dropped: Option<String> = None;
     let mut code_cache: HashMap<B256, Bytecode> = HashMap::new();
 
     let mut last: Option<u64> = None;
@@ -471,6 +488,17 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         let hash = h.hash_slow();
         let snap_peers = net.peers().iter().filter(|(_, p)| p.snap2 || p.snap1).count();
         tracing::info!(iteration = it, number = h.number, snap_peers, "measuring");
+        if args.drop_top_after == Some(it) {
+            if let Some((top, ps)) = sched.peer_stats().into_iter().max_by_key(|(_, p)| p.ok) {
+                sched.transport().exclude(top);
+                tracing::warn!(peer = %top, served = ps.ok, ewma_ms = ps.ewma_ms, "EXPERIMENT: excluded the top-serving peer");
+                dropped = Some(format!("{top}"));
+            }
+        }
+        let window = if dropped.is_some() { "after" } else { "before" };
+        log(serde_json::json!({"ev": "peers", "it": it, "window": window, "peers": sched.peer_stats().into_iter()
+            .map(|(id, p)| serde_json::json!({"peer": format!("{id:.10}"), "ok": p.ok, "ewma_ms": p.ewma_ms, "limit": p.limit}))
+            .collect::<Vec<_>>()}));
 
         for (i, call) in calls.iter().enumerate() {
             let r = &mut res[i];
@@ -507,12 +535,15 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                         }
                         tracing::info!(call = %call.name, ?source, predicted = keys.len(), rounds = c.rounds.len(),
                             ms = c.wall.as_millis() as u64, "hinted");
+                        log(serde_json::json!({"ev": "hinted", "it": it, "window": window, "call": call.name,
+                            "ms": c.wall.as_secs_f64() * 1e3, "rounds": c.rounds.len(), "ok": true}));
                         code_cache.extend(st.code.iter().map(|(k, v)| (*k, v.clone())));
                         learned.record(call.to, &call.data, to_keys(&c.access));
                     }
                     Err(e) => {
                         r.errors += 1;
                         tracing::warn!(call = %call.name, "hinted run failed: {e}");
+                        log(serde_json::json!({"ev": "hinted", "it": it, "window": window, "call": call.name, "ok": false}));
                     }
                 }
                 if args.soak && it > 0 {
@@ -604,7 +635,7 @@ pub async fn run_wave(args: WaveArgs) -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     let call = calls().into_iter().find(|c| c.name.starts_with("v3_single 100")).unwrap();
-    let full = Scheduler::new(ElTransport(net.clone()), skim_snap::Config::default());
+    let full = Scheduler::new(ElTransport::new(net.clone()), skim_snap::Config::default());
     let h = net.head().unwrap();
     let mut st = Sparse::default();
     let learned = cold_run(&full, &h, &call, &mut st, None).await?.access;
@@ -626,7 +657,7 @@ pub async fn run_wave(args: WaveArgs) -> anyhow::Result<()> {
         keys.extend(learned.storage.iter().map(|&(address, slot)| Key::Storage { root: h.state_root, address, slot }));
         for (&n, mode) in args.sweep.iter().flat_map(|n| args.modes.iter().map(move |m| (n, m))) {
             let sched = Scheduler::new(
-                ElTransport(net.clone()),
+                ElTransport::new(net.clone()),
                 skim_snap::Config {
                     per_peer_inflight: args.per_peer_inflight,
                     adaptive: mode == "aimd",

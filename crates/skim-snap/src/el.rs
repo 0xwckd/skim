@@ -7,7 +7,21 @@ use skim_el::{ElNet, ReqError};
 use crate::{AccountAnswer, AccountState, PeerId, SlotAnswer, Transport, TransportError};
 
 #[derive(Clone)]
-pub struct ElTransport(pub ElNet);
+pub struct ElTransport {
+    pub net: ElNet,
+    /// Peers the scheduler must not use (experiments, operator policy).
+    pub excluded: std::sync::Arc<parking_lot::RwLock<std::collections::HashSet<PeerId>>>,
+}
+
+impl ElTransport {
+    pub fn new(net: ElNet) -> Self {
+        Self { net, excluded: Default::default() }
+    }
+
+    pub fn exclude(&self, peer: PeerId) {
+        self.excluded.write().insert(peer);
+    }
+}
 
 fn map_err(e: ReqError) -> TransportError {
     match e {
@@ -20,12 +34,13 @@ fn map_err(e: ReqError) -> TransportError {
 
 impl Transport for ElTransport {
     fn snap_peers(&self) -> Vec<PeerId> {
-        self.0.peers().into_iter().filter(|(_, p)| p.snap2 || p.snap1).map(|(id, _)| id).collect()
+        let ex = self.excluded.read();
+        self.net.peers().into_iter().filter(|(id, p)| (p.snap2 || p.snap1) && !ex.contains(id)).map(|(id, _)| id).collect()
     }
 
     async fn account(&self, peer: PeerId, root: B256, address: Address) -> Result<AccountAnswer, TransportError> {
         let h = keccak256(address);
-        let m = self.0.account_range(peer, root, h, 512).await.0.map_err(map_err)?;
+        let m = self.net.account_range(peer, root, h, 512).await.0.map_err(map_err)?;
         if m.accounts.is_empty() && m.proof.is_empty() {
             return Ok(AccountAnswer::Unavailable);
         }
@@ -37,7 +52,7 @@ impl Transport for ElTransport {
 
     async fn storage(&self, peer: PeerId, root: B256, address: Address, slot: U256) -> Result<SlotAnswer, TransportError> {
         let sh = keccak256(slot.to_be_bytes::<32>());
-        let m = self.0.storage_range(peer, root, keccak256(address), sh, 512).await.0.map_err(map_err)?;
+        let m = self.net.storage_range(peer, root, keccak256(address), sh, 512).await.0.map_err(map_err)?;
         let first = m.slots.first().and_then(|s| s.first());
         if first.is_none() && m.proof.is_empty() {
             return Ok(SlotAnswer::EmptyNoProof);
@@ -48,6 +63,6 @@ impl Transport for ElTransport {
     }
 
     async fn codes(&self, peer: PeerId, hashes: Vec<B256>) -> Result<Vec<Bytes>, TransportError> {
-        Ok(self.0.byte_codes(peer, hashes, 2 << 20).await.0.map_err(map_err)?.codes)
+        Ok(self.net.byte_codes(peer, hashes, 2 << 20).await.0.map_err(map_err)?.codes)
     }
 }

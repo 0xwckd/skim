@@ -319,6 +319,10 @@ impl<T: Transport> Scheduler<T> {
         .await
     }
 
+    pub fn transport(&self) -> &T {
+        &self.inner.transport
+    }
+
     pub fn stats(&self) -> Stats {
         self.inner.state.lock().stats.clone()
     }

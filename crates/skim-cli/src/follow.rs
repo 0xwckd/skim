@@ -321,7 +321,7 @@ impl Ctx {
 pub async fn run(args: Args) -> anyhow::Result<()> {
     let infura = if args.no_infura { None } else { Some((reqwest::Client::new(), infura_url()?)) };
     let net = ElNet::start_sepolia(args.el_port, Vec::new(), false).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-    let sched = Scheduler::new(ElTransport(net.clone()), skim_snap::Config::default());
+    let sched = Scheduler::new(ElTransport::new(net.clone()), skim_snap::Config::default());
     let (_cl, mut rx) = ClNode::start(NodeConfig::sepolia(args.cl_port)).await?;
     let all = calls();
     let calls: Vec<Call> = if args.calls.is_empty() {
