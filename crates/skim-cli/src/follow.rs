@@ -89,6 +89,13 @@ pub struct Args {
     /// Background prefetch budget: keys per pool per block (closest to the current tick first).
     #[arg(long, default_value_t = 256)]
     prefetch_budget: usize,
+    /// Predictor uses learned sets only (no protocol-aware V3 source): measures how well
+    /// learned sets generalize on their own.
+    #[arg(long)]
+    learned_only: bool,
+    /// Disable the learned-set pattern tier (exact + shape core only), for A/B runs.
+    #[arg(long)]
+    no_patterns: bool,
 }
 
 fn unix_ms(t: SystemTime) -> f64 {
@@ -285,6 +292,7 @@ struct Ctx {
     v3_words: i32,
     v3_pools: StdMutex<Vec<prefetch::V3Pool>>,
     random_quotes: usize,
+    learned_only: bool,
     predictor: Option<StdMutex<skim_sim::predictor::Predictor>>,
     adaptive_window: bool,
     prefetch_budget: usize,
@@ -380,6 +388,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         v3_words: args.v3_words,
         v3_pools: Default::default(),
         random_quotes: args.random_quotes,
+        learned_only: args.learned_only,
         adaptive_window: args.adaptive_window,
         prefetch_budget: args.prefetch_budget,
         infura_every: args.infura_every.max(1),
@@ -387,7 +396,10 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         health_out: StdMutex::new(std::io::BufWriter::new(std::fs::File::create(format!("{}.health", args.out))?)),
         predictor: args.predictor.then(|| {
             StdMutex::new(skim_sim::predictor::Predictor {
-                learned: skim_sim::learned::Learned::new(8, 0.5, 256),
+                learned: skim_sim::learned::Learned::with_limits(8, 0.5, 256, skim_sim::learned::Limits {
+                    patterns: if args.no_patterns { 0 } else { skim_sim::learned::Limits::default().patterns },
+                    ..Default::default()
+                }),
                 v3: Vec::new(),
                 base_words: args.v3_words.max(1),
                 reach: Default::default(),
@@ -543,7 +555,7 @@ fn write_health(ctx: &Ctx, b: &BlockRef) {
         "t": unix_ms(SystemTime::now()) / 1e3, "number": b.number,
         "store": {"chain": sizes.chain, "recent_bals": sizes.recent_bals, "keys": sizes.keys, "versions": sizes.versions,
                   "watched_keys": sizes.watched_keys, "code": sizes.code, "code_bytes": sizes.code_bytes},
-        "learned": learned.map(|(e, ek, sh, sk)| serde_json::json!({"exact": e, "exact_keys": ek, "shapes": sh, "shape_keys": sk})),
+        "learned": learned,
         "peers": {"snap_connected": snap_peers, "scheduler_known": peers.len(),
                   "ewma_p50_ms": ewma.get(ewma.len() / 2), "ewma_p90_ms": ewma.get(ewma.len() * 9 / 10)},
         "scheduler": ctx.sched.stats(), "queues": {"high": q_hi, "low": q_lo},
@@ -607,7 +619,7 @@ async fn detect_pools(ctx: &Arc<Ctx>, h: &Header, b: &BlockRef, pools: &[Address
                         let t0 = word([0x0d, 0xfe, 0x16, 0x81]);
                         let t1 = word([0xd2, 0x12, 0x20, 0xa7]);
                         tracing::info!(%address, spacing, ?fee, "V3 pool registered for prefetch");
-                        if let (Some(p), Some(fee), Some(t0), Some(t1)) = (&ctx.predictor, fee, t0, t1) {
+                        if let (Some(p), Some(fee), Some(t0), Some(t1), false) = (&ctx.predictor, fee, t0, t1, ctx.learned_only) {
                             p.lock().unwrap().v3.push(skim_sim::predictor::V3Meta {
                                 pool,
                                 fee: fee.to(),

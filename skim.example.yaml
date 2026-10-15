@@ -23,3 +23,15 @@ state:
     cache_ttl_blocks: 4          # unsubscribed state is cached (and kept current) this long
   limits:
     max_subscribed_keys: 100000
+
+# Protocol-aware predictors: fetch what a call will read before running it.
+predictors:
+  uniswap_v3:
+    # quoteExactInputSingle on these pools: predict the tick range a swap of that size reaches,
+    # and keep a window around the current tick warm in the background.
+    pools:
+      - "0x3289680dD4d6C10bb19b899729cda5eEF58AEfF1"   # WETH/USDC 0.05%
+      - "0x6Ce0896eAE6D4BD668fDe41BB784548fb8F59b50"   # WETH/USDC 0.3%
+      - "0x6418EEC70f50913ff0d756B48d32Ce7C02b47C47"   # WETH/USDC 1%
+    words: 2
+    prefetch_budget: 256

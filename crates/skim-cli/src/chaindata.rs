@@ -1,0 +1,559 @@
+//! Chain data beyond state: headers, transactions, receipts and logs, from the P2P network.
+//!
+//! - **Transactions sent through skim** (`eth_sendRawTransaction`) are gossiped to every
+//!   connected EL peer and re-broadcast until a gossiped payload includes them.
+//! - **Inclusion** is seen directly: every verified execution payload carries its transactions,
+//!   so skim indexes their hashes as blocks arrive.
+//! - **Receipts** come from `GetReceipts` for that one block, accepted only if they rebuild the
+//!   header's `receipts_root`. Bodies of older blocks (`GetBlockBodies`) must rebuild its
+//!   `transactions_root`. Headers further back are fetched and accepted only if they link by hash
+//!   to a known header.
+//! - **Logs** (`eth_getLogs`): a block is a candidate only if its header `logsBloom` matches the
+//!   filter and, when skim saw its BAL, a filtered address is in it (a contract that emits a log
+//!   is always in the block's access list). Only candidates' receipts are fetched.
+
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
+use alloy_consensus::{
+    Header, Transaction as _, TxReceipt, proofs::ordered_trie_root_with_encoder, transaction::SignerRecoverable,
+};
+use alloy_consensus::private::alloy_eips::eip2718::{Decodable2718, Encodable2718, Typed2718};
+use alloy_primitives::{Address, B256, Bytes, keccak256};
+use alloy_rpc_types_eth::{Filter, FilterBlockOption};
+use futures::StreamExt;
+use parking_lot::{Mutex, RwLock};
+use serde_json::{Value, json};
+use skim_el::{ElNet, Receipt, SignedTx};
+
+/// Headers kept (about 1.1 days of Sepolia; a header is about 600 bytes).
+const HEADERS_MAX: usize = 8192;
+/// Blocks whose transaction hashes / BAL addresses are indexed in memory.
+const TX_INDEX_BLOCKS: usize = 2048;
+/// Blocks whose receipts / raw transactions are cached.
+const BLOCK_CACHE: usize = 128;
+/// Re-broadcast interval and give-up time for sent transactions.
+const REBROADCAST: Duration = Duration::from_secs(12);
+const SENT_TTL: Duration = Duration::from_secs(30 * 60);
+
+#[derive(Debug)]
+pub enum DataError {
+    /// Not served by any peer we tried (pruned, or peers busy): `-32002`.
+    Unavailable(String),
+    /// Bad request: `-32602` / `-32005` range limit.
+    Invalid(String),
+    RangeTooLarge(u64),
+}
+
+struct Sent {
+    tx: SignedTx,
+    from: Address,
+    first: Instant,
+    last: Instant,
+}
+
+#[derive(Default)]
+struct Inner {
+    /// Canonical headers by number (hash cached).
+    headers: BTreeMap<u64, (B256, Arc<Header>)>,
+    /// Transaction hashes per block, from gossiped payloads or fetched bodies.
+    txs: BTreeMap<u64, (B256, Arc<Vec<B256>>)>,
+    tx_index: HashMap<B256, (u64, u32)>,
+    /// Every address in a block's BAL, for blocks skim followed.
+    touched: BTreeMap<u64, (B256, Arc<HashSet<Address>>)>,
+    sent: HashMap<B256, Sent>,
+}
+
+/// A small insertion-ordered cache.
+struct Cache<V> {
+    map: HashMap<B256, V>,
+    order: std::collections::VecDeque<B256>,
+    cap: usize,
+}
+
+impl<V: Clone> Cache<V> {
+    fn new(cap: usize) -> Self {
+        Self { map: HashMap::new(), order: Default::default(), cap }
+    }
+    fn get(&self, k: &B256) -> Option<V> {
+        self.map.get(k).cloned()
+    }
+    fn put(&mut self, k: B256, v: V) {
+        if self.map.insert(k, v).is_none() {
+            self.order.push_back(k);
+            while self.order.len() > self.cap {
+                if let Some(o) = self.order.pop_front() {
+                    self.map.remove(&o);
+                }
+            }
+        }
+    }
+}
+
+pub struct ChainData {
+    net: ElNet,
+    inner: RwLock<Inner>,
+    receipts: Mutex<Cache<Arc<Vec<Receipt>>>>,
+    bodies: Mutex<Cache<Arc<Vec<Bytes>>>>,
+    pub max_log_range: u64,
+    rr: AtomicUsize,
+}
+
+fn tx_hashes(raw: &[Bytes]) -> Vec<B256> {
+    raw.iter().map(keccak256).collect()
+}
+
+impl ChainData {
+    pub fn new(net: ElNet, max_log_range: u64) -> Arc<Self> {
+        let cd = Arc::new(Self {
+            net,
+            inner: Default::default(),
+            receipts: Mutex::new(Cache::new(BLOCK_CACHE)),
+            bodies: Mutex::new(Cache::new(BLOCK_CACHE)),
+            max_log_range,
+            rr: AtomicUsize::new(0),
+        });
+        let me = Arc::downgrade(&cd);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let Some(cd) = me.upgrade() else { return };
+                cd.rebroadcast();
+            }
+        });
+        cd
+    }
+
+    // ---- ingestion -------------------------------------------------------------------------
+
+    /// A canonical header (from gossip, gap fill or the chain placer). A different hash at a
+    /// known number is a reorg: everything indexed at and above it is dropped.
+    pub fn note_header(&self, h: &Header) {
+        let hash = h.hash_slow();
+        let mut g = self.inner.write();
+        if g.headers.get(&h.number).is_some_and(|(x, _)| *x != hash) {
+            let stale: Vec<u64> = g.headers.range(h.number..).map(|(n, _)| *n).collect();
+            for n in stale {
+                g.headers.remove(&n);
+                if let Some((_, hs)) = g.txs.remove(&n) {
+                    for t in hs.iter() {
+                        g.tx_index.remove(t);
+                    }
+                }
+                g.touched.remove(&n);
+            }
+        }
+        g.headers.insert(h.number, (hash, Arc::new(h.clone())));
+        while g.headers.len() > HEADERS_MAX {
+            g.headers.pop_first();
+        }
+    }
+
+    /// Transactions and BAL addresses of a verified gossiped payload.
+    pub fn note_payload(&self, number: u64, hash: B256, raw_txs: Vec<Bytes>, touched: HashSet<Address>) {
+        let hashes = tx_hashes(&raw_txs);
+        self.bodies.lock().put(hash, Arc::new(raw_txs));
+        let mut g = self.inner.write();
+        self.index_txs(&mut g, number, hash, hashes);
+        g.touched.insert(number, (hash, Arc::new(touched)));
+        while g.touched.len() > TX_INDEX_BLOCKS {
+            g.touched.pop_first();
+        }
+    }
+
+    fn index_txs(&self, g: &mut Inner, number: u64, hash: B256, hashes: Vec<B256>) {
+        for (i, t) in hashes.iter().enumerate() {
+            g.tx_index.insert(*t, (number, i as u32));
+            if g.sent.contains_key(t) {
+                tracing::info!(tx = %t, number, "sent transaction included");
+            }
+        }
+        if let Some((_, old)) = g.txs.insert(number, (hash, Arc::new(hashes))) {
+            for t in old.iter() {
+                if g.tx_index.get(t).is_some_and(|(n, _)| *n == number) {
+                    g.tx_index.remove(t);
+                }
+            }
+        }
+        while g.txs.len() > TX_INDEX_BLOCKS {
+            if let Some((_, (_, hs))) = g.txs.pop_first() {
+                for t in hs.iter() {
+                    g.tx_index.remove(t);
+                }
+            }
+        }
+    }
+
+    // ---- sending ---------------------------------------------------------------------------
+
+    /// Decodes, checks and gossips a signed transaction. `nonce`/`balance` are the sender's
+    /// state at the head (for the same early errors a node's pool would give).
+    pub fn decode_raw(raw: &Bytes) -> Result<(SignedTx, Address), DataError> {
+        let tx = SignedTx::decode_2718(&mut raw.as_ref()).map_err(|e| DataError::Invalid(format!("invalid transaction: {e}")))?;
+        if tx.is_eip4844() {
+            return Err(DataError::Invalid("blob transactions are not supported (no sidecar gossip)".into()));
+        }
+        if tx.chain_id().is_some_and(|c| c != skim_sim::env::SEPOLIA_CHAIN_ID) {
+            return Err(DataError::Invalid(format!("wrong chain id {:?}", tx.chain_id())));
+        }
+        let from = tx.recover_signer().map_err(|e| DataError::Invalid(format!("invalid signature: {e}")))?;
+        Ok((tx, from))
+    }
+
+    /// Gossips `tx` and tracks it until inclusion. Returns the hash and how many peers got it.
+    pub fn send(&self, tx: SignedTx, from: Address) -> (B256, usize) {
+        let hash = *tx.tx_hash();
+        let peers = self.net.broadcast(vec![tx.clone()]);
+        let now = Instant::now();
+        self.inner.write().sent.entry(hash).or_insert(Sent { tx, from, first: now, last: now });
+        tracing::info!(tx = %hash, %from, peers, "transaction broadcast");
+        (hash, peers)
+    }
+
+    fn rebroadcast(&self) {
+        let mut due = Vec::new();
+        {
+            let mut g = self.inner.write();
+            let included: HashSet<B256> = g.sent.keys().filter(|h| g.tx_index.contains_key(*h)).copied().collect();
+            g.sent.retain(|h, s| included.contains(h) || s.first.elapsed() < SENT_TTL);
+            for (h, s) in g.sent.iter_mut() {
+                if !included.contains(h) && s.last.elapsed() >= REBROADCAST {
+                    s.last = Instant::now();
+                    due.push(s.tx.clone());
+                }
+            }
+        }
+        if !due.is_empty() {
+            let peers = self.net.broadcast(due.clone());
+            tracing::debug!(txs = due.len(), peers, "re-broadcast pending transactions");
+        }
+    }
+
+    /// Highest pending (sent, not yet included) nonce of `from` + 1, if any.
+    pub fn pending_nonce(&self, from: Address, latest: u64) -> u64 {
+        let g = self.inner.read();
+        let mut nonces: Vec<u64> = g
+            .sent
+            .iter()
+            .filter(|(h, s)| s.from == from && !g.tx_index.contains_key(*h) && s.tx.nonce() >= latest)
+            .map(|(_, s)| s.tx.nonce())
+            .collect();
+        nonces.sort();
+        // Only a gap-free run counts (a node's pool would not make a gapped tx pending).
+        let mut next = latest;
+        for n in nonces {
+            if n == next {
+                next += 1;
+            }
+        }
+        next
+    }
+
+    // ---- headers, bodies, receipts ---------------------------------------------------------
+
+    fn peers(&self) -> Vec<skim_el::Peer> {
+        let mut v: Vec<_> = self
+            .net
+            .peers()
+            .into_iter()
+            .filter(|(_, p)| p.eth_version >= 70 && !p.client.starts_with("enrscout"))
+            .map(|(id, _)| id)
+            .collect();
+        if !v.is_empty() {
+            let k = self.rr.fetch_add(1, Ordering::Relaxed) % v.len();
+            v.rotate_left(k);
+        }
+        v
+    }
+
+    /// Makes headers down to `number` available, walking back by hash from the oldest one.
+    async fn ensure_headers(&self, number: u64) -> Result<(), DataError> {
+        for _ in 0..64 {
+            let (oldest, parent) = {
+                let g = self.inner.read();
+                let Some((n, (_, h))) = g.headers.first_key_value() else {
+                    return Err(DataError::Unavailable("no headers yet".into()));
+                };
+                (*n, h.parent_hash)
+            };
+            if oldest <= number || oldest == 0 {
+                return Ok(());
+            }
+            let want = (oldest - number).min(256);
+            let mut done = false;
+            for p in self.peers().into_iter().take(4) {
+                let hs = match self.net.headers_falling(p, parent.into(), want).await {
+                    (Ok(hs), _) => hs,
+                    (Err(e), _) => {
+                        tracing::debug!(peer = %p, "headers: {e}");
+                        continue;
+                    }
+                };
+                // Accept only a hash-linked chain ending at our oldest header.
+                let mut expect = parent;
+                let mut ok = Vec::new();
+                for h in hs {
+                    let hh = h.hash_slow();
+                    if hh != expect {
+                        break;
+                    }
+                    expect = h.parent_hash;
+                    ok.push((hh, h));
+                }
+                if ok.is_empty() {
+                    tracing::debug!(peer = %p, "headers: response does not link to our oldest header");
+                    continue;
+                }
+                let mut g = self.inner.write();
+                for (hh, h) in ok {
+                    g.headers.insert(h.number, (hh, Arc::new(h)));
+                }
+                done = true;
+                break;
+            }
+            if !done {
+                return Err(DataError::Unavailable(format!("headers below {oldest} not served by peers")));
+            }
+        }
+        Ok(())
+    }
+
+    /// Raw transactions of a block, verified against `transactions_root`.
+    pub async fn block_txs(&self, hash: B256, header: &Header) -> Result<Arc<Vec<Bytes>>, DataError> {
+        if let Some(b) = self.bodies.lock().get(&hash) {
+            return Ok(b);
+        }
+        for p in self.peers().into_iter().take(5) {
+            let mut bodies = match self.net.bodies(p, vec![hash]).await {
+                (Ok(b), _) => b,
+                (Err(e), _) => {
+                    tracing::debug!(peer = %p, number = header.number, "bodies: {e}");
+                    continue;
+                }
+            };
+            let Some(body) = bodies.pop() else { continue };
+            let raw: Vec<Bytes> = body.transactions.iter().map(|t| Bytes::from(t.encoded_2718())).collect();
+            let root = ordered_trie_root_with_encoder(&raw, |t: &Bytes, buf| buf.extend_from_slice(t));
+            if root != header.transactions_root {
+                tracing::debug!(peer = %p, number = header.number, "body does not match transactions_root");
+                continue;
+            }
+            let raw = Arc::new(raw);
+            self.bodies.lock().put(hash, raw.clone());
+            let mut g = self.inner.write();
+            self.index_txs(&mut g, header.number, hash, tx_hashes(&raw));
+            return Ok(raw);
+        }
+        Err(DataError::Unavailable(format!("block {} body not served by peers", header.number)))
+    }
+
+    /// All receipts of a block, verified against `receipts_root`.
+    pub async fn block_receipts(&self, hash: B256, header: &Header) -> Result<Arc<Vec<Receipt>>, DataError> {
+        if header.receipts_root == alloy_consensus::EMPTY_ROOT_HASH {
+            return Ok(Arc::new(Vec::new()));
+        }
+        if let Some(r) = self.receipts.lock().get(&hash) {
+            return Ok(r);
+        }
+        for p in self.peers().into_iter().take(6) {
+            let (r, d) = match self.net.block_receipts(p, hash).await {
+                (Ok(r), d) => (r, d),
+                (Err(e), _) => {
+                    tracing::debug!(peer = %p, number = header.number, "receipts: {e}");
+                    continue;
+                }
+            };
+            if Receipt::calculate_receipt_root_no_memo(&r) != header.receipts_root {
+                tracing::debug!(peer = %p, number = header.number, n = r.len(), "receipts do not match receipts_root");
+                continue;
+            }
+            tracing::debug!(number = header.number, n = r.len(), ms = d.as_millis() as u64, "receipts fetched");
+            let r = Arc::new(r);
+            self.receipts.lock().put(hash, r.clone());
+            return Ok(r);
+        }
+        Err(DataError::Unavailable(format!("block {} receipts not served by peers", header.number)))
+    }
+
+    /// Where a transaction is: (number, block hash, header, index), if skim indexed it.
+    fn locate(&self, tx: &B256) -> Option<(u64, B256, Arc<Header>, u32)> {
+        let g = self.inner.read();
+        let (n, i) = *g.tx_index.get(tx)?;
+        let (bh, h) = g.headers.get(&n)?.clone();
+        (g.txs.get(&n)?.0 == bh).then_some((n, bh, h, i))
+    }
+
+    // ---- RPC views -------------------------------------------------------------------------
+
+    fn tx_json(tx: &SignedTx, from: Address, at: Option<(u64, B256, &Header, u32)>) -> Value {
+        let rpc = alloy_rpc_types_eth::Transaction {
+            inner: alloy_consensus::transaction::Recovered::new_unchecked(tx.clone(), from),
+            block_hash: at.map(|a| a.1),
+            block_number: at.map(|a| a.0),
+            transaction_index: at.map(|a| a.3 as u64),
+            effective_gas_price: at.map(|a| tx.effective_gas_price(a.2.base_fee_per_gas)),
+            block_timestamp: None,
+        };
+        serde_json::to_value(rpc).unwrap_or(Value::Null)
+    }
+
+    /// `eth_getTransactionByHash`: sent transactions (pending or included) and transactions of
+    /// indexed blocks. `null` if unknown.
+    pub async fn transaction(&self, hash: B256) -> Result<Value, DataError> {
+        let sent = self.inner.read().sent.get(&hash).map(|s| (s.tx.clone(), s.from));
+        match (self.locate(&hash), sent) {
+            (Some((n, bh, h, i)), Some((tx, from))) => Ok(Self::tx_json(&tx, from, Some((n, bh, &h, i)))),
+            (None, Some((tx, from))) => Ok(Self::tx_json(&tx, from, None)),
+            (Some((n, bh, h, i)), None) => {
+                let raw = self.block_txs(bh, &h).await?;
+                let r = raw.get(i as usize).ok_or_else(|| DataError::Unavailable("index out of range".into()))?;
+                let (tx, from) = Self::decode_any(r)?;
+                Ok(Self::tx_json(&tx, from, Some((n, bh, &h, i))))
+            }
+            (None, None) => Ok(Value::Null),
+        }
+    }
+
+    fn decode_any(raw: &Bytes) -> Result<(SignedTx, Address), DataError> {
+        let tx = SignedTx::decode_2718(&mut raw.as_ref()).map_err(|e| DataError::Unavailable(format!("decode: {e}")))?;
+        let from = tx.recover_signer().map_err(|e| DataError::Unavailable(format!("signer: {e}")))?;
+        Ok((tx, from))
+    }
+
+    fn log_json(log: &alloy_primitives::Log, bh: B256, n: u64, ts: u64, txh: B256, ti: u32, li: u64) -> Value {
+        json!({
+            "address": log.address, "topics": log.topics(), "data": log.data.data,
+            "blockHash": bh, "blockNumber": format!("{n:#x}"), "blockTimestamp": format!("{ts:#x}"),
+            "transactionHash": txh, "transactionIndex": format!("{ti:#x}"), "logIndex": format!("{li:#x}"),
+            "removed": false,
+        })
+    }
+
+    /// `eth_getTransactionReceipt`. `null` while pending or unknown (clients poll).
+    pub async fn receipt(&self, hash: B256) -> Result<Value, DataError> {
+        let Some((n, bh, h, i)) = self.locate(&hash) else { return Ok(Value::Null) };
+        let receipts = self.block_receipts(bh, &h).await?;
+        let raw = self.block_txs(bh, &h).await?;
+        let r = receipts.get(i as usize).ok_or_else(|| DataError::Unavailable("receipt index out of range".into()))?;
+        let (tx, from) = Self::decode_any(&raw[i as usize])?;
+        let prev = if i == 0 { 0 } else { receipts[i as usize - 1].cumulative_gas_used };
+        let first_log: u64 = receipts[..i as usize].iter().map(|r| r.logs.len() as u64).sum();
+        let logs: Vec<Value> = r
+            .logs
+            .iter()
+            .enumerate()
+            .map(|(k, l)| Self::log_json(l, bh, n, h.timestamp, hash, i, first_log + k as u64))
+            .collect();
+        let contract = tx.to().is_none().then(|| from.create(tx.nonce()));
+        Ok(json!({
+            "transactionHash": hash, "transactionIndex": format!("{i:#x}"),
+            "blockHash": bh, "blockNumber": format!("{n:#x}"),
+            "from": from, "to": tx.to(), "contractAddress": contract,
+            "cumulativeGasUsed": format!("{:#x}", r.cumulative_gas_used),
+            "gasUsed": format!("{:#x}", r.cumulative_gas_used - prev),
+            "effectiveGasPrice": format!("{:#x}", tx.effective_gas_price(h.base_fee_per_gas)),
+            "logs": logs, "logsBloom": r.bloom(),
+            "type": format!("{:#x}", tx.ty()), "status": if r.success { "0x1" } else { "0x0" },
+        }))
+    }
+
+    /// Transaction hashes of an indexed block (for `eth_getBlockBy*`).
+    pub fn block_tx_hashes(&self, number: u64, hash: B256) -> Option<Arc<Vec<B256>>> {
+        self.inner.read().txs.get(&number).filter(|(h, _)| *h == hash).map(|(_, v)| v.clone())
+    }
+
+    /// `eth_getLogs` over `[from, to]` (already resolved; `to` ≤ head).
+    pub async fn logs(&self, filter: &Filter, from: u64, to: u64) -> Result<Value, DataError> {
+        if to < from {
+            return Err(DataError::Invalid("fromBlock is after toBlock".into()));
+        }
+        if to - from + 1 > self.max_log_range {
+            return Err(DataError::RangeTooLarge(self.max_log_range));
+        }
+        self.ensure_headers(from).await?;
+        let (candidates, scanned) = {
+            let g = self.inner.read();
+            let mut c = Vec::new();
+            let mut scanned = 0u64;
+            for n in from..=to {
+                let Some((bh, h)) = g.headers.get(&n).cloned() else {
+                    return Err(DataError::Unavailable(format!("no header for block {n}")));
+                };
+                scanned += 1;
+                if !filter.matches_bloom(h.logs_bloom) {
+                    continue;
+                }
+                if !filter.address.is_empty()
+                    && let Some((th, t)) = g.touched.get(&n)
+                    && *th == bh
+                    && !filter.address.iter().any(|a| t.contains(a))
+                {
+                    continue;
+                }
+                c.push((n, bh, h));
+            }
+            (c, scanned)
+        };
+        let t = Instant::now();
+        let fetched: Vec<_> = futures::stream::iter(candidates.iter().cloned())
+            .map(|(n, bh, h)| async move {
+                let r = self.block_receipts(bh, &h).await?;
+                let has = r.iter().any(|r| r.logs.iter().any(|l| filter.matches(l)));
+                let hashes = if has {
+                    match self.block_tx_hashes(n, bh) {
+                        Some(hs) => Some(hs),
+                        None => Some(Arc::new(tx_hashes(&self.block_txs(bh, &h).await?))),
+                    }
+                } else {
+                    None
+                };
+                Ok::<_, DataError>((n, bh, h, r, hashes))
+            })
+            .buffered(8)
+            .collect()
+            .await;
+        let mut out = Vec::new();
+        for res in fetched {
+            let (n, bh, h, receipts, hashes) = res?;
+            let Some(hashes) = hashes else { continue };
+            let mut li = 0u64;
+            for (ti, r) in receipts.iter().enumerate() {
+                for l in &r.logs {
+                    if filter.matches(l) {
+                        out.push(Self::log_json(l, bh, n, h.timestamp, hashes[ti], ti as u32, li));
+                    }
+                    li += 1;
+                }
+            }
+        }
+        tracing::debug!(scanned, candidates = candidates.len(), logs = out.len(), ms = t.elapsed().as_millis() as u64, "eth_getLogs");
+        Ok(Value::Array(out))
+    }
+
+    /// Block range of a filter, with tags resolved against `head`.
+    pub fn range(filter: &Filter, head: u64) -> Result<(u64, u64), DataError> {
+        use alloy_rpc_types_eth::BlockNumberOrTag as T;
+        let tag = |t: Option<&T>| -> Result<u64, DataError> {
+            match t {
+                None | Some(T::Latest) | Some(T::Pending) => Ok(head),
+                Some(t @ (T::Safe | T::Finalized)) => Err(DataError::Unavailable(format!("block tag {t} is not tracked yet"))),
+                Some(T::Number(n)) => Ok((*n).min(head)),
+                Some(T::Earliest) => Ok(0),
+            }
+        };
+        match &filter.block_option {
+            FilterBlockOption::Range { from_block, to_block } => Ok((tag(from_block.as_ref())?, tag(to_block.as_ref())?)),
+            FilterBlockOption::AtBlockHash(_) => Err(DataError::Invalid("blockHash filters are resolved by the caller".into())),
+        }
+    }
+
+    pub fn number_of(&self, hash: &B256) -> Option<u64> {
+        self.inner.read().headers.iter().rev().find(|(_, (h, _))| h == hash).map(|(n, _)| *n)
+    }
+}

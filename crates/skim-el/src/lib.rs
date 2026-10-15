@@ -22,7 +22,8 @@ use reth_eth_wire_types::{
         AccountRangeMessage, ByteCodesMessage, GetAccountRangeMessage, GetByteCodesMessage, GetStorageRangesMessage, RangeBound,
         SnapProtocolMessage, StorageRangesMessage,
     },
-    BlockAccessLists, BlockHashOrNumber, BlockRangeUpdate, GetBlockAccessLists, GetBlockHeaders, HeadersDirection,
+    BlockAccessLists, BlockHashOrNumber, BlockRangeUpdate, GetBlockAccessLists, GetBlockBodies, GetBlockHeaders,
+    GetReceipts70, HeadersDirection,
 };
 use reth_network::{
     config::rng_secret_key, p2p::snap::client::SnapResponse, NetworkConfig, NetworkHandle,
@@ -38,6 +39,12 @@ use reth_storage_api::noop::NoopProvider;
 use tokio::sync::oneshot;
 
 pub use reth_network_api::PeerId as Peer;
+
+/// A signed transaction as gossiped on the EL (no blob sidecars).
+pub type SignedTx = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>;
+/// A receipt as served by `GetReceipts` (the bloom is recomputed locally).
+pub type Receipt = alloy_consensus::EthereumReceipt;
+pub type BlockBody = alloy_consensus::BlockBody<SignedTx>;
 pub use reth_network_peers::TrustedPeer;
 
 /// EIP-1459 DNS tree for Sepolia (same signing key as geth's built-in ethdisco trees).
@@ -393,5 +400,52 @@ impl ElNet {
             (Ok(_), d) => (Err(ReqError::Unexpected), d),
             (Err(e), d) => (Err(e), d),
         }
+    }
+
+    /// Headers walking towards genesis from `start` (inclusive).
+    pub async fn headers_falling(&self, peer: PeerId, start: BlockHashOrNumber, limit: u64) -> Timed<Vec<Header>> {
+        let request = GetBlockHeaders { start_block: start, limit, skip: 0, direction: HeadersDirection::Falling };
+        let (r, d) = self.send(peer, |response| PeerRequest::GetBlockHeaders { request, response }).await;
+        (r.map(|h| h.0), d)
+    }
+
+    /// `GetBlockBodies`. Callers verify each body against its header's `transactions_root`.
+    pub async fn bodies(&self, peer: PeerId, hashes: Vec<B256>) -> Timed<Vec<BlockBody>> {
+        let request = GetBlockBodies(hashes);
+        let (r, d) = self.send(peer, |response| PeerRequest::GetBlockBodies { request, response }).await;
+        (r.map(|b| b.0), d)
+    }
+
+    /// All receipts of one block (eth/70+ `GetReceipts`, following `lastBlockIncomplete`).
+    /// Callers verify them against the header's `receipts_root`.
+    pub async fn block_receipts(&self, peer: PeerId, hash: B256) -> Timed<Vec<Receipt>> {
+        let start = Instant::now();
+        let mut out = Vec::new();
+        for _ in 0..64 {
+            let request = GetReceipts70 { first_block_receipt_index: out.len() as u64, block_hashes: vec![hash] };
+            let (r, _) = self.send(peer, |response| PeerRequest::GetReceipts70 { request, response }).await;
+            match r {
+                Ok(mut m) => {
+                    let got = m.receipts.pop().unwrap_or_default();
+                    let empty = got.is_empty();
+                    out.extend(got);
+                    if !m.last_block_incomplete || empty {
+                        return (Ok(out), start.elapsed());
+                    }
+                }
+                Err(e) => return (Err(e), start.elapsed()),
+            }
+        }
+        (Err(ReqError::Peer("receipts: too many partial responses".into())), start.elapsed())
+    }
+
+    /// Sends full transactions to every connected peer. Returns how many peers got them.
+    pub fn broadcast(&self, txs: Vec<SignedTx>) -> usize {
+        let txs: Vec<Arc<SignedTx>> = txs.into_iter().map(Arc::new).collect();
+        let peers: Vec<PeerId> = self.peers.read().keys().copied().collect();
+        for p in &peers {
+            self.handle.send_transactions(*p, txs.clone());
+        }
+        peers.len()
     }
 }

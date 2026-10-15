@@ -6,9 +6,12 @@
 //! - `3` execution reverted, with the revert data
 //!
 //! Block tags: `latest` is the **state-ready** head. A block number inside the retained window
-//! and EIP-1898 `{blockHash}` / `{blockNumber}` are accepted. `pending`, `safe`, `finalized` and
-//! `earliest` are not tracked yet and answer `-32002`. Within one batch, `latest` is pinned to
-//! one block.
+//! and EIP-1898 `{blockHash}` / `{blockNumber}` are accepted. `pending` reads the latest state,
+//! except that `eth_getTransactionCount` counts transactions sent through skim and not yet
+//! included. `safe`, `finalized` and `earliest` are not tracked yet and answer `-32002`. Within
+//! one batch, `latest` is pinned to one block.
+//!
+//! Transactions, receipts and logs come from [`crate::chaindata`].
 
 use std::sync::Arc;
 
@@ -24,6 +27,8 @@ use serde_json::{Value, json};
 use skim_bal::StateKey;
 use skim_sim::{Mode, SimError, Simulator};
 use skim_state::BlockRef;
+
+use crate::chaindata::{ChainData, DataError};
 
 pub const CLIENT_VERSION: &str = concat!("skim/", env!("CARGO_PKG_VERSION"), " (P2P-backed simulation; unverified state)");
 
@@ -61,11 +66,7 @@ impl From<SimError> for RpcError {
 type R = Result<Value, RpcError>;
 
 const OUT_OF_SCOPE: &[&str] = &[
-    "eth_sendRawTransaction",
-    "eth_sendTransaction",
-    "eth_getLogs",
-    "eth_getTransactionReceipt",
-    "eth_getTransactionByHash",
+    "eth_sendTransaction", // skim holds no keys: sign locally, then eth_sendRawTransaction
     "eth_newFilter",
     "eth_getFilterChanges",
     "eth_subscribe",
@@ -89,6 +90,17 @@ fn need<T: serde::de::DeserializeOwned>(params: &Value, i: usize) -> Result<T, R
 pub struct Rpc {
     pub sim: Arc<Simulator>,
     pub subs: Option<Arc<skim_sim::subscription::Subscriptions>>,
+    pub chain: Option<Arc<ChainData>>,
+}
+
+impl From<DataError> for RpcError {
+    fn from(e: DataError) -> Self {
+        match e {
+            DataError::Unavailable(m) => Self::unavailable(m),
+            DataError::Invalid(m) => Self::new(-32000, m),
+            DataError::RangeTooLarge(n) => Self::new(-32005, format!("block range too large: at most {n} blocks per eth_getLogs")),
+        }
+    }
 }
 
 impl Rpc {
@@ -101,7 +113,8 @@ impl Rpc {
                 .block(n)
                 .or_else(|| store.archived_block(n).map(|(b, _)| b))
                 .ok_or_else(|| RpcError::unavailable(format!("block {n} is outside the retained window and not archived"))),
-            BlockId::Number(BlockNumberOrTag::Pending) => Err(RpcError::new(-32004, "pending state is not tracked")),
+            // Pending state = latest state (skim keeps no mempool); see eth_getTransactionCount.
+            BlockId::Number(BlockNumberOrTag::Pending) => latest(),
             BlockId::Number(t) => Err(RpcError::unavailable(format!("block tag {t} is not tracked yet"))),
             BlockId::Hash(h) => {
                 let head = latest()?;
@@ -113,6 +126,10 @@ impl Rpc {
                     .ok_or_else(|| RpcError::unavailable(format!("block {} is not in the window or the archive", h.block_hash)))
             }
         }
+    }
+
+    fn chain(&self) -> Result<&Arc<ChainData>, RpcError> {
+        self.chain.as_ref().ok_or_else(|| RpcError::unavailable("chain data is not available in this mode"))
     }
 
     fn header(&self, b: &BlockRef) -> Result<Header, RpcError> {
@@ -167,8 +184,10 @@ impl Rpc {
                 let block: Block<alloy_rpc_types_eth::Transaction> = Block {
                     header: alloy_rpc_types_eth::Header::new(h),
                     uncles: vec![],
-                    // Transactions are not retained (simulation client): an empty list.
-                    transactions: BlockTransactions::Hashes(vec![]),
+                    // Hashes when skim indexed the block's transactions (gossip or a fetched body).
+                    transactions: BlockTransactions::Hashes(
+                        self.chain.as_ref().and_then(|c| c.block_tx_hashes(b.number, b.hash)).map(|v| v.to_vec()).unwrap_or_default(),
+                    ),
                     withdrawals: None,
                 };
                 Ok(serde_json::to_value(block).unwrap())
@@ -178,7 +197,14 @@ impl Rpc {
                 let b = self.resolve_block(param(params, 1)?, latest)?;
                 match method {
                     "eth_getBalance" => Ok(json!(sim.read(&b, StateKey::Balance(a)).await?)),
-                    "eth_getTransactionCount" => Ok(json!(sim.read(&b, StateKey::Nonce(a)).await?)),
+                    "eth_getTransactionCount" => {
+                        let n: u64 = sim.read(&b, StateKey::Nonce(a)).await?.saturating_to();
+                        let pending = matches!(param::<BlockId>(params, 1)?, Some(BlockId::Number(BlockNumberOrTag::Pending)));
+                        Ok(hex_u64(match (&self.chain, pending) {
+                            (Some(c), true) => c.pending_nonce(a, n),
+                            _ => n,
+                        }))
+                    }
                     _ => Ok(json!(sim.code(&b, a).await?)),
                 }
             }
@@ -197,6 +223,9 @@ impl Rpc {
                 let b = self.resolve_block(param(params, 1)?, latest)?;
                 let header = self.header(&b)?;
                 let out = sim.call(&b, self.tx_env(req, &header), Mode::Resolve { max_rounds: 8 }).await?;
+                tracing::debug!(number = b.number, predicted_keys = out.predicted.as_ref().map_or(0, |p| p.keys),
+                    predicted_ms = out.predicted.as_ref().map_or(0.0, |p| p.wall_ms), rounds = out.rounds.len(),
+                    round_keys = out.rounds.iter().map(|r| r.keys).sum::<usize>(), "eth_call fetches");
                 Self::exec_result(&out.result)
             }
             "eth_estimateGas" => {
@@ -223,6 +252,43 @@ impl Rpc {
                 let base = self.header(&b)?.base_fee_per_gas.unwrap_or_default() as u128;
                 let tip = 1_000_000_000u128;
                 Ok(json!(U256::from(if method == "eth_gasPrice" { base + tip } else { tip })))
+            }
+            "eth_sendRawTransaction" => {
+                let chain = self.chain()?;
+                let raw: Bytes = need(params, 0)?;
+                let (tx, from) = ChainData::decode_raw(&raw)?;
+                // The early errors a node's pool would give, from verified state at the head.
+                use alloy_consensus::Transaction as _;
+                let b = self.resolve_block(None, latest)?;
+                let nonce: u64 = sim.read(&b, StateKey::Nonce(from)).await?.saturating_to();
+                if tx.nonce() < nonce {
+                    return Err(RpcError::new(-32000, format!("nonce too low: next nonce {nonce}, tx nonce {}", tx.nonce())));
+                }
+                let balance = sim.read(&b, StateKey::Balance(from)).await?;
+                let cost = U256::from(tx.gas_limit()) * U256::from(tx.max_fee_per_gas()) + tx.value();
+                if balance < cost {
+                    return Err(RpcError::new(-32000, format!("insufficient funds for gas * price + value: balance {balance}, cost {cost}")));
+                }
+                let (hash, peers) = chain.send(tx, from);
+                if peers == 0 {
+                    tracing::warn!(tx = %hash, "no EL peers connected; will re-broadcast");
+                }
+                Ok(json!(hash))
+            }
+            "eth_getTransactionByHash" => Ok(self.chain()?.transaction(need(params, 0)?).await?),
+            "eth_getTransactionReceipt" => Ok(self.chain()?.receipt(need(params, 0)?).await?),
+            "eth_getLogs" => {
+                let chain = self.chain()?;
+                let filter: alloy_rpc_types_eth::Filter = need(params, 0)?;
+                let head = self.resolve_block(None, latest)?.number;
+                let (from, to) = match filter.block_option {
+                    alloy_rpc_types_eth::FilterBlockOption::AtBlockHash(h) => {
+                        let n = chain.number_of(&h).ok_or_else(|| RpcError::unavailable(format!("block {h} is not known")))?;
+                        (n, n)
+                    }
+                    _ => ChainData::range(&filter, head)?,
+                };
+                Ok(chain.logs(&filter, from, to).await?)
             }
             "skim_subscriptionStatus" => Ok(serde_json::to_value(self.subs.as_ref().map(|s| s.status()).unwrap_or_default()).unwrap()),
             m if OUT_OF_SCOPE.contains(&m) => Err(RpcError::unsupported(m)),

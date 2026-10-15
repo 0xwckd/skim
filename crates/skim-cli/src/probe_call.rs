@@ -526,7 +526,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                         r.hinted_keys.push(c.rounds.iter().map(|x| x.keys).sum());
                         match source {
                             Source::Exact => r.hinted_exact_k.push(c.rounds.len()),
-                            Source::Core => r.hinted_core_k.push(c.rounds.len()),
+                            Source::Core | Source::Pattern => r.hinted_core_k.push(c.rounds.len()),
                         }
                         if let Some(inf) = &infura {
                             check(r, &call.name, &c.output, inf);

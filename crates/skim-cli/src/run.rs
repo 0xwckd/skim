@@ -11,7 +11,7 @@ use std::{net::SocketAddr, sync::Arc};
 use skim_bal::BlockWrites;
 use skim_cl::{ClEvent, ClNode, NodeConfig, ssz::Envelope, verify};
 use skim_el::ElNet;
-use skim_sim::{Simulator, learned::Learned, predictor::Predictor};
+use skim_sim::{Simulator, learned::{self, Learned}, predictor::Predictor};
 use skim_snap::{Scheduler, el::ElTransport};
 use skim_state::Store;
 
@@ -47,12 +47,47 @@ pub struct Args {
     /// first write. 0 = off.
     #[arg(long, default_value_t = 0)]
     archive_backfill: u64,
+    /// Largest block range one `eth_getLogs` request may scan.
+    #[arg(long, default_value_t = 2048)]
+    max_logs_range: u64,
+    /// Disable the learned-set pattern tier (A/B measurements).
+    #[arg(long)]
+    no_learned_patterns: bool,
 }
 
 #[derive(serde::Deserialize, Default)]
 struct Config {
     #[serde(default)]
     state: StateConfig,
+    #[serde(default)]
+    predictors: Predictors,
+}
+
+/// Protocol-aware predictors (PROJECT.md §7.2).
+#[derive(serde::Deserialize, Default)]
+struct Predictors {
+    #[serde(default)]
+    uniswap_v3: Option<V3Config>,
+}
+
+/// Uniswap V3: for `quoteExactInputSingle` on these pools, predict the bitmap words a swap of
+/// the given size can reach, and keep a window around the current tick warm in the background.
+#[derive(serde::Deserialize)]
+struct V3Config {
+    pools: Vec<alloy_primitives::Address>,
+    /// Bitmap words kept warm on each side of the current word (grows with observed reach).
+    #[serde(default = "two")]
+    words: i32,
+    /// Background prefetch budget: keys per pool per block.
+    #[serde(default = "two_fifty_six")]
+    prefetch_budget: usize,
+}
+
+fn two() -> i32 {
+    2
+}
+fn two_fifty_six() -> usize {
+    256
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -130,7 +165,15 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let sim = Simulator::new(
         store.clone(),
         sched,
-        Predictor { learned: Learned::new(8, 0.5, 256), v3: vec![], base_words: 2, reach: Default::default() },
+        Predictor {
+            learned: Learned::with_limits(8, 0.5, 256, learned::Limits {
+                patterns: if args.no_learned_patterns { 0 } else { learned::Limits::default().patterns },
+                ..Default::default()
+            }),
+            v3: vec![],
+            base_words: 2,
+            reach: Default::default(),
+        },
     );
     let cfg: Config = match &args.config {
         Some(p) => serde_yaml_ng::from_str(&std::fs::read_to_string(p)?)?,
@@ -143,18 +186,26 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let subs = Arc::new(skim_sim::subscription::Subscriptions::new(cfg.state.subscriptions, cfg.state.limits.max_subscribed_keys)?);
     tracing::info!(subscriptions = subs.status().len(), declared_keys = subs.total_keys(), "state subscriptions loaded");
     let (_cl, mut rx) = ClNode::start(NodeConfig::sepolia(args.cl_port)).await?;
-    tokio::spawn(serve(Arc::new(Rpc { sim: sim.clone(), subs: Some(subs.clone()) }), args.rpc));
+    let chaindata = crate::chaindata::ChainData::new(net.clone(), args.max_logs_range);
+    tokio::spawn(serve(Arc::new(Rpc { sim: sim.clone(), subs: Some(subs.clone()), chain: Some(chaindata.clone()) }), args.rpc));
     if store.archive().is_some() {
         spawn_archive_healer(store.clone(), net.clone(), args.archive_backfill);
     }
     let maintaining = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let v3 = cfg.predictors.uniswap_v3.map(Arc::new);
+    if let Some(v) = &v3 {
+        sim.predictor.lock().base_words = v.words;
+    }
+    let v3_state = Arc::new(V3State::default());
     let sim2 = sim.clone();
     let store2 = store.clone();
+    let cd2 = chaindata.clone();
     let chain = Chain {
         store: store.clone(),
         net: net.clone(),
         on_header: Box::new(move |h| {
             sim2.insert_header(h.clone());
+            cd2.note_header(h);
             store2.note_header(h.hash_slow(), alloy_rlp::encode(h));
         }),
         lookback: 32,
@@ -174,9 +225,19 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         }
         let Ok(bal) = skim_bal::decode(env.payload.block_access_list) else { continue };
         let number = v.header.number;
-        match chain.place(v.header, Arc::new(BlockWrites::from_bal(&bal))).await {
+        let writes = BlockWrites::from_bal(&bal);
+        chaindata.note_payload(
+            number,
+            v.computed_hash,
+            env.payload.transactions.iter().map(|t| alloy_primitives::Bytes::copy_from_slice(t)).collect(),
+            writes.touched.iter().copied().collect(),
+        );
+        match chain.place(v.header, Arc::new(writes)).await {
             Placed::Applied { ready, reorged_to, filled } => {
                 tracing::info!(number, changed = ready.changed_keys.len(), ?reorged_to, filled, "state ready");
+                if let Some(v) = &v3 {
+                    tokio::spawn(v3_tick(sim.clone(), v.clone(), v3_state.clone(), ready.block));
+                }
                 // Keep subscriptions current and their readiness fresh (one pass at a time).
                 if !maintaining.swap(true, std::sync::atomic::Ordering::SeqCst) {
                     let (sim, subs, flag, b) = (sim.clone(), subs.clone(), maintaining.clone(), ready.block);
@@ -192,6 +253,82 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[derive(Default)]
+struct V3State {
+    registered: std::sync::atomic::AtomicBool,
+    busy: std::sync::atomic::AtomicBool,
+    pools: parking_lot::Mutex<Vec<skim_sim::prefetch::V3Pool>>,
+}
+
+/// Per block: register the configured V3 pools once (tickSpacing, fee, tokens, read through the
+/// simulator like any call), then keep each pool's tick window warm with a budgeted,
+/// low-priority prefetch. One pass at a time.
+async fn v3_tick(sim: Arc<Simulator>, cfg: Arc<V3Config>, st: Arc<V3State>, b: skim_state::BlockRef) {
+    use std::sync::atomic::Ordering::SeqCst;
+    if st.busy.swap(true, SeqCst) {
+        return;
+    }
+    if !st.registered.load(SeqCst) {
+        let mut ok = 0;
+        for &pool in &cfg.pools {
+            let word = |sel: [u8; 4]| {
+                let sim = sim.clone();
+                async move {
+                    let header = sim.header(&b)?;
+                    let tx = revm::context::TxEnv::builder()
+                        .kind(revm::primitives::TxKind::Call(pool))
+                        .data(alloy_primitives::Bytes::copy_from_slice(&sel))
+                        .gas_limit(header.gas_limit)
+                        .gas_price(0)
+                        .build()
+                        .ok()?;
+                    let out = sim.call(&b, tx, skim_sim::Mode::Resolve { max_rounds: 8 }).await.ok()?;
+                    match out.result {
+                        revm::context::result::ExecutionResult::Success { output, .. } if output.data().len() == 32 => {
+                            Some(alloy_primitives::Bytes::copy_from_slice(output.data()))
+                        }
+                        _ => None,
+                    }
+                }
+            };
+            let (Some(sp), Some(fee), Some(t0), Some(t1)) = (
+                word([0xd0, 0xc9, 0x3a, 0x7c]).await, // tickSpacing()
+                word([0xdd, 0xca, 0x3f, 0x43]).await, // fee()
+                word([0x0d, 0xfe, 0x16, 0x81]).await, // token0()
+                word([0xd2, 0x12, 0x20, 0xa7]).await, // token1()
+            ) else {
+                tracing::warn!(%pool, "uniswap_v3: not a V3 pool (or state unavailable yet); retrying next block");
+                continue;
+            };
+            let Some(spacing) = skim_sim::prefetch::decode_spacing(&sp) else { continue };
+            let p = skim_sim::prefetch::V3Pool { address: pool, spacing };
+            let meta = skim_sim::predictor::V3Meta {
+                pool: p,
+                fee: alloy_primitives::U256::from_be_slice(&fee).to(),
+                token0: alloy_primitives::Address::from_slice(&t0[12..]),
+                token1: alloy_primitives::Address::from_slice(&t1[12..]),
+            };
+            let mut pred = sim.predictor.lock();
+            if !pred.v3.iter().any(|m| m.pool.address == pool) {
+                pred.v3.push(meta);
+                st.pools.lock().push(p);
+                tracing::info!(%pool, spacing, fee = meta.fee, "uniswap_v3 predictor: pool registered");
+            }
+            ok += 1;
+        }
+        if ok == cfg.pools.len() {
+            st.registered.store(true, SeqCst);
+        }
+    }
+    let at = if sim.miss_at_parent { sim.store.block(b.number.saturating_sub(1)).unwrap_or(b) } else { b };
+    let pools = st.pools.lock().clone();
+    for p in pools {
+        let window = sim.predictor.lock().window(&p.address);
+        skim_sim::prefetch::refresh_pool(&sim.store, &sim.sched, &b, &at, &p, window, cfg.prefetch_budget).await;
+    }
+    st.busy.store(false, SeqCst);
 }
 
 /// Heals gaps between archive segments (e.g. after a restart) from eth/71 headers + BALs,

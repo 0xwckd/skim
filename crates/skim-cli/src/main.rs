@@ -3,6 +3,7 @@
 
 mod bench_node;
 mod chain;
+mod chaindata;
 mod follow;
 mod probe_cl;
 mod probe_call;

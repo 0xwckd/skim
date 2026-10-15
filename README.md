@@ -128,14 +128,14 @@ curl -s localhost:8545 -H 'content-type: application/json' \
 ```
 
 **Supported methods:**
-- `eth_call` and `eth_estimateGas`
-- `eth_getBalance`, `eth_getCode`, `eth_getStorageAt`, `eth_getTransactionCount`
-- `eth_getBlockByNumber` / `eth_getBlockByHash`
-- `eth_blockNumber`, `eth_chainId`, `net_version`, `eth_syncing`, `eth_gasPrice`, `web3_clientVersion`
+- State and simulation: `eth_call`, `eth_estimateGas`, `eth_getBalance`, `eth_getCode`, `eth_getStorageAt`, `eth_getTransactionCount` (including `pending`)
+- Transactions: `eth_sendRawTransaction` (gossiped straight to EL peers), `eth_getTransactionByHash`, `eth_getTransactionReceipt`
+- Logs: `eth_getLogs`. Receipts are fetched only for blocks whose bloom and BAL match, and checked against `receiptsRoot`.
+- Blocks and chain: `eth_getBlockByNumber` / `eth_getBlockByHash`, `eth_blockNumber`, `eth_chainId`, `net_version`, `eth_syncing`, `eth_gasPrice`, `eth_maxPriorityFeePerGas`, `web3_clientVersion`
 - `skim_subscriptionStatus`
 
 **Errors:**
-- Out-of-scope methods (`eth_sendRawTransaction`, `eth_getLogs`, receipts) return `-32004`.
+- Out-of-scope methods (`eth_sendTransaction`, since skim holds no keys, and filters and subscriptions) return `-32004`.
 - State or blocks skim can't serve return `-32002`. skim never returns a fabricated value.
 
 ## Correctness rules skim lives by
@@ -164,7 +164,7 @@ Consensus light-client verification is on the roadmap. Until then, skim trusts t
 - [ ] Resource benchmark vs a Nethermind full node (same workload, same block hashes)
 - [x] **M4: selective state archiving.** `retention: archive` keeps every BAL-written version of subscribed state on disk. `eth_getStorageAt` and `eth_call` then work at historical blocks for what you subscribed to, from the block each key became known (90/90 and 51/51 historical reads matched Infura, restart gaps healed from eth/71; see [M4](docs/m4-archive.md)). *Sync and archive only what you need.*
 - [x] **M4.2: backfill from retained BALs.** `--archive-backfill N` extends archived history up to about 2 weeks before a subscription existed. Unchanged keys are covered for the whole range; written keys are covered from their first write. Live: 102 historical reads matched Infura, 3 were correctly refused, 0 were wrong.
-- [ ] Generalized learned patterns (pool + direction + amount bucket + tick range), key and byte bounds
+- [x] **M5:** generalized learned patterns (exact args + amount buckets) with key/byte bounds. The V3 predictor is configurable in `skim run`: calls that needed the network fell from 51 to 19 out of 400. Added `eth_sendRawTransaction`, receipts and `eth_getLogs`, all identical to Infura in every check ([M5](docs/m5-predictors-and-chain-data.md)).
 - [ ] `storage: all` for small contracts; WebSocket pushes for `on_block` subscriptions
 - [ ] Consensus light-client verification; mainnet once Glamsterdam ships there
 

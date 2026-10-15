@@ -1,0 +1,96 @@
+# M5: generalized learned sets, the V3 predictor in `skim run`, transactions, receipts and logs
+
+Runs: 2026-10-15, Sepolia, one home connection, public peers.
+
+## 1. Learned sets: a pattern tier, with bounds
+`skim_sim::learned` now has three tiers, most specific first:
+
+| Tier | Key | Prediction |
+|---|---|---|
+| Exact | `to` + full calldata | the last access set for that input |
+| **Pattern** (new) | `to` + selector + per-argument class | union of the pattern's last 4 runs |
+| Shape | `to` + selector | keys seen in ≥ 50% of the last 8 runs (frequency core) |
+
+**Argument classes:**
+- *Exact:* addresses, small integers (< 2²⁴: fee tiers, directions, tick spacings, ABI offsets), and small negative integers.
+- *Magnitude bucket:* everything else, i.e. amounts and price limits. One bucket spans a factor of 4.
+
+So `quote(WETH→USDC, 0.3%, 1.2 ETH)` and `quote(WETH→USDC, 0.3%, 1.7 ETH)` share a pattern. `USDC→WETH`, another fee tier, or `100 ETH` do not.
+
+**Bounds:**
+- Least-recently-used limits per tier: 4,096 exact entries, 1,024 patterns, 256 shapes.
+- A global budget of 500,000 keys across tiers, evicting exact entries first, then patterns, then shapes.
+- `sizes()` reports keys, estimated bytes and evictions in the `follow` health records.
+- Tests: amount generalization without crossing pools or directions, the global budget, LRU order.
+
+### A/B: patterns on vs off (`skim run`, on-demand TTL 4)
+Setup: the same random V3 quotes (8 per block, log-uniform amounts, 3 fee tiers, both directions) were sent to two instances for 50 blocks. Tool: `docs/tools/learned_ab.py`.
+
+| | Patterns on | Patterns off |
+|---|---|---|
+| Calls with miss rounds after running | **25** | 40 |
+| Keys fetched in miss rounds | **6,507** | 9,023 |
+| Calls that ran a predicted fetch first | 31 | 0 |
+| Latency P50 / P99 | 1.6 / 4,531 ms | 1.6 / 4,391 ms |
+
+**Verdict: neutral on latency.** Patterns move work from miss rounds into one predicted wave, but the tail is set by large swaps walking ticks, which no learned set can cover for a new size. In `follow` (all fetched keys stay resident) the two arms were identical: 0 predicted waves, 25 miss events each. Patterns are kept because they are bounded and cheap, and they help repeated similar inputs with an eviction TTL. The protocol predictor is what fixes the tail (next section).
+
+## 2. The Uniswap V3 predictor in `skim run`
+Until now the input-aware V3 predictor existed only in the `follow` harness. It is now configured in `skim.yaml`:
+
+```yaml
+predictors:
+  uniswap_v3:
+    pools: ["0x3289…EfF1", "0x6Ce0…9b50", "0x6418…C47"]
+    words: 2              # bitmap words kept warm on each side (grows with observed reach)
+    prefetch_budget: 256  # keys per pool per block, low priority
+```
+
+Pools are registered through the simulator itself (`tickSpacing`, `fee`, `token0`, `token1`). Each block, a budgeted low-priority prefetch keeps each pool's tick window warm.
+
+**A/B (same driver and workload, 50 blocks, 400 calls each):**
+
+| | **V3 predictor** | Learned sets only |
+|---|---|---|
+| Calls that needed the network | **19** | 51 |
+| Fetch waves per such call | 1 (16), 2 (1), 3 (2) | 1 (27), 2 (10), 3 (6), 4 (5), 5 (2), 8 (1) |
+| Calls over 100 ms | **20** | 51 |
+| Latency P50 / P90 / P99 | 2.0 / **5.5** / 4,521 ms | 1.4 / 300 / 2,706 ms |
+| Errors | 1 | 0 |
+
+**Known issue:** the **first call of the run** (cold store) predicted the full reach of a large swap. The wave failed after **75 s** and returned an error. The remaining slow calls are wide predicted waves (382–792 keys, 2–7 s). Next: cap a predicted wave and fetch the nearest words first, and promote the observed reach into the background window sooner.
+
+## 3. Transactions, receipts and logs
+New JSON-RPC methods:
+- `eth_sendRawTransaction`
+- `eth_getTransactionByHash` and `eth_getTransactionReceipt`
+- `eth_getLogs`
+- `eth_getTransactionCount(addr, "pending")`
+- block transaction hashes in `eth_getBlockBy*`
+
+How each piece of data is obtained:
+- **Send:** the transaction is decoded and its signer recovered. skim rejects it on the wrong chain id, `nonce too low`, or insufficient funds, all checked against verified head state. It is then gossiped to every connected EL peer and re-broadcast every 12 s until a payload includes it (up to 30 min). Blob transactions are rejected because there is no sidecar gossip.
+- **Inclusion:** every verified payload's transactions are hashed and indexed (last 2,048 blocks). This needs no extra network traffic.
+- **Receipts:** `GetReceipts` (eth/70 format) for that one block, accepted only if the receipts rebuild the header's `receipts_root`. Older bodies (`GetBlockBodies`) must rebuild `transactions_root`. Headers older than the ones skim followed are fetched backwards and accepted only if they link by hash.
+- **Logs:** a block is a candidate only if its `logsBloom` matches **and**, for blocks whose BAL skim saw, a filtered address is in the BAL. A contract that emits a log is always in its block's access list. Only candidates' receipts are fetched. The range is capped by `--max-logs-range` (default 2,048).
+
+**Correctness vs Infura** (`docs/tools/chaindata_check.py`): every comparison matched exactly.
+
+| Check | Result |
+|---|---|
+| `eth_getTransactionReceipt` + `eth_getTransactionByHash`, 32 txs of the latest blocks | **32 / 32 identical** |
+| `getLogs` WETH `Transfer`, 16 / 1,024 blocks | 1 / 166 logs, **identical** |
+| `getLogs` `Swap` topic, any address, 16 / 1,024 blocks | 18 / 1,025 logs, **identical** |
+| `getLogs` two addresses, 16 / 1,024 blocks | 3 / 269 logs, **identical** |
+| `getLogs` by `blockHash` | 175 and 249 logs, **identical** |
+
+**Cost:**
+
+| Query | Candidates (of blocks scanned) | Time |
+|---|---|---|
+| Address filter, followed blocks (BAL known) | 1 of 16 | ~0 ms (cached receipts) |
+| WETH `Transfer`, 1,024 blocks (mostly from before skim started: bloom only) | 180 | 25.7 s |
+| Two addresses, 1,024 blocks | 183 | 13.1 s |
+| `Swap` topic with no address, 1,024 blocks (bloom saturated) | 881 | 116 s |
+
+Wide historical scans are bounded by receipt downloads from the 1–2 EL peers connected at the time. Narrow filters over followed blocks are nearly free. Sending was checked for decoding, validation and broadcast. A funded Sepolia key is needed for an end-to-end inclusion test.
