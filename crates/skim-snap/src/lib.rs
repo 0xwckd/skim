@@ -26,6 +26,10 @@ pub mod el;
 
 pub type PeerId = alloy_primitives::B512;
 
+/// Root of an empty Merkle-Patricia trie: `keccak256(rlp(""))`.
+pub const EMPTY_ROOT_HASH: B256 =
+    alloy_primitives::b256!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421");
+
 /// What a lookup asks for. Account and storage keys are pinned to a state root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Key {
@@ -129,8 +133,6 @@ pub struct Config {
     pub hedge_after: Duration,
     pub deadline: Duration,
     pub code_batch: usize,
-    /// Empty-without-proof answers from this many distinct peers resolve a slot as zero.
-    pub empty_quorum: u32,
     /// Use only the N peers with the best latency (experiments; `None` = all).
     pub max_peers: Option<usize>,
 }
@@ -145,7 +147,6 @@ impl Default for Config {
             hedge_after: Duration::from_millis(1200),
             deadline: Duration::from_secs(15),
             code_batch: 32,
-            empty_quorum: 2,
             max_peers: None,
         }
     }
@@ -177,12 +178,29 @@ pub struct PeerStats {
     pub inflight: usize,
 }
 
+/// Where a job's time went (PROJECT.md §6.3 tail-latency breakdown).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct FetchMeta {
+    /// Enqueue to first send: waiting for peers or for per-peer capacity.
+    pub queue_ms: f64,
+    /// Enqueue to answer.
+    pub total_ms: f64,
+    pub attempts: u32,
+    /// "Root unavailable" or empty-without-proof answers before success.
+    pub unavailable: u32,
+    pub hedged: bool,
+    /// Shared another waiter's in-flight job.
+    pub deduped: bool,
+}
+
+type Waiter = oneshot::Sender<(Result<Value, FetchError>, FetchMeta)>;
+
 struct Job {
-    waiters: Vec<oneshot::Sender<Result<Value, FetchError>>>,
+    waiters: Vec<(Waiter, bool)>,
     attempts: u32,
+    unavailable: u32,
     inflight: u32,
     tried: HashSet<PeerId>,
-    empty_answers: HashSet<PeerId>,
     created: Instant,
     first_sent: Option<Instant>,
     last_sent: Option<Instant>,
@@ -285,13 +303,18 @@ impl<T: Transport> Scheduler<T> {
 
     /// Fetches a wave of keys concurrently. Results are in input order.
     pub async fn fetch(&self, keys: &[Key]) -> Vec<Result<Value, FetchError>> {
+        self.fetch_detailed(keys).await.into_iter().map(|(r, _)| r).collect()
+    }
+
+    /// Like [`Self::fetch`], with per-key timing and retry metadata.
+    pub async fn fetch_detailed(&self, keys: &[Key]) -> Vec<(Result<Value, FetchError>, FetchMeta)> {
         let rxs: Vec<_> = {
             let mut st = self.inner.state.lock();
             keys.iter().map(|k| self.inner.enqueue(&mut st, *k)).collect()
         };
         self.inner.wake.notify_one();
         futures::future::join_all(rxs.into_iter().map(|rx| async move {
-            rx.await.unwrap_or(Err(FetchError::Deadline))
+            rx.await.unwrap_or((Err(FetchError::Deadline), FetchMeta::default()))
         }))
         .await
     }
@@ -321,21 +344,21 @@ impl<T: Transport> Scheduler<T> {
 }
 
 impl<T: Transport> Inner<T> {
-    fn enqueue(&self, st: &mut State, key: Key) -> oneshot::Receiver<Result<Value, FetchError>> {
+    fn enqueue(&self, st: &mut State, key: Key) -> oneshot::Receiver<(Result<Value, FetchError>, FetchMeta)> {
         let (tx, rx) = oneshot::channel();
         if let Some(job) = st.jobs.get_mut(&key) {
-            job.waiters.push(tx);
+            job.waiters.push((tx, true));
             st.stats.dedup_hits += 1;
             return rx;
         }
         st.jobs.insert(
             key,
             Job {
-                waiters: vec![tx],
+                waiters: vec![(tx, false)],
                 attempts: 0,
+                unavailable: 0,
                 inflight: 0,
                 tried: HashSet::new(),
-                empty_answers: HashSet::new(),
                 created: Instant::now(),
                 first_sent: None,
                 last_sent: None,
@@ -353,8 +376,17 @@ impl<T: Transport> Inner<T> {
             if result.is_err() {
                 st.stats.failed += 1;
             }
-            for w in job.waiters {
-                let _ = w.send(result.clone());
+            let now = Instant::now();
+            let meta = FetchMeta {
+                queue_ms: job.first_sent.unwrap_or(now).duration_since(job.created).as_secs_f64() * 1e3,
+                total_ms: now.duration_since(job.created).as_secs_f64() * 1e3,
+                attempts: job.attempts,
+                unavailable: job.unavailable,
+                hedged: job.hedged,
+                deduped: false,
+            };
+            for (w, deduped) in job.waiters {
+                let _ = w.send((result.clone(), FetchMeta { deduped, ..meta }));
             }
         }
     }
@@ -380,7 +412,7 @@ impl<T: Transport> Inner<T> {
             allowed.as_ref().is_none_or(|a| a.contains(*id))
                 && p.inflight < p.cap(&self.cfg)
                 && root.is_none_or(|r| p.unavailable_roots.get(&r).is_none_or(|t| t.elapsed() > ROOT_RETRY))
-                && !job.empty_answers.contains(*id)
+
         };
         let best = |untried_only: bool| {
             st.peers
@@ -480,7 +512,6 @@ impl<T: Transport> Inner<T> {
         enum Outcome {
             Values(Vec<(Key, Value)>),
             Unavailable,
-            Empty,
             Err(TransportError),
         }
         let outcome = match keys[0] {
@@ -491,7 +522,16 @@ impl<T: Transport> Inner<T> {
             },
             Key::Storage { root, address, slot } => match t.storage(peer, root, address, slot).await {
                 Ok(SlotAnswer::Found(v)) => Outcome::Values(vec![(keys[0], Value::Storage(v))]),
-                Ok(SlotAnswer::EmptyNoProof) => Outcome::Empty,
+                // Empty without proof is "storage trie empty" only if the account says so;
+                // otherwise this peer can't serve the root (yet). Never guess zero.
+                Ok(SlotAnswer::EmptyNoProof) => match t.account(peer, root, address).await {
+                    Ok(AccountAnswer::Found(None)) => Outcome::Values(vec![(keys[0], Value::Storage(U256::ZERO))]),
+                    Ok(AccountAnswer::Found(Some(a))) if a.storage_root == EMPTY_ROOT_HASH => {
+                        Outcome::Values(vec![(keys[0], Value::Storage(U256::ZERO))])
+                    }
+                    Ok(_) => Outcome::Unavailable,
+                    Err(e) => Outcome::Err(e),
+                },
                 Err(e) => Outcome::Err(e),
             },
             Key::Code(_) => {
@@ -544,6 +584,9 @@ impl<T: Transport> Inner<T> {
             }
             Outcome::Unavailable => {
                 st.stats.root_unavailable += 1;
+                if let Some(j) = st.jobs.get_mut(&keys[0]) {
+                    j.unavailable += 1;
+                }
                 if let (Some(p), Some(root)) = (st.peers.get_mut(&peer), keys[0].root()) {
                     if p.unavailable_roots.len() > 256 {
                         p.unavailable_roots.retain(|_, t| t.elapsed() < Duration::from_secs(60));
@@ -551,19 +594,6 @@ impl<T: Transport> Inner<T> {
                     p.unavailable_roots.insert(root, Instant::now());
                 }
                 Self::retry_or_fail(&self.cfg, &mut st, keys[0]);
-            }
-            Outcome::Empty => {
-                let k = keys[0];
-                let quorum = self.cfg.empty_quorum.min(st.peers.len().max(1) as u32);
-                let n = st.jobs.get_mut(&k).map(|j| {
-                    j.empty_answers.insert(peer);
-                    j.empty_answers.len() as u32
-                });
-                match n {
-                    Some(n) if n >= quorum => Self::finish(&mut st, &k, Ok(Value::Storage(U256::ZERO))),
-                    Some(_) => Self::retry_or_fail(&self.cfg, &mut st, k),
-                    None => st.stats.late_answers_ignored += 1,
-                }
             }
             Outcome::Err(e) => {
                 if gone || matches!(e, TransportError::Disconnected) {

@@ -7,7 +7,11 @@ enum Behav {
     /// Session drops on the first request; the peer leaves the pool.
     Disconnect,
     Unavailable,
+    /// Storage answers empty-without-proof; the account has an empty storage trie.
     Empty,
+    /// Storage answers empty-without-proof, but the account's storage trie is NOT empty
+    /// (a peer that can't serve the root): must never resolve as zero.
+    EmptyLying,
     Fail,
 }
 
@@ -51,7 +55,7 @@ impl Mock {
                 Err(TransportError::Disconnected)
             }
             Behav::Unavailable => Ok(unavailable),
-            Behav::Empty => Ok(empty),
+            Behav::Empty | Behav::EmptyLying => Ok(empty),
             Behav::Fail => Err(TransportError::Timeout),
         };
         self.inflight.lock().get_mut(&peer).unwrap().0 -= 1;
@@ -68,7 +72,11 @@ impl Transport for Mock {
         self.peers.lock().clone()
     }
     async fn account(&self, peer: PeerId, _: B256, _: Address) -> Result<AccountAnswer, TransportError> {
-        self.serve(peer, || AccountAnswer::Found(Some(acct())), AccountAnswer::Unavailable, AccountAnswer::Unavailable).await
+        match self.behav[&peer] {
+            Behav::Empty => Ok(AccountAnswer::Found(Some(AccountState { storage_root: EMPTY_ROOT_HASH, ..acct() }))),
+            Behav::EmptyLying => Ok(AccountAnswer::Found(Some(acct()))),
+            _ => self.serve(peer, || AccountAnswer::Found(Some(acct())), AccountAnswer::Unavailable, AccountAnswer::Unavailable).await,
+        }
     }
     async fn storage(&self, peer: PeerId, _: B256, _: Address, slot: U256) -> Result<SlotAnswer, TransportError> {
         self.serve(peer, || SlotAnswer::Found(slot + U256::from(1)), SlotAnswer::EmptyNoProof, SlotAnswer::EmptyNoProof).await
@@ -160,10 +168,23 @@ async fn hedges_slow_peer() {
 }
 
 #[tokio::test]
-async fn empty_quorum_resolves_zero() {
-    let m = Mock::new(&[(1, Behav::Empty), (2, Behav::Empty)]);
+async fn empty_storage_trie_resolves_zero() {
+    let m = Mock::new(&[(1, Behav::Empty)]);
     let s = Scheduler::new(m, cfg());
     assert_eq!(s.fetch(&[slot(9)]).await[0], Ok(Value::Storage(U256::ZERO)));
+}
+
+#[tokio::test]
+async fn empty_answer_from_unserving_peer_is_never_zero() {
+    // Regression (Spike P0-A): an empty-without-proof answer for an account with storage was
+    // taken as zero, corrupting state. It must fall through to a peer that serves the root.
+    let m = Mock::new(&[(1, Behav::EmptyLying), (2, Behav::Ok { ms: 30 })]);
+    let s = Scheduler::new(m, cfg());
+    assert_eq!(s.fetch(&[slot(9)]).await[0], Ok(Value::Storage(U256::from(10))));
+
+    let m = Mock::new(&[(1, Behav::EmptyLying)]);
+    let s = Scheduler::new(m, Config { max_attempts: 3, ..cfg() });
+    assert!(s.fetch(&[slot(9)]).await[0].is_err());
 }
 
 #[tokio::test]

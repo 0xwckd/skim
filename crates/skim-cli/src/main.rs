@@ -2,6 +2,7 @@
 
 mod follow;
 mod learned;
+mod prefetch;
 mod probe_cl;
 mod probe_call;
 mod probe_el;

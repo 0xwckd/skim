@@ -39,6 +39,7 @@ use skim_snap::{Scheduler, el::ElTransport};
 use skim_state::{BlockRef, Snapshot, StateValue, Store};
 
 use crate::{
+    prefetch,
     probe_call::{Call, Misses, Sparse, block_env, calls, cold_run, infura_url},
     stats::Samples,
 };
@@ -63,6 +64,18 @@ pub struct Args {
     no_infura: bool,
     #[arg(long, default_value = "data/follow.jsonl")]
     out: String,
+    /// Root to resolve misses at: `parent` (fetch at H-1, replay BAL(H)) or `head`.
+    #[arg(long, default_value = "parent")]
+    miss_root: String,
+    /// V3 prefetch: bitmap words on each side of the current word (0 disables).
+    #[arg(long, default_value_t = 2)]
+    v3_words: i32,
+    /// V3 pools to prefetch for (default: Sepolia WETH/USDC 0.05% and 0.3%).
+    #[arg(long, value_delimiter = ',', default_value = "0x3289680dD4d6C10bb19b899729cda5eEF58AEfF1,0x6Ce0896eAE6D4BD668fDe41BB784548fb8F59b50")]
+    v3_pools: Vec<Address>,
+    /// Random new-input V3 quotes per block (no learned set applies to them).
+    #[arg(long, default_value_t = 0)]
+    random_quotes: usize,
 }
 
 fn unix_ms(t: SystemTime) -> f64 {
@@ -212,6 +225,17 @@ struct Stats {
     lead_vs_answer: Samples,
     infura_polled: u64,
     misses_resolved: u64,
+    miss_events: u64,
+    miss_wall: Samples,
+    miss_queue: Samples,
+    miss_service: Samples,
+    miss_attempts_max: u32,
+    miss_unavailable: u64,
+    calls_run: u64,
+    calls_with_miss: u64,
+    prefetch_rounds: u64,
+    prefetch_keys: u64,
+    prefetch_wall: Samples,
     match_ok: u64,
     match_fail: u64,
 }
@@ -226,6 +250,10 @@ struct Ctx {
     infura: Option<(reqwest::Client, String)>,
     /// Infura readiness per block number, polled independently of skim (see `spawn_poller`).
     pollers: StdMutex<HashMap<u64, tokio::task::JoinHandle<Option<Poll>>>>,
+    miss_at_parent: bool,
+    v3_words: i32,
+    v3_pools: StdMutex<Vec<prefetch::V3Pool>>,
+    random_quotes: usize,
 }
 
 /// First successful Infura `eth_call` at a block number: when that request was sent (an upper
@@ -310,7 +338,15 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         out: StdMutex::new(std::io::BufWriter::new(std::fs::File::create(&args.out)?)),
         infura,
         pollers: Default::default(),
+        miss_at_parent: args.miss_root == "parent",
+        v3_words: args.v3_words,
+        v3_pools: Default::default(),
+        random_quotes: args.random_quotes,
     });
+    for a in args.v3_pools.iter().chain([&crate::probe_call::WETH_ADDR, &crate::probe_call::USDC_ADDR]) {
+        ctx.store.watch_address(*a);
+    }
+    let pools = args.v3_pools.clone();
     tracing::info!(calls = ctx.calls.len(), "follow: waiting for envelopes and SNAP peers");
 
     // 0 = not started, 1 = running, 2 = done. Blocks are applied from the first envelope on, so
@@ -377,9 +413,10 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                 let snap_peers = ctx.net.peers().iter().filter(|(_, p)| p.snap1 || p.snap2).count();
                 if snap_peers >= 2 {
                     boot.store(1, SeqCst);
-                    let (ctx2, h2, boot2) = (ctx.clone(), h.clone(), boot.clone());
+                    let (ctx2, h2, boot2, pools2) = (ctx.clone(), h.clone(), boot.clone(), pools.clone());
                     tokio::spawn(async move {
                         bootstrap(&ctx2, &h2, &b).await;
+                        detect_pools(&ctx2, &h2, &b, &pools2).await;
                         boot2.store(2, SeqCst);
                     });
                 } else {
@@ -392,6 +429,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         }
         followed += 1;
         spawn_poller(&ctx, b.number + 1, b.timestamp + 12);
+        spawn_prefetch(&ctx, b);
         {
             let mut s = ctx.stats.lock().unwrap();
             s.blocks += 1;
@@ -428,6 +466,50 @@ async fn bootstrap(ctx: &Ctx, h: &Header, b: &BlockRef) {
     tracing::info!(at = b.number, ?head, "bootstrap complete; following");
 }
 
+/// Reads each pool's `tickSpacing()` from the bootstrapped state (resolving it if needed).
+async fn detect_pools(ctx: &Arc<Ctx>, h: &Header, b: &BlockRef, pools: &[Address]) {
+    let sel = Bytes::from_static(&[0xd0, 0xc9, 0x3a, 0x7c]); // tickSpacing()
+    for &address in pools {
+        let call = Call { name: "tickSpacing".into(), to: address, data: sel.clone() };
+        for _ in 0..4 {
+            let Ok(snap) = ctx.store.snapshot(b) else { break };
+            let (out, m) = simulate(&snap, h, &call);
+            if m.accounts.is_empty() && m.storage.is_empty() && m.code.is_empty() {
+                match out.as_ref().and_then(prefetch::decode_spacing) {
+                    Some(spacing) => {
+                        tracing::info!(%address, spacing, "V3 pool registered for prefetch");
+                        ctx.v3_pools.lock().unwrap().push(prefetch::V3Pool { address, spacing });
+                    }
+                    None => tracing::warn!(%address, "tickSpacing() failed"),
+                }
+                break;
+            }
+            prefetch::resolve(&ctx.store, &ctx.sched, b, &m.accounts, &m.storage, &m.code).await;
+        }
+    }
+}
+
+/// Per-block V3 refresh, off the simulation path.
+fn spawn_prefetch(ctx: &Arc<Ctx>, b: BlockRef) {
+    if ctx.v3_words <= 0 {
+        return;
+    }
+    let pools = ctx.v3_pools.lock().unwrap().clone();
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        let at = if ctx.miss_at_parent { ctx.store.block(b.number - 1).unwrap_or(b) } else { b };
+        for pool in pools {
+            let rounds = prefetch::refresh_pool(&ctx.store, &ctx.sched, &b, &at, &pool, ctx.v3_words).await;
+            let mut s = ctx.stats.lock().unwrap();
+            for r in rounds {
+                s.prefetch_rounds += 1;
+                s.prefetch_keys += r.keys as u64;
+                s.prefetch_wall.push_ms(r.wall_ms);
+            }
+        }
+    });
+}
+
 /// Fetches headers and eth/71 BALs for `from..=to` from EL peers and applies them.
 async fn fill_gap(ctx: &Ctx, from: u64, to: u64, headers: &mut HashMap<B256, Header>) -> anyhow::Result<()> {
     if from > to {
@@ -457,32 +539,51 @@ async fn fill_gap(ctx: &Ctx, from: u64, to: u64, headers: &mut HashMap<B256, Hea
 
 async fn measure_block(ctx: Arc<Ctx>, h: Header, b: BlockRef, recv_ms: f64, applied_ms: f64) {
     let Ok(snap) = ctx.store.snapshot(&b) else { return };
+    let at = if ctx.miss_at_parent { ctx.store.block(b.number - 1).unwrap_or(b) } else { b };
+    let mut calls: Vec<Call> = ctx.calls.iter().map(|c| Call { name: c.name.clone(), to: c.to, data: c.data.clone() }).collect();
+    calls.extend(crate::probe_call::random_quotes(b.number, ctx.random_quotes));
     let mut outputs = Vec::new();
     let mut local_us = 0.0;
     let mut resolved = 0u64;
-    for call in &ctx.calls {
+    let mut miss_log = Vec::new();
+    for call in &calls {
         let t = Instant::now();
         let (mut out, mut m) = simulate(&snap, &h, call);
         local_us += t.elapsed().as_secs_f64() * 1e6;
-        // Misses: resolve over SNAP at this block's root, commit as bases, retry (bounded).
-        for _ in 0..8 {
+        let mut had_miss = false;
+        // Misses: fetch at `at` (parent root by default), commit as bases (replaying this
+        // block's BAL), re-run. Bounded.
+        for round in 0..8 {
             if m.accounts.is_empty() && m.storage.is_empty() && m.code.is_empty() {
                 break;
             }
+            had_miss = true;
+            m.accounts.sort();
+            m.accounts.dedup();
+            m.storage.sort();
+            m.storage.dedup();
+            m.code.sort();
+            m.code.dedup();
             resolved += (m.accounts.len() + m.storage.len()) as u64;
-            let mut st = Sparse::default();
-            let mut access = Misses::default();
-            access.accounts.extend(m.accounts.iter().copied());
-            access.storage.extend(m.storage.iter().copied());
-            let hint = Misses { accounts: access.accounts.clone(), storage: access.storage.clone(), code: Default::default() };
-            match cold_run(&ctx.sched, &h, call, &mut st, Some(&hint)).await {
-                Ok(c) => commit_sparse(&ctx.store, &b, &st, &c.access),
-                Err(e) => {
-                    tracing::warn!(call = %call.name, "miss resolve failed: {e}");
-                    break;
-                }
-            }
+            let r = prefetch::resolve(&ctx.store, &ctx.sched, &at, &m.accounts, &m.storage, &m.code).await;
+            let t2 = Instant::now();
             (out, m) = simulate(&snap, &h, call);
+            let rerun_us = t2.elapsed().as_secs_f64() * 1e6;
+            {
+                let mut s = ctx.stats.lock().unwrap();
+                s.miss_events += 1;
+                s.miss_wall.push_ms(r.wall_ms);
+                s.miss_queue.push_ms(r.queue_ms_max);
+                s.miss_service.push_ms(r.service_ms_max);
+                s.miss_attempts_max = s.miss_attempts_max.max(r.attempts_max);
+                s.miss_unavailable += r.unavailable as u64;
+            }
+            miss_log.push(serde_json::json!({"call": call.name, "round": round, "rerun_us": rerun_us, "resolve": r}));
+        }
+        {
+            let mut s = ctx.stats.lock().unwrap();
+            s.calls_run += 1;
+            s.calls_with_miss += had_miss as u64;
         }
         outputs.push(out);
     }
@@ -499,7 +600,7 @@ async fn measure_block(ctx: Arc<Ctx>, h: Header, b: BlockRef, recv_ms: f64, appl
     };
     let (mut warm_ms, mut matches, mut mismatches) = (None, 0, 0);
     if let Some((client, url)) = &ctx.infura {
-        for (call, ours) in ctx.calls.iter().zip(&outputs) {
+        for (call, ours) in calls.iter().zip(&outputs) {
             let t = Instant::now();
             match infura_call(client, url, b.hash, call).await {
                 Ok(theirs) => {
@@ -544,7 +645,7 @@ async fn measure_block(ctx: Arc<Ctx>, h: Header, b: BlockRef, recv_ms: f64, appl
         "infura_ready_gt_ms": poll.and_then(|p| p.last_fail_sent_ms).map(|t| t - slot0),
         "infura_answer_ms": poll.map(|p| p.first_ok_recv_ms - slot0),
         "infura_polls": poll.map(|p| p.polls), "infura_call_ms": warm_ms,
-        "local_us": local_us, "resolved": resolved, "matches": matches, "mismatches": mismatches}));
+        "local_us": local_us, "resolved": resolved, "misses": miss_log, "matches": matches, "mismatches": mismatches}));
 }
 
 fn report(ctx: &Ctx) {
@@ -563,6 +664,11 @@ fn report(ctx: &Ctx) {
         "blocks_with_infura_poll": s.infura_polled,
         "infura_warm_call": s.infura_call.json(),
         "misses_resolved": s.misses_resolved,
+        "calls_run": s.calls_run, "calls_with_miss": s.calls_with_miss,
+        "miss_events": s.miss_events, "miss_wall": s.miss_wall.json(), "miss_queue_max": s.miss_queue.json(),
+        "miss_service_max": s.miss_service.json(), "miss_attempts_max": s.miss_attempts_max,
+        "miss_root_unavailable": s.miss_unavailable,
+        "prefetch_rounds": s.prefetch_rounds, "prefetch_keys": s.prefetch_keys, "prefetch_wall": s.prefetch_wall.json(),
         "outputs_match": s.match_ok, "outputs_mismatch": s.match_fail,
         "scheduler": ctx.sched.stats(),
     });

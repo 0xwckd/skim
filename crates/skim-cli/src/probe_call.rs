@@ -93,6 +93,43 @@ fn to_keys(m: &Misses) -> Vec<AccessKey> {
     m.accounts.iter().map(|a| AccessKey::Account(*a)).chain(m.storage.iter().map(|(a, s)| AccessKey::Storage(*a, *s))).collect()
 }
 
+pub(crate) const WETH_ADDR: Address = WETH;
+pub(crate) const USDC_ADDR: Address = USDC;
+
+/// `n` new-input V3 single-hop quotes for block `seed`: random direction, fee tier (0.05% or
+/// 0.3%) and log-uniform amount (0.0001–100 WETH, or 0.001–100,000 USDC).
+pub(crate) fn random_quotes(seed: u64, n: usize) -> Vec<Call> {
+    let mut x = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
+    let mut next = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let pad = |h: &str| format!("{h:0>64}");
+    let (w, u) = ("fff9976782d46cc05630d1f6ebab18b2324d6b14", "1c7d4b196cb0c7b01d743fbc6116a902379c7238");
+    (0..n)
+        .map(|_| {
+            let r = next();
+            let weth_in = r & 1 == 0;
+            let fee: u32 = if r & 2 == 0 { 500 } else { 3000 };
+            let frac = (next() % 1_000_000) as f64 / 1_000_000.0;
+            let (tin, tout, amount) = if weth_in {
+                (w, u, 10f64.powf(14.0 + 6.0 * frac)) // 1e14..1e20 wei
+            } else {
+                (u, w, 10f64.powf(3.0 + 8.0 * frac)) // 1e3..1e11 (6 decimals)
+            };
+            let amt = amount as u128;
+            let data = format!("c6a5026a{}{}{}{}{}", pad(tin), pad(tout), pad(&format!("{amt:x}")), pad(&format!("{fee:x}")), pad("0"));
+            Call {
+                name: format!("rand {} {amt} fee{fee}", if weth_in { "WETH->USDC" } else { "USDC->WETH" }),
+                to: QUOTER,
+                data: Bytes::from(alloy_primitives::hex::decode(data).unwrap()),
+            }
+        })
+        .collect()
+}
+
 const QUOTER: Address = address!("Ed1f6473345F45b75F8179591dd5bA1888cf2FB3");
 const WETH: Address = address!("fFf9976782d46CC05630D1f6eBAb18b2324d6B14");
 const USDC: Address = address!("1c7D4B196Cb0C7B01d743Fbc6116a902379C7238");
