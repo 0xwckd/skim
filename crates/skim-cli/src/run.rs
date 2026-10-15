@@ -39,6 +39,9 @@ pub struct Args {
     /// skim.yaml: state subscriptions, on-demand cache TTL, limits (PROJECT.md §7.5).
     #[arg(long)]
     config: Option<std::path::PathBuf>,
+    /// On-disk archive for subscriptions with `retention: { mode: archive }` (M4).
+    #[arg(long)]
+    archive: Option<std::path::PathBuf>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -110,7 +113,15 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         }
     });
     let sched = Scheduler::new(transport, skim_snap::Config::default());
-    let store = Store::new(args.window);
+    let store = match &args.archive {
+        Some(p) => {
+            let ar = skim_state::archive::Archive::open(p)?;
+            tracing::info!(path = %p.display(), last_block = ?ar.last_block()?, segments = ?ar.segments()?,
+                archived_keys = ar.archived_keys()?.len(), "archive opened");
+            Store::with_archive(args.window, ar)?
+        }
+        None => Store::new(args.window),
+    };
     let sim = Simulator::new(
         store.clone(),
         sched,
@@ -130,7 +141,17 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     tokio::spawn(serve(Arc::new(Rpc { sim: sim.clone(), subs: Some(subs.clone()) }), args.rpc));
     let maintaining = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sim2 = sim.clone();
-    let chain = Chain { store: store.clone(), net: net.clone(), on_header: Box::new(move |h| sim2.insert_header(h.clone())), lookback: 32 };
+    let store2 = store.clone();
+    let chain = Chain {
+        store: store.clone(),
+        net: net.clone(),
+        on_header: Box::new(move |h| {
+            sim2.insert_header(h.clone());
+            store2.note_header(h.hash_slow(), alloy_rlp::encode(h));
+        }),
+        lookback: 32,
+    };
+    let mut archive_gap_checked = false;
     tracing::info!("following Sepolia from CL gossip; RPC answers once the first block is applied");
 
     while let Some(ev) = rx.recv().await {
@@ -146,6 +167,22 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         }
         let Ok(bal) = skim_bal::decode(env.payload.block_access_list) else { continue };
         let number = v.header.number;
+        // After a restart, fill the archive from its last block up to this one, so archived
+        // history stays continuous (eth/71 BALs are retained for ~2 weeks).
+        if !archive_gap_checked {
+            archive_gap_checked = true;
+            if let Some(ar) = store.archive() {
+                if let Some(last) = ar.last_block()? {
+                    if number > last + 1 {
+                        match fill_archive_gap(&store, &net, last + 1, number - 1).await {
+                            Ok(n) => tracing::info!(from = last + 1, to = number - 1, blocks = n, "archive gap filled from eth/71"),
+                            Err(e) => tracing::warn!(from = last + 1, to = number - 1,
+                                "archive gap not filled ({e}); history before {number} stays uncovered for keys written in the gap"),
+                        }
+                    }
+                }
+            }
+        }
         match chain.place(v.header, Arc::new(BlockWrites::from_bal(&bal))).await {
             Placed::Applied { ready, reorged_to, filled } => {
                 tracing::info!(number, changed = ready.changed_keys.len(), ?reorged_to, filled, "state ready");
@@ -164,4 +201,43 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Writes blocks `from..=to` (headers + archived keys' BAL writes) straight into the archive.
+async fn fill_archive_gap(store: &skim_state::Store, net: &ElNet, from: u64, to: u64) -> anyhow::Result<u64> {
+    use reth_eth_wire_types::BlockHashOrNumber;
+    let ar = store.archive().ok_or_else(|| anyhow::anyhow!("no archive"))?;
+    let mut prev = ar.hash(from - 1)?;
+    let mut next = from;
+    let peers: Vec<_> = net.peers().into_iter().filter(|(_, p)| p.eth_version >= 71).map(|(id, _)| id).collect();
+    'outer: while next <= to {
+        let count = (to - next + 1).min(64);
+        for &peer in &peers {
+            let Ok(hs) = net.headers(peer, BlockHashOrNumber::Number(next), count).await.0 else { continue };
+            if hs.is_empty() || hs[0].number != next {
+                continue;
+            }
+            let hashes: Vec<alloy_primitives::B256> = hs.iter().map(|h| h.hash_slow()).collect();
+            let Ok(bals) = net.bals(peer, hashes.clone()).await.0 else { continue };
+            for ((h, hash), raw) in hs.iter().zip(&hashes).zip(bals.0) {
+                if prev.is_some_and(|p| p != h.parent_hash) {
+                    anyhow::bail!("archive chain does not link at {}", h.number);
+                }
+                let raw = raw.ok_or_else(|| anyhow::anyhow!("BAL {} unavailable", h.number))?;
+                let bal = skim_bal::decode_verified(&raw, h.block_access_list_hash.unwrap_or_default())?;
+                let w = BlockWrites::from_bal(&bal);
+                let aw: Vec<_> = w.writes.iter().filter(|(k, _)| store.is_archived(k)).copied().collect();
+                let rlp = alloy_rlp::encode(h);
+                ar.write_block(&skim_state::archive::ArchiveBlock { number: h.number, hash: *hash, header_rlp: &rlp, writes: &aw })?;
+                for (ch, c) in &w.code {
+                    ar.put_code(*ch, c)?;
+                }
+                prev = Some(*hash);
+                next = h.number + 1;
+            }
+            continue 'outer;
+        }
+        anyhow::bail!("no EL peer served headers+BALs from {next}");
+    }
+    Ok(to + 1 - from)
 }

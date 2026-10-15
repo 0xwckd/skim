@@ -59,6 +59,8 @@ pub enum SimError {
     State(#[from] StateError),
     #[error("no header for block {0}")]
     NoHeader(u64),
+    #[error("state not archived at block {block}: {keys} key(s) uncovered (archived history starts where each key was first known)")]
+    NotArchived { block: u64, keys: usize },
     #[error("evm: {0}")]
     Evm(String),
 }
@@ -112,7 +114,12 @@ impl Simulator {
     }
 
     pub fn header(&self, b: &BlockRef) -> Option<Header> {
-        self.headers.read().get(&b.number).filter(|h| h.hash_slow() == b.hash).cloned()
+        if let Some(h) = self.headers.read().get(&b.number).filter(|h| h.hash_slow() == b.hash).cloned() {
+            return Some(h);
+        }
+        let (_, rlp) = self.store.archived_block(b.number)?;
+        let h = <Header as alloy_rlp::Decodable>::decode(&mut rlp.as_slice()).ok()?;
+        (h.hash_slow() == b.hash).then_some(h)
     }
 
     fn fetch_at(&self, b: &BlockRef) -> BlockRef {
@@ -122,7 +129,7 @@ impl Simulator {
     /// One local execution (CPU only).
     pub fn execute(&self, snap: &Snapshot, header: &Header, tx: TxEnv) -> Result<(ExecutionResult, Access), SimError> {
         let store = self.store.clone();
-        let block_hash = move |n: u64| store.block(n).map(|b| b.hash);
+        let block_hash = move |n: u64| store.block_hash(n);
         let db = db::SnapDb { snap, block_hash: &block_hash, access: Default::default() };
         let res = {
             let mut evm = Context::mainnet()
@@ -148,6 +155,8 @@ impl Simulator {
         let snap = self.store.snapshot(b)?;
         let header = self.header(b).ok_or(SimError::NoHeader(b.number))?;
         let at = self.fetch_at(b);
+        // Historical (archived) blocks: old roots aren't served by SNAP peers, so never fetch.
+        let mode = if snap.is_archived() { Mode::WarmOnly } else { mode };
         let input = match tx.kind {
             TxKind::Call(to) => Some(CallInput { to, data: tx.data.clone() }),
             TxKind::Create => None,
@@ -183,6 +192,12 @@ impl Simulator {
                 return Ok(CallOutcome { result, access, predicted, rounds, exec_us });
             }
             let max = match mode {
+                Mode::WarmOnly if snap.is_archived() => {
+                    return Err(SimError::NotArchived {
+                        block: b.number,
+                        keys: access.miss_accounts.len() + access.miss_storage.len() + access.miss_code.len(),
+                    });
+                }
                 Mode::WarmOnly => {
                     return Err(SimError::StateUnavailable(
                         access.miss_accounts.len() + access.miss_storage.len() + access.miss_code.len(),
@@ -219,6 +234,9 @@ impl Simulator {
         let snap = self.store.snapshot(b)?;
         if let StateValue::Known(v) = snap.get(&key)? {
             return Ok(v);
+        }
+        if snap.is_archived() {
+            return Err(SimError::NotArchived { block: b.number, keys: 1 });
         }
         let at = self.fetch_at(b);
         let ret = *self.on_demand.read();

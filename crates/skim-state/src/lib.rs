@@ -13,6 +13,8 @@
 //!   immutable [`Snapshot`]s. A snapshot whose block left the selected chain reports
 //!   [`StateError::Reorged`] instead of reading another branch's data.
 
+pub mod archive;
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
@@ -90,6 +92,9 @@ struct Inner {
     watched_keys: HashSet<StateKey>,
     /// On-demand keys and the block after which they expire (tracked until then).
     temp: HashMap<StateKey, u64>,
+    /// Keys whose every version goes to the on-disk archive.
+    archived: HashSet<StateKey>,
+    pending_headers: HashMap<B256, Vec<u8>>,
     recent: BTreeMap<u64, Arc<BlockWrites>>,
     code: HashMap<B256, Bytes>,
 }
@@ -126,13 +131,87 @@ pub struct Store {
     inner: RwLock<Inner>,
     window: u64,
     events: broadcast::Sender<StateReady>,
+    /// Selective archive (M4): every version of archived keys, on disk.
+    archive: Option<Arc<archive::Archive>>,
+    archive_errors: std::sync::atomic::AtomicU64,
 }
 
 impl Store {
     /// `window`: blocks of history (chain entries, BAL index, versions) kept for reads, lazy
     /// fills and reorgs.
     pub fn new(window: u64) -> Arc<Self> {
-        Arc::new(Self { inner: RwLock::default(), window, events: broadcast::channel(1024).0 })
+        Arc::new(Self {
+            inner: RwLock::default(),
+            window,
+            events: broadcast::channel(1024).0,
+            archive: None,
+            archive_errors: Default::default(),
+        })
+    }
+
+    /// A store that also archives every version of archived keys (reloaded from `archive`).
+    pub fn with_archive(window: u64, archive: archive::Archive) -> Result<Arc<Self>, archive::ArchiveError> {
+        let keys = archive.archived_keys()?;
+        let inner = Inner { archived: keys.clone(), watched_keys: keys, ..Default::default() };
+        Ok(Arc::new(Self {
+            inner: RwLock::new(inner),
+            window,
+            events: broadcast::channel(1024).0,
+            archive: Some(Arc::new(archive)),
+            archive_errors: Default::default(),
+        }))
+    }
+
+    pub fn archive(&self) -> Option<&Arc<archive::Archive>> {
+        self.archive.as_ref()
+    }
+
+    pub fn archive_errors(&self) -> u64 {
+        self.archive_errors.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn archive_try<T>(&self, r: Result<T, archive::ArchiveError>) -> Option<T> {
+        match r {
+            Ok(v) => Some(v),
+            Err(_) => {
+                self.archive_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    /// Header RLP for `hash`, written to the archive when its block is applied.
+    pub fn note_header(&self, hash: B256, rlp: Vec<u8>) {
+        if self.archive.is_some() {
+            self.inner.write().pending_headers.insert(hash, rlp);
+        }
+    }
+
+    /// Subscribes `k` and archives every version of it from now on. Versions already held in
+    /// memory (the key was tracked) are archived too, so coverage starts at the earliest one.
+    pub fn archive_key(&self, k: StateKey) {
+        let Some(ar) = &self.archive else {
+            self.watch_key(k);
+            return;
+        };
+        let mem: Vec<(u64, U256)> = {
+            let mut st = self.inner.write();
+            st.temp.remove(&k);
+            st.watched_keys.insert(k);
+            if !st.archived.insert(k) {
+                return;
+            }
+            st.versions.get(&k).cloned().unwrap_or_default()
+        };
+        let r = match mem.split_first() {
+            Some(((b0, v0), rest)) => ar.write_base(&k, *b0, *v0, rest),
+            None => ar.add_keys(&[k]),
+        };
+        self.archive_try(r);
+    }
+
+    pub fn is_archived(&self, k: &StateKey) -> bool {
+        self.inner.read().archived.contains(k)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<StateReady> {
@@ -205,6 +284,22 @@ impl Store {
                 st.code.insert(*h, c.clone());
             }
             let touched = writes.touched.iter().filter(|a| !st.watched_addresses.contains(*a)).count();
+            if let Some(ar) = &self.archive {
+                let aw: Vec<(StateKey, U256)> = writes.writes.iter().filter(|(k, _)| st.archived.contains(k)).copied().collect();
+                let rlp = st.pending_headers.remove(&block.hash).unwrap_or_default();
+                st.pending_headers.retain(|_, _| false);
+                let r = ar.write_block(&archive::ArchiveBlock {
+                    number: block.number,
+                    hash: block.hash,
+                    header_rlp: &rlp,
+                    writes: &aw,
+                });
+                self.archive_try(r);
+                for (h, c) in &writes.code {
+                    let r = ar.put_code(*h, c);
+                    self.archive_try(r);
+                }
+            }
             st.chain.insert(block.number, block);
             st.recent.insert(block.number, writes);
             self.gc(&mut st);
@@ -216,6 +311,10 @@ impl Store {
 
     /// Drops chain entries, BAL index and versions above `number` (reorg to that ancestor).
     pub fn rollback_to(&self, number: u64) {
+        if let Some(ar) = &self.archive {
+            let r = ar.truncate_above(number);
+            self.archive_try(r);
+        }
         let mut st = self.inner.write();
         st.chain.retain(|n, _| *n <= number);
         st.recent.retain(|n, _| *n <= number);
@@ -261,8 +360,16 @@ impl Store {
             .range(at.number + 1..)
             .filter_map(|(n, w)| w.get(&key).map(|v| (*n, v)))
             .collect();
-        for (n, v) in later {
-            st.put(key, n, v);
+        for (n, v) in &later {
+            st.put(key, *n, *v);
+        }
+        if st.archived.contains(&key) {
+            let base = st.versions.get(&key).and_then(|v| v.iter().find(|(n, _)| *n == at.number).copied());
+            drop(st);
+            if let (Some(ar), Some((n, v))) = (&self.archive, base) {
+                let r = ar.write_base(&key, n, v, &later);
+                self.archive_try(r);
+            }
         }
         Ok(())
     }
@@ -284,11 +391,18 @@ impl Store {
     }
 
     pub fn code(&self, hash: &B256) -> Option<Bytes> {
-        self.inner.read().code.get(hash).cloned()
+        if let Some(c) = self.inner.read().code.get(hash).cloned() {
+            return Some(c);
+        }
+        self.archive.as_ref().and_then(|a| a.code(hash).ok().flatten())
     }
 
     pub fn insert_code(&self, code: Bytes) -> B256 {
         let h = keccak256(&code);
+        if let Some(ar) = &self.archive {
+            let r = ar.put_code(h, &code);
+            self.archive_try(r);
+        }
         self.inner.write().code.insert(h, code);
         h
     }
@@ -297,10 +411,40 @@ impl Store {
     pub fn snapshot(self: &Arc<Self>, block: &BlockRef) -> Result<Snapshot, StateError> {
         let st = self.inner.read();
         match st.chain.get(&block.number) {
-            Some(b) if b.hash == block.hash => Ok(Snapshot { store: self.clone(), block: *block }),
+            Some(b) if b.hash == block.hash => Ok(Snapshot { store: self.clone(), block: *block, archived: false }),
             Some(_) => Err(StateError::Reorged { number: block.number, hash: block.hash }),
-            None => Err(StateError::OutOfWindow(block.number)),
+            None => match &self.archive {
+                Some(ar) if ar.hash(block.number).ok().flatten() == Some(block.hash) => {
+                    Ok(Snapshot { store: self.clone(), block: *block, archived: true })
+                }
+                _ => Err(StateError::OutOfWindow(block.number)),
+            },
         }
+    }
+
+    /// A block outside the in-memory window, from the archive (header decoded).
+    pub fn archived_block(&self, number: u64) -> Option<(BlockRef, Vec<u8>)> {
+        let ar = self.archive.as_ref()?;
+        let rlp = ar.header_rlp(number).ok().flatten()?;
+        let hash = ar.hash(number).ok().flatten()?;
+        let h = <alloy_consensus::Header as alloy_rlp::Decodable>::decode(&mut rlp.as_slice()).ok()?;
+        Some((
+            BlockRef { number, hash, parent_hash: h.parent_hash, state_root: h.state_root, timestamp: h.timestamp },
+            rlp,
+        ))
+    }
+
+    /// Block hash by number: the in-memory chain, then the archive.
+    pub fn block_hash(&self, number: u64) -> Option<B256> {
+        if let Some(b) = self.inner.read().chain.get(&number) {
+            return Some(b.hash);
+        }
+        self.archive.as_ref().and_then(|a| a.hash(number).ok().flatten())
+    }
+
+    /// Number of an archived block hash.
+    pub fn archived_number(&self, hash: &B256) -> Option<u64> {
+        self.archive.as_ref().and_then(|a| a.number_of(hash).ok().flatten())
     }
 
     /// Tracked keys that are known at `block`.
@@ -341,6 +485,8 @@ impl Store {
 pub struct Snapshot {
     store: Arc<Store>,
     block: BlockRef,
+    /// Served from the on-disk archive (outside the in-memory window).
+    archived: bool,
 }
 
 impl Snapshot {
@@ -352,7 +498,18 @@ impl Snapshot {
         self.store.code(hash)
     }
 
+    pub fn is_archived(&self) -> bool {
+        self.archived
+    }
+
     pub fn get(&self, key: &StateKey) -> Result<StateValue, StateError> {
+        if self.archived {
+            let ar = self.store.archive.as_ref().expect("archived snapshot without archive");
+            return Ok(match ar.get(key, self.block.number) {
+                Ok(archive::ArchiveRead::Value(v)) => StateValue::Known(v),
+                _ => StateValue::Unknown,
+            });
+        }
         let st = self.store.inner.read();
         if st.chain.get(&self.block.number).map(|b| b.hash) != Some(self.block.hash) {
             return Err(StateError::Reorged { number: self.block.number, hash: self.block.hash });

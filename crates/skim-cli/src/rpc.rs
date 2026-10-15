@@ -97,9 +97,10 @@ impl Rpc {
         let latest = || latest.ok_or_else(|| RpcError::unavailable("not following the chain yet"));
         match id.unwrap_or(BlockId::Number(BlockNumberOrTag::Latest)) {
             BlockId::Number(BlockNumberOrTag::Latest) => latest(),
-            BlockId::Number(BlockNumberOrTag::Number(n)) => {
-                store.block(n).ok_or_else(|| RpcError::unavailable(format!("block {n} is outside the retained window")))
-            }
+            BlockId::Number(BlockNumberOrTag::Number(n)) => store
+                .block(n)
+                .or_else(|| store.archived_block(n).map(|(b, _)| b))
+                .ok_or_else(|| RpcError::unavailable(format!("block {n} is outside the retained window and not archived"))),
             BlockId::Number(BlockNumberOrTag::Pending) => Err(RpcError::new(-32004, "pending state is not tracked")),
             BlockId::Number(t) => Err(RpcError::unavailable(format!("block tag {t} is not tracked yet"))),
             BlockId::Hash(h) => {
@@ -108,7 +109,8 @@ impl Rpc {
                     .rev()
                     .filter_map(|n| store.block(n))
                     .find(|b| b.hash == h.block_hash)
-                    .ok_or_else(|| RpcError::unavailable(format!("block {} is not on the followed chain window", h.block_hash)))
+                    .or_else(|| store.archived_number(&h.block_hash).and_then(|n| store.archived_block(n)).map(|(b, _)| b))
+                    .ok_or_else(|| RpcError::unavailable(format!("block {} is not in the window or the archive", h.block_hash)))
             }
         }
     }

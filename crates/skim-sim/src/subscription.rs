@@ -53,6 +53,20 @@ pub struct SubscriptionSpec {
     /// Re-run `calls` every block and keep the latest results.
     #[serde(default)]
     pub on_block: bool,
+    /// `{ mode: archive }` keeps every version of this subscription's keys on disk (M4).
+    #[serde(default)]
+    pub retention: Option<RetentionSpec>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct RetentionSpec {
+    pub mode: String,
+}
+
+impl SubscriptionSpec {
+    pub fn archive(&self) -> bool {
+        self.retention.as_ref().is_some_and(|r| r.mode == "archive")
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -124,10 +138,14 @@ impl Subscriptions {
     /// Per block: subscribe declared keys (fetching unknown ones), run/learn the calls,
     /// then compute readiness at `head`.
     pub async fn maintain(&self, sim: &Simulator, head: &BlockRef) {
-        // 1. Declared keys: subscribe and fetch whatever is unknown (one wave, parent root).
+        // 1. Declared keys: subscribe (or archive) and fetch whatever is unknown.
         let declared: Vec<StateKey> = self.required.read().values().flat_map(|k| k.iter().copied()).collect();
+        let archived: HashSet<StateKey> = {
+            let req = self.required.read();
+            self.specs.iter().filter(|s| s.archive()).flat_map(|s| req.get(&s.name).into_iter().flatten().copied()).collect()
+        };
         for k in &declared {
-            sim.store.watch_key(*k);
+            if archived.contains(k) { sim.store.archive_key(*k) } else { sim.store.watch_key(*k) }
         }
         if let Ok(snap) = sim.store.snapshot(head) {
             let (accts, slots) = crate::unknown_split(&snap, &declared);
@@ -184,6 +202,18 @@ impl Subscriptions {
             s.truncated = truncated;
             if spec.on_block {
                 s.results = results;
+            }
+        }
+
+        // Archive keys learned this block too (their history starts now).
+        {
+            let req = self.required.read();
+            for spec in self.specs.iter().filter(|s| s.archive()) {
+                for k in req.get(&spec.name).into_iter().flatten() {
+                    if !sim.store.is_archived(k) {
+                        sim.store.archive_key(*k);
+                    }
+                }
             }
         }
 

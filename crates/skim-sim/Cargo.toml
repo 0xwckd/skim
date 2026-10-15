@@ -13,6 +13,7 @@ skim-state.workspace = true
 skim-snap.workspace = true
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
+alloy-rlp.workspace = true
 revm.workspace = true
 tokio.workspace = true
 tracing.workspace = true

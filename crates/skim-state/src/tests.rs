@@ -167,3 +167,46 @@ fn ttl_never_downgrades_a_subscription_and_promotion_sticks() {
     assert_eq!(known(&snap, slot(2)), Some(8));
     assert!(s.is_subscribed(&slot(2)));
 }
+
+#[test]
+fn archived_keys_answer_blocks_outside_the_window() {
+    let d = tempfile::tempdir().unwrap();
+    let ar = archive::Archive::open(d.path().join("a.redb")).unwrap();
+    let s = Store::with_archive(4, ar).unwrap();
+    s.apply_block(blk(1, 0), writes(&[])).unwrap();
+    s.insert_base(&blk(1, 0), slot(1), U256::from(100)).unwrap();
+    s.insert_base(&blk(1, 0), slot(2), U256::from(200)).unwrap();
+    s.archive_key(slot(1)); // slot 2 is subscribed but not archived
+    for n in 2..=20 {
+        let w: Vec<(StateKey, u64)> = if n % 5 == 0 { vec![(slot(1), n), (slot(2), n)] } else { vec![] };
+        s.apply_block(blk(n, 0), writes(&w)).unwrap();
+    }
+    // Block 3 is far outside the 4-block window: served from the archive.
+    let old = s.snapshot(&blk(3, 0)).unwrap();
+    assert!(old.is_archived());
+    assert_eq!(known(&old, slot(1)), Some(100));
+    assert_eq!(known(&old, slot(2)), None); // not archived: never guessed
+    assert_eq!(known(&s.snapshot(&blk(12, 0)).unwrap(), slot(1)), Some(10));
+    assert_eq!(known(&s.snapshot(&blk(19, 0)).unwrap(), slot(1)), Some(15));
+    assert_eq!(known(&s.snapshot(&blk(20, 0)).unwrap(), slot(1)), Some(20));
+    assert_eq!(s.archive_errors(), 0);
+    assert_eq!(s.block_hash(3), Some(blk(3, 0).hash));
+}
+
+#[test]
+fn archive_follows_reorgs() {
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::with_archive(64, archive::Archive::open(d.path().join("a.redb")).unwrap()).unwrap();
+    s.apply_block(blk(10, 0), writes(&[])).unwrap();
+    s.insert_base(&blk(10, 0), slot(1), U256::from(1)).unwrap();
+    s.archive_key(slot(1));
+    s.apply_block(blk(11, 0), writes(&[(slot(1), 11)])).unwrap();
+    s.apply_block(blk(12, 0), writes(&[(slot(1), 12)])).unwrap();
+    s.rollback_to(11);
+    let mut b = blk(12, 1);
+    b.parent_hash = blk(11, 0).hash;
+    s.apply_block(b, writes(&[(slot(1), 99)])).unwrap();
+    let ar = s.archive().unwrap();
+    assert_eq!(ar.get(&slot(1), 12).unwrap(), archive::ArchiveRead::Value(U256::from(99)));
+    assert_eq!(ar.get(&slot(1), 11).unwrap(), archive::ArchiveRead::Value(U256::from(11)));
+}
