@@ -11,6 +11,7 @@ for path in sys.argv[1:]:
     for r in rows:
         by_call = collections.defaultdict(list)
         for m in r['misses']:
+            if m['round'] == 'predict': continue
             by_call[m['call']].append(m)
             res = m['resolve']
             wall.append(res['wall_ms']); queue.append(res['queue_ms_max']); service.append(res['service_ms_max'])

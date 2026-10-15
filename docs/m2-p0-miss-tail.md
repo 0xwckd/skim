@@ -61,3 +61,26 @@ The SNAP pool grew from 5 to 22 peers during the run. Windows with a similar poo
 - **Latency:** no measurable change (P50 +12 ms, P99 −48 ms).
 
 **Limitation:** the pool was large (12–22 SNAP peers). The earlier soak sometimes had only 2–4 SNAP peers. Losing the top peer in a pool that small would likely raise the tail, which this run doesn't test.
+
+## D: State Access Predictor (`follow --predictor`, same workload as C)
+Before each call, the predictor fetches every predicted-but-unknown key in **one wave** at the parent root. It predicts from two sources:
+- **learned sets:** exact input first, otherwise the frequency-weighted core
+- **input-aware V3 range:** from the amount, current `sqrtPrice` and `liquidity`, the bitmap words the swap can reach (×1.5 + 1 word), plus the initialized ticks inside them
+
+A miss on a bitmap word is expanded to the whole word range back to the current word. Raw data is in `data/p0-D.*`.
+
+| | C: prefetch only | **D: + predictor** |
+|---|---|---|
+| Outputs match Infura | 900/900 | **900/900** |
+| Calls that missed *after* running | 3 (up to 3 rounds) | **0** |
+| Calls that needed a predicted fetch first | – | 13 (2 at warm-up in block 0, then 11) |
+| Fetch rounds for such a call | 1–3 | **always 1 wave** |
+| Predicted wave after warm-up: keys / wall | – | 1–349 keys / 185 ms – 2.36 s |
+
+- **Rounds are solved:** new inputs, including 53–96 WETH swaps, now run in a single fetch wave.
+- **The remaining tail is wave width:** 142–349 keys for the largest swaps, of which 0.7–2.0 s is queueing for per-peer capacity.
+- **Predicted fetches die out:** after block 3 they happened only in blocks 6, 8, 15 and 31, because fetched keys stay current through BAL writes.
+
+**Next:**
+- Widen the *background* window per pool to the furthest reach the predictor has observed. Those keys then leave the critical path entirely: one initial fetch, then BAL keeps them current.
+- Handle very wide waves with AIMD and more peers.
