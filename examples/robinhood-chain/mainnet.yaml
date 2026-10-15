@@ -1,0 +1,22 @@
+# Official chain configuration: https://docs.robinhood.com/chain/connecting/
+network: robinhood-mainnet
+# Override with --upstream <your-Nitro-RPC> if needed.
+state:
+  subscriptions:
+    - name: weth-account
+      # Official WETH: https://docs.robinhood.com/chain/contracts/
+      address: "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73"
+      account: true
+      storage: ["0x0"]
+    - name: weth-metadata
+      calls:
+        - to: "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73"
+          data: "0x95d89b41" # symbol()
+        - to: "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73"
+          data: "0x313ce567" # decimals()
+      on_block: true
+    - name: arbitrum-chain-id
+      calls:
+        - to: "0x0000000000000000000000000000000000000064"
+          data: "0xd127f54a" # ArbSys.arbChainID()
+      on_block: true

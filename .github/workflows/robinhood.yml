@@ -1,0 +1,20 @@
+name: Robinhood backend
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt -p skim-robinhood --check
+      - run: cargo test --locked -p skim-robinhood
+      - run: cargo clippy --locked -p skim-robinhood --all-targets -- -D warnings
+      - run: cargo check --locked -p skim-cli

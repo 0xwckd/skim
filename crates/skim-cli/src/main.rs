@@ -37,6 +37,8 @@ enum Cmd {
     Follow(follow::Args),
     /// Follow the chain and serve JSON-RPC (eth_call, eth_getStorageAt, ...) on top of it.
     Run(run::Args),
+    /// Serve Robinhood Chain through a block-pinned Nitro RPC read cache.
+    Robinhood(skim_robinhood::Args),
     /// P3 baseline: same per-block eth_call workload against a full node's RPC.
     BenchNode(bench_node::Args),
     /// Peer-count sweep: one large learned wave fetched with 1/2/4/all peers per block.
@@ -60,6 +62,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::ProbeCall(args) => probe_call::run(args).await,
         Cmd::Follow(args) => follow::run(args).await,
         Cmd::Run(args) => run::run(args).await,
+        Cmd::Robinhood(args) => skim_robinhood::run(args).await,
         Cmd::BenchNode(args) => bench_node::run(args).await,
         Cmd::ProbeWave(args) => probe_call::run_wave(args).await,
         Cmd::ProbeCl(args) => probe_cl::run(args).await,

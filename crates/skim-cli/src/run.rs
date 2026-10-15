@@ -86,6 +86,8 @@ pub struct Args {
 #[derive(serde::Deserialize, Default)]
 struct Config {
     #[serde(default)]
+    network: Option<String>,
+    #[serde(default)]
     state: StateConfig,
     #[serde(default)]
     predictors: Predictors,
@@ -171,6 +173,14 @@ fn hundred_k() -> skim_sim::subscription::Limit {
 }
 
 pub async fn run(args: Args) -> anyhow::Result<()> {
+    let cfg: Config = match &args.config {
+        Some(p) => serde_yaml_ng::from_str(&std::fs::read_to_string(p)?)?,
+        None => Config::default(),
+    };
+    anyhow::ensure!(
+        cfg.network.as_deref().is_none_or(|network| network == "sepolia"),
+        "skim run supports Sepolia only; use skim robinhood --config <file> for Robinhood Chain"
+    );
     let persist = if args.ephemeral {
         None
     } else {
@@ -238,10 +248,6 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             reach: Default::default(),
         },
     );
-    let cfg: Config = match &args.config {
-        Some(p) => serde_yaml_ng::from_str(&std::fs::read_to_string(p)?)?,
-        None => Config::default(),
-    };
     if !cfg.state.on_demand.enabled {
         tracing::warn!("on_demand.enabled=false: unsubscribed state is still fetched for correctness, with a 1-block TTL");
     }

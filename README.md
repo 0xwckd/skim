@@ -1,3 +1,23 @@
+# Robinhood Chain fork
+
+This fork adds Robinhood Chain mainnet and testnet support through a **Nitro RPC read cache**.
+It pins reads and cached calls to block hashes, warms explicit account/slot/call watchlists,
+and preserves Nitro execution by forwarding simulations to a Nitro node.
+**Robinhood mode requires an upstream RPC**: Ethereum SNAP, BAL sync, local revm execution,
+proof verification, selective archiving, and Ethereum light-client verification do not apply
+to this backend. The original Sepolia backend remains available as `skim run`.
+
+```bash
+cargo run --release -p skim-robinhood -- --config examples/robinhood-chain/mainnet.yaml
+# Or, after building the full CLI:
+# skim robinhood --network mainnet
+```
+
+See the [Robinhood guide](docs/guide/robinhood-chain.md) for configuration, limitations,
+supported methods, and a live comparison against Robinhood's RPC.
+
+---
+
 <p align="center">
   <img src="assets/banner.svg" alt="skim: sync only what you need" width="100%">
 </p>

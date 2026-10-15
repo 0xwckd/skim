@@ -1,5 +1,8 @@
 # Examples (viem)
 
+**Robinhood Chain:** [mainnet/testnet watchlists](robinhood-chain/) and a dependency-free
+[live RPC comparison](robinhood-chain/smoke.py). See the [Robinhood guide](../docs/guide/robinhood-chain.md).
+
 Runnable apps that use skim as their Ethereum endpoint. The scripts are plain [viem](https://viem.sh): the only skim-specific part is the URL, plus the `skim.yaml` that tells skim what to keep ready.
 
 ```bash

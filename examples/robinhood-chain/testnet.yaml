@@ -1,0 +1,8 @@
+network: robinhood-testnet
+state:
+  subscriptions:
+    - name: arbitrum-chain-id
+      calls:
+        - to: "0x0000000000000000000000000000000000000064"
+          data: "0xd127f54a" # ArbSys.arbChainID() = 46630
+      on_block: true

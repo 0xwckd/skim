@@ -7431,6 +7431,7 @@ dependencies = [
  "skim-bal",
  "skim-cl",
  "skim-el",
+ "skim-robinhood",
  "skim-sim",
  "skim-snap",
  "skim-state",
@@ -7460,6 +7461,23 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "skim-robinhood"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "futures",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

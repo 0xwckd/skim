@@ -1,5 +1,7 @@
 # skim documentation
 
+**Robinhood Chain fork:** [Nitro RPC cache, setup and limitations](guide/robinhood-chain.md).
+
 ## Guide
 1. [Getting started](guide/getting-started.md): build, run, first call, subscriptions
 2. [How skim works](guide/how-it-works.md): BALs, verified fetches, subscriptions, prediction

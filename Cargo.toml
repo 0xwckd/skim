@@ -53,6 +53,7 @@ skim-snap = { path = "crates/skim-snap" }
 skim-state = { path = "crates/skim-state" }
 skim-sim = { path = "crates/skim-sim" }
 skim-cl = { path = "crates/skim-cl" }
+skim-robinhood = { path = "crates/skim-robinhood" }
 
 [profile.release]
 lto = "thin"
