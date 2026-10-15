@@ -56,6 +56,10 @@ pub struct Args {
     /// Consensus-layer peers to keep (more = better odds of being close to each publisher).
     #[arg(long, default_value_t = 80)]
     cl_peers: usize,
+    /// EL peers to keep connected (enode URLs), e.g. your own node as a dependable state source.
+    /// Answers are still Merkle-proof checked. Repeatable.
+    #[arg(long = "trusted-peer")]
+    trusted_peer: Vec<skim_el::TrustedPeer>,
     /// Disable the learned-set pattern tier (A/B measurements).
     #[arg(long)]
     no_learned_patterns: bool,
@@ -143,7 +147,7 @@ fn hundred_k() -> usize {
 }
 
 pub async fn run(args: Args) -> anyhow::Result<()> {
-    let net = ElNet::start_sepolia(args.el_port, Vec::new(), false).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let net = ElNet::start_sepolia(args.el_port, args.trusted_peer.clone(), false).await.map_err(|e| anyhow::anyhow!("{e}"))?;
     let transport = ElTransport::new(net.clone());
     for p in &args.exclude_snap_peer {
         transport.exclude(*p);

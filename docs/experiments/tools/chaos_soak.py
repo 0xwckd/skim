@@ -1,6 +1,6 @@
 """Long-run correctness soak: skim must answer right or refuse, under restarts and key-set churn.
 
-usage: REF_URL=<reference node> python3 -I chaos_soak.py <skim-binary> <out-dir> [minutes]
+usage: REF_URL=<reference node> [SKIM_EXTRA_ARGS="--trusted-peer enode://…"] python3 -I chaos_soak.py <skim-binary> <out-dir> [minutes]
 
 Every block, the same requests go to skim and to the reference at the same block hash:
   - random Uniswap V3 quotes (cold misses, prediction)
@@ -108,7 +108,7 @@ class Skim:
         log = open(os.path.join(OUT, "skim.log"), "ab")
         self.proc = subprocess.Popen(
             [BIN, "run", "--rpc", f"127.0.0.1:{PORT}", "--cl-port", "9170", "--el-port", "30409", "--window", "32",
-             "--config", path, "--archive", self.archive],
+             "--config", path, "--archive", self.archive] + os.environ.get("SKIM_EXTRA_ARGS", "").split(),
             stdout=log, stderr=log, env=dict(os.environ, RUST_LOG="info"))
 
     def stop(self, sig):
@@ -169,7 +169,7 @@ while time.time() < t_end:
     reqs += [("slot_sub", "eth_getStorageAt", [POOL, hex(s), tag]) for s in (0, 4)]
     reqs += [("slot_cold", "eth_getStorageAt", [POOL, hex(rnd.randrange(5, 12)), tag])]
     reqs += [("blockhash", "eth_call", [blockhash_probe(n - rnd.randrange(1, 257)), tag])]
-    reqs += [("gasprice", "eth_call", [{"data": initcode_returning("3a"), "gas": "0x186a0", "gasPrice": hex(rnd.randrange(1, 10**10))}, tag])]
+    reqs += [("gasprice", "eth_call", [{"data": initcode_returning("3a"), "gas": "0x4c4b40", "gasPrice": hex(rnd.randrange(1, 10**10))}, tag])]
     if n - first_block > 40:
         old = rnd.randrange(first_block, n - 35)
         reqs += [("archived", "eth_getStorageAt", [POOL, "0x0", hex(old)])]
