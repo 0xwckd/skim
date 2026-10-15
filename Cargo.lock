@@ -7341,6 +7341,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "anyhow",
+ "blst",
  "discv5 0.12.0",
  "enr 0.14.0",
  "futures",

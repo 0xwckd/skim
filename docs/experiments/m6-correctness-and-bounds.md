@@ -113,4 +113,10 @@ The median per-block difference between the two was −17 ms (new earlier in 56%
 
 ✓ = also checked to fail against the previous code.
 
-Re-checking the first soak with the corrected classifier: the 3 "reference unavailable" results were all `BLOCKHASH` probes. Probes that both sides answered were all counted as matches before as well, so the 0-wrong result stands. Reorgs are covered by the deterministic store tests, not by the live soak.
+**What this means for the first soak:**
+- The old classifier could hide a mismatch only where the reference returned an error.
+- That happened 3 times, all `BLOCKHASH` probes (contract creations that cannot revert). The raw responses weren't logged, so those 3 can't be re-classified.
+- Every other answer was a value or a skim refusal and was compared correctly. The 0-wrong result holds for those 3,488.
+- The next soak runs with the corrected classifier.
+
+Reorgs are covered by the deterministic store tests, not by the live soak.
