@@ -477,7 +477,9 @@ Every comparison uses identical hardware, inputs, fork rules and target block st
 
 **Go if** both paths are reliable enough for continuous partial-state maintenance.
 
-### M1: BAL follower + first interface
+### M1: BAL follower + first interface (core done: `skim follow`, `docs/m1-follower.md`)
+Result: 100 consecutive blocks followed from CL gossip, 700/700 outputs matching Infura, state ready P50 880 ms after slot start, all 7 watched calls simulated locally in 3.8 ms with no network. First-answer latency **ties** Infura (P50 difference 0; skim first in 50/99 blocks). Every further call is local. Next levers: gossip mesh quality, and the miss path (one miss took 7.4 s).
+
 - Payload/header tracking, BAL decode and verification, gap recovery over eth/71, sequential application.
 - A Rust test that follows, snapshots and reads a slot.
 - A minimal JSON-RPC (`chainId`, `blockNumber`, `getBalance`, `getStorageAt`, `getCode`) so `cast` works against `localhost:8545`.
