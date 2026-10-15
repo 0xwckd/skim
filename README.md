@@ -163,7 +163,7 @@ Consensus light-client verification is on the roadmap. Until then, skim trusts t
 - [x] M3: subscriptions (subscribed vs on-demand state)
 - [ ] Resource benchmark vs a Nethermind full node (same workload, same block hashes)
 - [x] **M4: selective state archiving.** `retention: archive` keeps every BAL-written version of subscribed state on disk. `eth_getStorageAt` and `eth_call` then work at historical blocks for what you subscribed to, from the block each key became known (90/90 and 51/51 historical reads matched Infura, restart gaps healed from eth/71; see [M4](docs/m4-archive.md)). *Sync and archive only what you need.*
-- [ ] M4.2: backfill archived keys from retained BALs (~2 weeks) for keys written in that window
+- [x] **M4.2: backfill from retained BALs.** `--archive-backfill N` extends archived history up to about 2 weeks before a subscription existed. Unchanged keys are covered for the whole range; written keys are covered from their first write. Live: 102 historical reads matched Infura, 3 were correctly refused, 0 were wrong.
 - [ ] Generalized learned patterns (pool + direction + amount bucket + tick range), key and byte bounds
 - [ ] `storage: all` for small contracts; WebSocket pushes for `on_block` subscriptions
 - [ ] Consensus light-client verification; mainnet once Glamsterdam ships there
