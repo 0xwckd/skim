@@ -104,7 +104,7 @@ Consequences for skim:
 
   This ties the BAL to a builder-signed bid inside a proposer-signed block, even before skim verifies any signatures.
 - **Measured (Lighthouse, 1,348 slots):** envelopes arrive P50 764 ms / P95 2.7 s after slot start. That is about 0.9 s earlier than skim's EL path (header poll + eth/71 BAL) and about 0.3–0.5 s before public EL nodes serve the header.
-- **Own listener works (`skim-cl`, `skim probe-cl`, `docs/m0-spike-a.md`).** It uses libp2p 0.57 + discv5 and a hand-written envelope parser. Over 139 slots:
+- **Own listener works (`skim-cl`, `skim probe-cl`, `docs/experiments/m0-spike-a.md`).** It uses libp2p 0.57 + discv5 and a hand-written envelope parser. Over 139 slots:
   - envelope P50 823 ms / P95 2.7 s (about 0.1–0.2 s behind Lighthouse's post-validation log)
   - EL header rebuilt from the payload, hash equal to `block_hash` in 139/139
   - bid link 138/138
@@ -274,7 +274,7 @@ cache miss ──► primary ──(slow / root unavailable)──► backup ─
   - If the primary is slow (adaptive hedge timeout, roughly its P95), the request is hedged to a backup.
   - If the primary hasn't executed H yet (`root unavailable`), the request goes to a backup or falls back to H-1 plus a local BAL(H) replay (§6.3).
 - **Re-scoring.** Discovery keeps running in the background. Every few minutes, candidates are probed with a few cheap requests. A candidate that beats the worst pinned peer replaces it.
-- **Retention (measured, `docs/m0-scheduler.md`).** With a genesis status, public snap/2 peers evicted us within 22–51 s. Two changes fixed most of it:
+- **Retention (measured, `docs/experiments/m0-scheduler.md`).** With a genesis status, public snap/2 peers evicted us within 22–51 s. Two changes fixed most of it:
   - **Advertising the real head** (Status + `BlockRangeUpdate`) got about 25× more SNAP service.
   - **A snap/1 client** reaches Geth peers.
 
@@ -368,13 +368,13 @@ REVM's `Database` is synchronous, so network I/O never happens inside it. A `Res
 
 Misses beyond the predicted set are fetched in later rounds.
 
-**Measured policy (`docs/m0-round2.md`):**
+**Measured policy (`docs/experiments/m0-round2.md`):**
 - exact-input set first
 - otherwise core keys (≥ 50% of the shape's last 8 runs, cap 256)
 
 Result: repeated inputs run at k=1, and new inputs of a known shape at k=2.
 
-**Planned (after the Nethermind benchmark): generalized learned patterns.** Exact-input entries churn under randomized inputs, even with the 4,096-entry FIFO bound. Patterns will be keyed by `pool + direction + amount bucket (log10) + tick range` instead of raw calldata, and bounded by total stored keys and estimated bytes, not just entry count.
+**Generalized learned patterns (M5, done).** Between exact and shape there is now a pattern tier, keyed by `to + selector + per-argument class`. Addresses and small integers are exact; amounts fall in factor-4 magnitude buckets. Every tier is LRU-bounded, under a global key budget. Measured: neutral on latency (the tail is tick walking, which the V3 predictor handles). See `docs/experiments/m5-predictors-and-chain-data.md`.
 
 **Throughput model:** a wave's speed is about Σ (in-flight_i / RTT_i) over serving peers (measured: 42 keys/s with one ~190 ms peer; 169 keys/s once a ~47 ms peer joined). Per-peer concurrency should adapt (AIMD) so that fast peers carry more of the load.
 
@@ -405,10 +405,10 @@ Built only on the public API. Runs over HTTP and WebSocket and supports batch re
 | `eth_subscribe("newHeads")` | from state-ready events | P1 |
 | `eth_gasPrice`, `eth_maxPriorityFeePerGas`, `eth_feeHistory` | headers plus gossip payload txs | P2 |
 | `eth_getProof` | only for roots fetched directly with proofs | P2 |
-| `eth_sendRawTransaction`, `eth_getLogs`, `eth_getTransactionReceipt`, `eth_getTransactionByHash` | out of scope | `-32004` |
+| `eth_sendRawTransaction`, `eth_getTransactionReceipt`, `eth_getTransactionByHash`, `eth_getLogs` | M5: gossip to EL peers; receipts via `GetReceipts` checked against `receiptsRoot`; logs prefiltered by bloom + BAL addresses | done |
 
 Further rules:
-- Block tags `latest`, `safe` and `finalized` and EIP-1898 `{blockHash}` are supported. `pending` maps to `-32004`.
+- Block tags `latest` and EIP-1898 `{blockHash}` / `{blockNumber}` are supported. `pending` reads latest state, plus sent-but-unincluded nonces for `eth_getTransactionCount`. `safe`/`finalized` are not tracked yet.
 - Within one batch, `latest` is pinned to a single snapshot.
 - Use `alloy-rpc-types` and `jsonrpsee` so the wire format matches existing clients.
 
@@ -548,7 +548,7 @@ Every comparison uses identical hardware, inputs, fork rules and target block st
 
 **Go if** both paths are reliable enough for continuous partial-state maintenance.
 
-### M1: BAL follower + first interface (core done: `skim follow`, `docs/m1-follower.md`)
+### M1: BAL follower + first interface (core done: `skim follow`, `docs/experiments/m1-follower.md`)
 Result: 100 consecutive blocks followed from CL gossip, 700/700 outputs matching Infura, state ready P50 880 ms after slot start, all 7 watched calls simulated locally in 3.8 ms with no network. First-answer latency **ties** Infura (P50 difference 0; skim first in 50/99 blocks). Every further call is local. Next levers: gossip mesh quality, and the miss path (one miss took 7.4 s).
 
 - Payload/header tracking, BAL decode and verification, gap recovery over eth/71, sequential application.

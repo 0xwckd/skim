@@ -1,0 +1,40 @@
+# Troubleshooting
+
+### `-32002` on reads right after starting
+SNAP-serving EL peers take **1–4 minutes** to connect on public Sepolia. Until then, state skim hasn't seen can't be fetched. Watch for log lines like:
+```text
+INFO skim_el: session peer=… client=Geth/… snap2=false
+INFO skim_el: session peer=… client=Nethermind/… snap2=true
+```
+Subscribed state shows `ready: false` with `missing_keys > 0` in `skim_subscriptionStatus` until then. Open `--el-port` (TCP + UDP) to get peers faster.
+
+### No `state ready` lines
+skim isn't receiving consensus gossip. Check:
+- **Outbound UDP and TCP to the CL port range.** Some networks block discv5 (UDP).
+- **The clock.** Gossip validation is slot-based, so a skewed clock drops messages.
+- **Two skims on the same ports.** Pass a different `--cl-port`/`--el-port` per instance.
+
+### Every cold call takes seconds
+Fetches go through whichever peers are connected. With 1–2 peers, a wide fetch (hundreds of keys, e.g. a very large swap's tick range) queues on them. Remedies, in order:
+1. **Subscribe** the state or calls your app uses, so they're never cold.
+2. For Uniswap V3, add `predictors.uniswap_v3.pools`. The tick window then stays warm, and new amounts fetch their range in one wave.
+3. Give skim time. The peer pool grows over the first ~10 minutes.
+
+### `eth_getLogs` is slow over long ranges
+- **Receipts per candidate block:** for blocks from before skim started, only the header bloom can rule a block out, so busy filters (e.g. a popular topic with no address) match most blocks.
+- **Mitigations:** narrow the address/topic filter, use shorter ranges, or keep skim running so more of the range has BAL data.
+- **Range cap:** `--max-logs-range` caps the range; larger requests get `-32005`.
+
+### `eth_sendRawTransaction` succeeded but no receipt
+- **Not included yet:** the receipt is `null` until a block includes the transaction. skim re-broadcasts every 12 s for 30 minutes.
+- **Dropped by peers:** a fee below the current base fee, or a nonce gap (an earlier nonce still missing), makes peers ignore the transaction. Check `eth_getTransactionCount(addr, "pending")` against your nonce.
+- **No EL peers:** check `skim_el: session` lines in the log.
+
+### `-32004` from a tool
+Some tools call methods skim doesn't serve, such as filters (`eth_newFilter`) or `eth_sendTransaction` with node-held keys. Use client-side signing (viem `privateKeyToAccount`, Foundry `--private-key`), and polling instead of filters (viem's `watch*` helpers poll by default over HTTP).
+
+### Collecting a useful report
+```bash
+RUST_LOG=info,skim::rpc=debug,skim::chaindata=debug skim run --config skim.yaml 2> skim.log
+```
+`eth_call fetches` lines show predicted keys, rounds and wall time per call. `SNAP answers rejected by verification` counts proofs that failed (expected to stay at 0 or near it).

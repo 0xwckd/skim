@@ -4,7 +4,7 @@ Run on 2026-10-15 (KST): `skim run --window 16 --archive … --config data/m4/sk
 - a Uniswap V3 pool (account + slots 0, 1, 2, 4)
 - a QuoterV2 call, whose learned access set (39 keys) is archived
 
-The 16-block in-memory window forces every historical read below to come from the on-disk archive. The reference is Infura (archive) at the same block numbers. Tool: `docs/tools/archive_check.py`.
+The 16-block in-memory window forces every historical read below to come from the on-disk archive. The reference is Infura (archive) at the same block numbers. Tool: `docs/experiments/tools/archive_check.py`.
 
 | Check | Result |
 |---|---|

@@ -1,0 +1,14 @@
+{
+  "name": "skim-examples",
+  "private": true,
+  "type": "module",
+  "description": "viem examples against a local skim node",
+  "scripts": {
+    "v3": "node uniswap-v3/quote.mjs",
+    "v4": "node uniswap-v4/quote.mjs",
+    "send": "node send-transaction/send.mjs"
+  },
+  "dependencies": {
+    "viem": "2.57.1"
+  }
+}

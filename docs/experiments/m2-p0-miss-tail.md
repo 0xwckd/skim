@@ -1,6 +1,6 @@
 # P0: cold-miss tail on new inputs (miss root, randomized quotes, V3 prefetch)
 
-Runs on 2026-10-16 (KST): 60 blocks per configuration, same home connection, public SNAP peers only. The local node was stopped for most of the runs. Raw data is in `data/p0-{A,B,C}.*`; the analysis script is `docs/tools/p0_analyze.py`.
+Runs on 2026-10-16 (KST): 60 blocks per configuration, same home connection, public SNAP peers only. The local node was stopped for most of the runs. Raw data is in `data/p0-{A,B,C}.*`; the analysis script is `docs/experiments/tools/p0_analyze.py`.
 
 **Workload, per block (900 calls per run):**
 - the 7 fixed calls from M1

@@ -24,7 +24,7 @@ So `quote(WETH→USDC, 0.3%, 1.2 ETH)` and `quote(WETH→USDC, 0.3%, 1.7 ETH)` s
 - Tests: amount generalization without crossing pools or directions, the global budget, LRU order.
 
 ### A/B: patterns on vs off (`skim run`, on-demand TTL 4)
-Setup: the same random V3 quotes (8 per block, log-uniform amounts, 3 fee tiers, both directions) were sent to two instances for 50 blocks. Tool: `docs/tools/learned_ab.py`.
+Setup: the same random V3 quotes (8 per block, log-uniform amounts, 3 fee tiers, both directions) were sent to two instances for 50 blocks. Tool: `docs/experiments/tools/learned_ab.py`.
 
 | | Patterns on | Patterns off |
 |---|---|---|
@@ -74,7 +74,7 @@ How each piece of data is obtained:
 - **Receipts:** `GetReceipts` (eth/70 format) for that one block, accepted only if the receipts rebuild the header's `receipts_root`. Older bodies (`GetBlockBodies`) must rebuild `transactions_root`. Headers older than the ones skim followed are fetched backwards and accepted only if they link by hash.
 - **Logs:** a block is a candidate only if its `logsBloom` matches **and**, for blocks whose BAL skim saw, a filtered address is in the BAL. A contract that emits a log is always in its block's access list. Only candidates' receipts are fetched. The range is capped by `--max-logs-range` (default 2,048).
 
-**Correctness vs Infura** (`docs/tools/chaindata_check.py`): every comparison matched exactly.
+**Correctness vs Infura** (`docs/experiments/tools/chaindata_check.py`): every comparison matched exactly.
 
 | Check | Result |
 |---|---|

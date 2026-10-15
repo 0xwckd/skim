@@ -6,7 +6,7 @@ Raw data:
 - `data/probe-cl-run1.*`: 16 min, 80 slots
 - `data/probe-cl-run2.*`: 12 min, 59 slots
 
-Each run has a `.jsonl` with one line per block/envelope/session/status, a `.out` with the final summary, and a `.err` with the tracing log. The comparison script is `docs/tools/cl_vs_lighthouse.py`.
+Each run has a `.jsonl` with one line per block/envelope/session/status, a `.out` with the final summary, and a `.err` with the tracing log. The comparison script is `docs/experiments/tools/cl_vs_lighthouse.py`.
 
 ## What was built
 **`crates/skim-cl`** is a small stack of our own. It does not use `lighthouse_network`.

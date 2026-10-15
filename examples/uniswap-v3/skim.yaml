@@ -1,0 +1,33 @@
+# Uniswap V3 on Sepolia: WETH/USDC quotes, served locally by skim.
+#
+#   skim run --config examples/uniswap-v3/skim.yaml
+#
+# What this keeps ready:
+#   - the 0.3% pool's slot0 + liquidity (subscribed: applied from every block's BAL)
+#   - a 1 WETH -> USDC quote, re-run every block (its whole access set stays warm)
+#   - the V3 predictor for all three WETH/USDC pools: a quote for any amount fetches the tick
+#     range that amount can reach in one wave, and a window around the current tick stays warm
+network: sepolia
+state:
+  subscriptions:
+    - name: weth-usdc-0.3%
+      address: "0x6Ce0896eAE6D4BD668fDe41BB784548fb8F59b50"
+      account: true
+      storage: ["0x0", "0x4"]                # slot0, liquidity
+    - name: quote-1-weth
+      calls:
+        # QuoterV2.quoteExactInputSingle(WETH -> USDC, 1 WETH, fee 3000, no price limit)
+        - to: "0xEd1f6473345F45b75F8179591dd5bA1888cf2FB3"
+          data: "0xc6a5026a000000000000000000000000fff9976782d46cc05630d1f6ebab18b2324d6b140000000000000000000000001c7d4b196cb0c7b01d743fbc6116a902379c72380000000000000000000000000000000000000000000000000de0b6b3a76400000000000000000000000000000000000000000000000000000000000000000bb80000000000000000000000000000000000000000000000000000000000000000"
+      on_block: true                          # latest result in skim_subscriptionStatus
+      # retention: { mode: archive }          # + `skim run --archive v3.redb` for historical quotes
+  on_demand:
+    enabled: true
+    cache_ttl_blocks: 4
+
+predictors:
+  uniswap_v3:
+    pools:
+      - "0x3289680dD4d6C10bb19b899729cda5eEF58AEfF1"   # WETH/USDC 0.05%
+      - "0x6Ce0896eAE6D4BD668fDe41BB784548fb8F59b50"   # WETH/USDC 0.3%
+      - "0x6418EEC70f50913ff0d756B48d32Ce7C02b47C47"   # WETH/USDC 1%
