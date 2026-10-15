@@ -412,6 +412,59 @@ Further rules:
 - Within one batch, `latest` is pinned to a single snapshot.
 - Use `alloy-rpc-types` and `jsonrpsee` so the wire format matches existing clients.
 
+## 7.5 Product model: application-specific state client (M3)
+
+> Not every app needs a full node. Sync only what you need.
+
+skim keeps two kinds of state with different guarantees.
+
+| | **Subscribed state** (state watchlist) | **On-demand state** |
+|---|---|---|
+| What | Accounts / slots / simulations the user declares | Everything else |
+| Initial sync | SNAP prefetch at subscribe time | none |
+| Per block | Kept current from each block's BAL (the full BAL is received; only subscribed keys are applied) | Kept current only while cached (TTL), then dropped |
+| Simulation | No network on the hot path; target: a few ms | SNAP fetch first (hundreds of ms or more) |
+| Cache | Retained; bounded by `limits` | Short-lived (TTL in blocks), bounded LRU |
+| Guarantee | **Ready** = head BAL applied **and** every required key known at the head; otherwise reported as not ready, never guessed | Best effort; never wrong (verified fetches, Unknown is never zero) |
+
+### Configuration (`skim.yaml`)
+```yaml
+network: sepolia
+state:
+  subscriptions:
+    - name: weth
+      address: "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14"
+      account: true            # balance, nonce, code
+      storage: ["0x...", "0x..."]
+    - name: small-registry
+      address: "0x..."
+      storage: all             # whole storage trie via SNAP ranges; only within limits
+    - name: uniswap-v3-pool
+      address: "0x..."
+      account: true
+      access: { learned: true, predictor: uniswap-v3 }
+    - name: my-quoter          # simulation subscription
+      simulation:
+        to: "0x..."
+        function: "quoteExactInputSingle(...)"
+        args_template: ...     # optional; else learned from observed calls
+        predictor: learned
+      prefetch: true
+      on_block: false          # true: re-run every block and push results
+  on_demand:
+    enabled: true
+    cache_ttl_blocks: 4
+  limits:
+    max_subscribed_keys: 100000
+```
+
+### Rules
+- **No silent promotion.** On-demand keys are tracked only for their TTL and then evicted with their versions. Observed access sets can be promoted to a subscription explicitly (`skim_promote`), or automatically only if the subscription opts in (`access.learned`).
+- **Correct TTL caching.** A value fetched at block H is reused at H+k only because the key stays tracked (BAL writes applied) during its TTL. After that it's refetched.
+- **Readiness is per subscription** and exposed (`skim_subscriptionStatus`, readiness events). A `WarmOnly` call that touches a not-ready subscription returns `-32002` with the missing keys.
+- **Limits are hard.** A subscription that would exceed `max_subscribed_keys` is rejected or truncated, and the condition is reported.
+- The learned access set and protocol predictors (§7.2) become the **auto-configuration layer** for subscriptions, not a separate mode.
+
 ## 8. Trust model
 **Checked (cheap):**
 - header parent links
