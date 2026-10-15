@@ -87,7 +87,7 @@ flowchart LR
     CL["CL gossip<br/>execution_payload + BAL"]
     EL["EL peers<br/>eth/71 BALs · snap/1 · snap/2"]
   end
-  CL -->|verify: rebuild header == block_hash| CHAIN[Chain placer<br/>reorgs · gaps]
+  CL -->|verify: rebuilt header hash matches block_hash| CHAIN[Chain placer<br/>reorgs · gaps]
   EL -->|gap fill| CHAIN
   CHAIN -->|BAL writes for tracked keys| MVCC[(Per-key MVCC store<br/>subscribed · on-demand TTL)]
   SUB[Subscriptions<br/>accounts · slots · simulations] --> PRED[State access predictor<br/>learned sets · V3 ticks]
