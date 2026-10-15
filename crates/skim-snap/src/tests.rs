@@ -7,11 +7,12 @@ enum Behav {
     /// Session drops on the first request; the peer leaves the pool.
     Disconnect,
     Unavailable,
-    /// Storage answers empty-without-proof; the account has an empty storage trie.
+    /// Verified empty storage trie: every slot is zero.
     Empty,
-    /// Storage answers empty-without-proof, but the account's storage trie is NOT empty
-    /// (a peer that can't serve the root): must never resolve as zero.
+    /// Can't verify (no proof / root not served): must never resolve as zero.
     EmptyLying,
+    /// Root not executed yet: the first `n` requests are unavailable, then it serves.
+    DelayedRoot(usize),
     Fail,
 }
 
@@ -54,8 +55,11 @@ impl Mock {
                 self.peers.lock().retain(|p| *p != peer);
                 Err(TransportError::Disconnected)
             }
-            Behav::Unavailable => Ok(unavailable),
-            Behav::Empty | Behav::EmptyLying => Ok(empty),
+            Behav::Unavailable | Behav::EmptyLying => Ok(unavailable),
+            Behav::Empty => Ok(empty),
+            Behav::DelayedRoot(n) => {
+                if self.requests.load(Ordering::SeqCst) <= n { Ok(unavailable) } else { Ok(ok()) }
+            }
             Behav::Fail => Err(TransportError::Timeout),
         };
         self.inflight.lock().get_mut(&peer).unwrap().0 -= 1;
@@ -72,14 +76,10 @@ impl Transport for Mock {
         self.peers.lock().clone()
     }
     async fn account(&self, peer: PeerId, _: B256, _: Address) -> Result<AccountAnswer, TransportError> {
-        match self.behav[&peer] {
-            Behav::Empty => Ok(AccountAnswer::Found(Some(AccountState { storage_root: EMPTY_ROOT_HASH, ..acct() }))),
-            Behav::EmptyLying => Ok(AccountAnswer::Found(Some(acct()))),
-            _ => self.serve(peer, || AccountAnswer::Found(Some(acct())), AccountAnswer::Unavailable, AccountAnswer::Unavailable).await,
-        }
+        self.serve(peer, || AccountAnswer::Found(Some(acct())), AccountAnswer::Unavailable, AccountAnswer::Found(Some(AccountState { storage_root: EMPTY_ROOT_HASH, ..acct() }))).await
     }
     async fn storage(&self, peer: PeerId, _: B256, _: Address, slot: U256) -> Result<SlotAnswer, TransportError> {
-        self.serve(peer, || SlotAnswer::Found(slot + U256::from(1)), SlotAnswer::EmptyNoProof, SlotAnswer::EmptyNoProof).await
+        self.serve(peer, || SlotAnswer::Found(slot + U256::from(1)), SlotAnswer::Unavailable, SlotAnswer::Found(U256::ZERO)).await
     }
     async fn codes(&self, peer: PeerId, hashes: Vec<B256>) -> Result<Vec<Bytes>, TransportError> {
         // Code whose keccak is the requested hash can't be faked; serve the preimages we know.
@@ -185,6 +185,18 @@ async fn empty_answer_from_unserving_peer_is_never_zero() {
     let m = Mock::new(&[(1, Behav::EmptyLying)]);
     let s = Scheduler::new(m, Config { max_attempts: 3, ..cfg() });
     assert!(s.fetch(&[slot(9)]).await[0].is_err());
+}
+
+#[tokio::test]
+async fn root_served_late_yields_the_value_never_zero() {
+    // The only peer hasn't executed the root for its first 3 requests (head-of-chain race).
+    let m = Mock::new(&[(1, Behav::DelayedRoot(3))]);
+    let s = Scheduler::new(m, Config { max_attempts: 10, ..cfg() });
+    let t = Instant::now();
+    let r = s.fetch(&[slot(5)]).await;
+    assert_eq!(r[0], Ok(Value::Storage(U256::from(6))));
+    // Each unavailable answer parks the peer for ROOT_RETRY before retrying the same root.
+    assert!(t.elapsed() >= ROOT_RETRY * 3, "{:?}", t.elapsed());
 }
 
 #[tokio::test]

@@ -1,0 +1,159 @@
+//! Merkle-Patricia proof checks for SNAP point lookups (PROJECT.md §3.4, §8 "Verified State").
+//!
+//! [`lookup`] walks from `root` along a hashed key through the proof nodes a peer returned:
+//! - `Ok(Some(value))`: the key is present, with this leaf value
+//! - `Ok(None)`: the key is **proven absent** (the path diverges, or a branch has no child there)
+//! - `Err(_)`: the proof doesn't settle it (missing node, malformed node). The caller must
+//!   treat this as "unavailable", never as zero.
+//!
+//! SNAP range proofs carry the nodes for both range boundaries in one list. Nodes are looked up
+//! by hash, so extra nodes are harmless.
+
+use std::collections::HashMap;
+
+use alloy_primitives::{B256, Bytes, keccak256};
+use alloy_rlp::Decodable;
+use alloy_trie::{
+    EMPTY_ROOT_HASH, HashBuilder, Nibbles,
+    nodes::{RlpNode, TrieNode},
+};
+
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum ProofError {
+    #[error("proof is missing node {0}")]
+    MissingNode(B256),
+    #[error("malformed trie node: {0}")]
+    Malformed(String),
+}
+
+pub fn lookup(root: B256, key: B256, proof: &[Bytes]) -> Result<Option<Vec<u8>>, ProofError> {
+    if root == EMPTY_ROOT_HASH {
+        return Ok(None);
+    }
+    let nodes: HashMap<B256, &[u8]> = proof.iter().map(|n| (keccak256(n), n.as_ref())).collect();
+    let path = Nibbles::unpack(key);
+    let mut pos = 0usize;
+    let mut cur: Vec<u8> = nodes.get(&root).ok_or(ProofError::MissingNode(root))?.to_vec();
+    let resolve = |child: &RlpNode| -> Result<Vec<u8>, ProofError> {
+        match child.as_hash() {
+            Some(h) => nodes.get(&h).map(|n| n.to_vec()).ok_or(ProofError::MissingNode(h)),
+            None => Ok(child.to_vec()), // inlined node (< 32 bytes)
+        }
+    };
+    loop {
+        let node = TrieNode::decode(&mut cur.as_slice()).map_err(|e| ProofError::Malformed(e.to_string()))?;
+        match node {
+            TrieNode::EmptyRoot => return Ok(None),
+            TrieNode::Branch(b) => {
+                if pos >= path.len() {
+                    return Err(ProofError::Malformed("branch at end of a hashed key".into()));
+                }
+                let nib = path.get_unchecked(pos);
+                match b.as_ref().children().find(|(i, _)| *i == nib).and_then(|(_, c)| c) {
+                    None => return Ok(None),
+                    Some(child) => {
+                        pos += 1;
+                        cur = resolve(child)?;
+                    }
+                }
+            }
+            TrieNode::Extension(e) => {
+                let rest = path.slice(pos..);
+                if !rest.starts_with(&e.key) {
+                    return Ok(None);
+                }
+                pos += e.key.len();
+                cur = resolve(&e.child)?;
+            }
+            TrieNode::Leaf(l) => {
+                return Ok((path.slice(pos..) == l.key).then_some(l.value));
+            }
+        }
+    }
+}
+
+/// Root of a trie holding exactly `leaves` (hashed key, RLP value). Used when a peer returns a
+/// whole small trie without proof: the response is accepted only if this equals the expected
+/// root.
+pub fn root_of(mut leaves: Vec<(B256, Bytes)>) -> B256 {
+    leaves.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut hb = HashBuilder::default();
+    for (k, v) in &leaves {
+        hb.add_leaf(Nibbles::unpack(k), v);
+    }
+    hb.root()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::U256;
+    use alloy_trie::proof::ProofRetainer;
+
+    /// A storage-like trie of `n` slots (keccak keys, RLP U256 values) and proofs for `targets`.
+    fn trie(n: u64, targets: &[B256]) -> (B256, Vec<(B256, Bytes)>, Vec<Bytes>) {
+        let mut leaves: Vec<(B256, Bytes)> = (1..=n)
+            .map(|i| (keccak256(U256::from(i).to_be_bytes::<32>()), alloy_rlp::encode(U256::from(i * 7)).into()))
+            .collect();
+        leaves.sort_by(|a, b| a.0.cmp(&b.0));
+        let retainer = ProofRetainer::new(targets.iter().map(|t| Nibbles::unpack(t)).collect());
+        let mut hb = HashBuilder::default().with_proof_retainer(retainer);
+        for (k, v) in &leaves {
+            hb.add_leaf(Nibbles::unpack(k), v);
+        }
+        let root = hb.root();
+        let proof = hb.take_proof_nodes().into_nodes_sorted().into_iter().map(|(_, b)| b).collect();
+        (root, leaves, proof)
+    }
+
+    fn key(i: u64) -> B256 {
+        keccak256(U256::from(i).to_be_bytes::<32>())
+    }
+
+    #[test]
+    fn inclusion_and_exclusion() {
+        let (present, absent) = (key(42), key(10_000));
+        let (root, _, proof) = trie(300, &[present, absent]);
+        let v = lookup(root, present, &proof).unwrap().unwrap();
+        assert_eq!(U256::decode(&mut v.as_slice()).unwrap(), U256::from(42 * 7));
+        assert_eq!(lookup(root, absent, &proof).unwrap(), None);
+    }
+
+    #[test]
+    fn missing_or_wrong_proof_is_an_error_not_absence() {
+        let k = key(42);
+        let (root, _, proof) = trie(300, &[k]);
+        // No proof at all.
+        assert!(matches!(lookup(root, k, &[]), Err(ProofError::MissingNode(_))));
+        // A proof for a different trie.
+        let (other_root, _, _) = trie(301, &[k]);
+        assert!(matches!(lookup(other_root, k, &proof), Err(ProofError::MissingNode(_))));
+        // A truncated proof (drop the deepest node).
+        let mut short = proof.clone();
+        short.pop();
+        // Whatever a truncated proof yields, it must never be read as "proven absent".
+        assert!(!matches!(lookup(root, k, &short), Ok(None)));
+    }
+
+    #[test]
+    fn tampered_node_breaks_the_hash_chain() {
+        let k = key(42);
+        let (root, _, mut proof) = trie(300, &[k]);
+        let last = proof.len() - 1;
+        let mut bad = proof[last].to_vec();
+        let n = bad.len();
+        bad[n - 1] ^= 1; // flip the value's last byte
+        proof[last] = bad.into();
+        assert!(matches!(lookup(root, k, &proof), Err(ProofError::MissingNode(_))));
+    }
+
+    #[test]
+    fn empty_root_proves_absence_and_full_trie_root_check() {
+        assert_eq!(lookup(EMPTY_ROOT_HASH, key(1), &[]).unwrap(), None);
+        let (root, leaves, _) = trie(5, &[]);
+        assert_eq!(root_of(leaves.clone()), root);
+        let mut tampered = leaves;
+        tampered[0].1 = alloy_rlp::encode(U256::from(999)).into();
+        assert_ne!(root_of(tampered), root);
+    }
+}

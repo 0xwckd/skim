@@ -7407,6 +7407,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
+ "alloy-trie",
  "futures",
  "parking_lot",
  "serde",

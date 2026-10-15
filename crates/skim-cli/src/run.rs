@@ -36,7 +36,18 @@ pub struct Args {
 
 pub async fn run(args: Args) -> anyhow::Result<()> {
     let net = ElNet::start_sepolia(args.el_port, Vec::new(), false).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-    let sched = Scheduler::new(ElTransport::new(net.clone()), skim_snap::Config::default());
+    let transport = ElTransport::new(net.clone());
+    let rej = transport.rejections.clone();
+    tokio::spawn(async move {
+        use std::sync::atomic::Ordering::Relaxed;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            tracing::info!(no_proof = rej.no_proof.load(Relaxed), bad_proof = rej.bad_proof.load(Relaxed),
+                contradiction = rej.contradiction.load(Relaxed), root_unavailable = rej.root_unavailable.load(Relaxed),
+                "SNAP answers rejected by verification");
+        }
+    });
+    let sched = Scheduler::new(transport, skim_snap::Config::default());
     let store = Store::new(args.window);
     let sim = Simulator::new(
         store.clone(),

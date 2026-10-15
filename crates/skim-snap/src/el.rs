@@ -1,25 +1,133 @@
-//! [`Transport`] over skim's EL network (reth sessions, snap/2).
+//! [`Transport`] over skim's EL network (reth sessions, snap/1 and snap/2), with **verified**
+//! point lookups (PROJECT.md §3.4, §8).
+//!
+//! Every answer is checked against the requested root before it can become state:
+//! - **Account:** a Merkle proof against the state root, for presence or proven absence.
+//! - **Storage slot:** the account is fetched (and verified) first, to learn its storage root.
+//!   Concurrent lookups share that fetch. Then:
+//!   - empty storage trie: every slot is zero
+//!   - otherwise the slot needs a proof against that root (present or proven absent)
+//!   - a proof-less answer is accepted only if it is the whole trie and rebuilds to that root
+//! - **Anything else** is [`AccountAnswer::Unavailable`] / [`SlotAnswer::Unavailable`]: no
+//!   proof, a proof that doesn't settle the key, or a response that contradicts its proof.
+//!   The scheduler retries elsewhere. Nothing unverified ever becomes a value, zero included.
 
-use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+
+use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_rlp::Decodable;
+use alloy_trie::TrieAccount;
+use parking_lot::{Mutex, RwLock};
 use skim_el::{ElNet, ReqError};
+use tokio::sync::OnceCell;
 
-use crate::{AccountAnswer, AccountState, PeerId, SlotAnswer, Transport, TransportError};
+use crate::{AccountAnswer, AccountState, EMPTY_ROOT_HASH, PeerId, SlotAnswer, Transport, TransportError, proof};
+
+/// Answers rejected by verification, by reason (for monitoring).
+#[derive(Debug, Default)]
+pub struct Rejections {
+    pub no_proof: AtomicU64,
+    pub bad_proof: AtomicU64,
+    pub contradiction: AtomicU64,
+    pub root_unavailable: AtomicU64,
+}
+
+type AccountCell = Arc<OnceCell<Option<AccountState>>>;
 
 #[derive(Clone)]
 pub struct ElTransport {
     pub net: ElNet,
     /// Peers the scheduler must not use (experiments, operator policy).
-    pub excluded: std::sync::Arc<parking_lot::RwLock<std::collections::HashSet<PeerId>>>,
+    pub excluded: Arc<RwLock<HashSet<PeerId>>>,
+    pub rejections: Arc<Rejections>,
+    /// Verified accounts by (state root, address, peer), shared by concurrent slot lookups to
+    /// the same peer. Per peer, so one slow peer never blocks lookups routed to others.
+    accounts: Arc<Mutex<HashMap<(B256, Address, PeerId), AccountCell>>>,
 }
 
 impl ElTransport {
     pub fn new(net: ElNet) -> Self {
-        Self { net, excluded: Default::default() }
+        Self { net, excluded: Default::default(), rejections: Default::default(), accounts: Default::default() }
     }
 
     pub fn exclude(&self, peer: PeerId) {
         self.excluded.write().insert(peer);
+    }
+
+    async fn account_verified(&self, peer: PeerId, root: B256, address: Address) -> Result<AccountAnswer, TransportError> {
+        let h = keccak256(address);
+        let m = self.net.account_range(peer, root, h, 512).await.0.map_err(map_err)?;
+        let r = &self.rejections;
+        if m.accounts.is_empty() && m.proof.is_empty() {
+            r.root_unavailable.fetch_add(1, Ordering::Relaxed);
+            return Ok(AccountAnswer::Unavailable);
+        }
+        if m.proof.is_empty() {
+            r.no_proof.fetch_add(1, Ordering::Relaxed);
+            return Ok(AccountAnswer::Unavailable);
+        }
+        let returned = m.accounts.first().filter(|d| d.hash == h).map(|d| d.trie_account());
+        match proof::lookup(root, h, &m.proof) {
+            Ok(Some(leaf)) => {
+                let Ok(acct) = TrieAccount::decode(&mut leaf.as_slice()) else {
+                    r.bad_proof.fetch_add(1, Ordering::Relaxed);
+                    return Ok(AccountAnswer::Unavailable);
+                };
+                if returned.is_some_and(|x| x != acct) {
+                    r.contradiction.fetch_add(1, Ordering::Relaxed);
+                    return Ok(AccountAnswer::Unavailable);
+                }
+                Ok(AccountAnswer::Found(Some(AccountState {
+                    nonce: acct.nonce,
+                    balance: acct.balance,
+                    storage_root: acct.storage_root,
+                    code_hash: acct.code_hash,
+                })))
+            }
+            Ok(None) if returned.is_none() => Ok(AccountAnswer::Found(None)),
+            Ok(None) => {
+                r.contradiction.fetch_add(1, Ordering::Relaxed);
+                Ok(AccountAnswer::Unavailable)
+            }
+            Err(_) => {
+                r.bad_proof.fetch_add(1, Ordering::Relaxed);
+                Ok(AccountAnswer::Unavailable)
+            }
+        }
+    }
+
+    /// The verified account at `root`, fetched once per (root, address, peer) across concurrent
+    /// callers. Failures aren't cached.
+    async fn account_shared(&self, peer: PeerId, root: B256, address: Address) -> Result<Option<Option<AccountState>>, TransportError> {
+        let cell = {
+            let mut map = self.accounts.lock();
+            if map.len() > 8192 {
+                map.retain(|_, c| c.initialized());
+                if map.len() > 8192 {
+                    map.clear();
+                }
+            }
+            map.entry((root, address, peer)).or_default().clone()
+        };
+        let res = cell
+            .get_or_try_init(|| async {
+                match self.account_verified(peer, root, address).await? {
+                    AccountAnswer::Found(a) => Ok(a),
+                    AccountAnswer::Unavailable => Err(TransportError::Other("account unavailable".into())),
+                }
+            })
+            .await;
+        match res {
+            Ok(a) => Ok(Some(*a)),
+            Err(TransportError::Other(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -39,30 +147,72 @@ impl Transport for ElTransport {
     }
 
     async fn account(&self, peer: PeerId, root: B256, address: Address) -> Result<AccountAnswer, TransportError> {
-        let h = keccak256(address);
-        let m = self.net.account_range(peer, root, h, 512).await.0.map_err(map_err)?;
-        if m.accounts.is_empty() && m.proof.is_empty() {
-            return Ok(AccountAnswer::Unavailable);
+        match self.account_shared(peer, root, address).await? {
+            Some(a) => Ok(AccountAnswer::Found(a)),
+            None => Ok(AccountAnswer::Unavailable),
         }
-        Ok(AccountAnswer::Found(m.accounts.first().filter(|d| d.hash == h).map(|d| {
-            let t = d.trie_account();
-            AccountState { nonce: t.nonce, balance: t.balance, storage_root: t.storage_root, code_hash: t.code_hash }
-        })))
     }
 
     async fn storage(&self, peer: PeerId, root: B256, address: Address, slot: U256) -> Result<SlotAnswer, TransportError> {
         let sh = keccak256(slot.to_be_bytes::<32>());
-        let m = self.net.storage_range(peer, root, keccak256(address), sh, 512).await.0.map_err(map_err)?;
-        let first = m.slots.first().and_then(|s| s.first());
-        if first.is_none() && m.proof.is_empty() {
-            return Ok(SlotAnswer::EmptyNoProof);
+        let (acct, resp) =
+            tokio::join!(self.account_shared(peer, root, address), self.net.storage_range(peer, root, keccak256(address), sh, 512));
+        let r = &self.rejections;
+        let storage_root = match acct? {
+            None => return Ok(SlotAnswer::Unavailable),
+            Some(None) => return Ok(SlotAnswer::Found(U256::ZERO)), // proven-absent account
+            Some(Some(a)) if a.storage_root == EMPTY_ROOT_HASH => return Ok(SlotAnswer::Found(U256::ZERO)),
+            Some(Some(a)) => a.storage_root,
+        };
+        let m = resp.0.map_err(map_err)?;
+        let slots = m.slots.into_iter().next().unwrap_or_default();
+        if m.proof.is_empty() {
+            // Only a complete small trie may come without proof: it must rebuild to the root.
+            if slots.is_empty() {
+                r.root_unavailable.fetch_add(1, Ordering::Relaxed);
+                return Ok(SlotAnswer::Unavailable);
+            }
+            let leaves: Vec<(B256, Bytes)> = slots.iter().map(|d| (d.hash, d.data.clone())).collect();
+            if proof::root_of(leaves) != storage_root {
+                r.no_proof.fetch_add(1, Ordering::Relaxed);
+                return Ok(SlotAnswer::Unavailable);
+            }
+            let v = slots.iter().find(|d| d.hash == sh).map(|d| U256::decode(&mut d.data.as_ref()));
+            return match v {
+                None => Ok(SlotAnswer::Found(U256::ZERO)),
+                Some(Ok(v)) => Ok(SlotAnswer::Found(v)),
+                Some(Err(_)) => Ok(SlotAnswer::Unavailable),
+            };
         }
-        Ok(SlotAnswer::Found(
-            first.filter(|d| d.hash == sh).and_then(|d| U256::decode(&mut d.data.as_ref()).ok()).unwrap_or_default(),
-        ))
+        let returned = slots.iter().find(|d| d.hash == sh);
+        match proof::lookup(storage_root, sh, &m.proof) {
+            Ok(Some(leaf)) => {
+                if returned.is_some_and(|d| d.data.as_ref() != leaf.as_slice()) {
+                    r.contradiction.fetch_add(1, Ordering::Relaxed);
+                    return Ok(SlotAnswer::Unavailable);
+                }
+                match U256::decode(&mut leaf.as_slice()) {
+                    Ok(v) => Ok(SlotAnswer::Found(v)),
+                    Err(_) => {
+                        r.bad_proof.fetch_add(1, Ordering::Relaxed);
+                        Ok(SlotAnswer::Unavailable)
+                    }
+                }
+            }
+            Ok(None) if returned.is_none() => Ok(SlotAnswer::Found(U256::ZERO)), // proven absent
+            Ok(None) => {
+                r.contradiction.fetch_add(1, Ordering::Relaxed);
+                Ok(SlotAnswer::Unavailable)
+            }
+            Err(_) => {
+                r.bad_proof.fetch_add(1, Ordering::Relaxed);
+                Ok(SlotAnswer::Unavailable)
+            }
+        }
     }
 
     async fn codes(&self, peer: PeerId, hashes: Vec<B256>) -> Result<Vec<Bytes>, TransportError> {
+        // Codes are content-addressed: the scheduler keys each answer by keccak256(code).
         Ok(self.net.byte_codes(peer, hashes, 2 << 20).await.0.map_err(map_err)?.codes)
     }
 }

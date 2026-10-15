@@ -23,6 +23,7 @@ use parking_lot::Mutex;
 use tokio::sync::{oneshot, Notify};
 
 pub mod el;
+pub mod proof;
 
 pub type PeerId = alloy_primitives::B512;
 
@@ -81,9 +82,11 @@ pub enum AccountAnswer {
 
 #[derive(Debug, Clone)]
 pub enum SlotAnswer {
-    /// Empty without proof: either the root is unavailable at this peer or the storage trie is
-    /// empty. Resolved by asking more peers.
-    EmptyNoProof,
+    /// The peer couldn't (verifiably) answer: root not served yet, missing or bad proof. Never
+    /// a value.
+    Unavailable,
+    /// Verified value; zero only when proven (absent account, empty storage trie, or an
+    /// exclusion proof).
     Found(U256),
 }
 
@@ -526,16 +529,7 @@ impl<T: Transport> Inner<T> {
             },
             Key::Storage { root, address, slot } => match t.storage(peer, root, address, slot).await {
                 Ok(SlotAnswer::Found(v)) => Outcome::Values(vec![(keys[0], Value::Storage(v))]),
-                // Empty without proof is "storage trie empty" only if the account says so;
-                // otherwise this peer can't serve the root (yet). Never guess zero.
-                Ok(SlotAnswer::EmptyNoProof) => match t.account(peer, root, address).await {
-                    Ok(AccountAnswer::Found(None)) => Outcome::Values(vec![(keys[0], Value::Storage(U256::ZERO))]),
-                    Ok(AccountAnswer::Found(Some(a))) if a.storage_root == EMPTY_ROOT_HASH => {
-                        Outcome::Values(vec![(keys[0], Value::Storage(U256::ZERO))])
-                    }
-                    Ok(_) => Outcome::Unavailable,
-                    Err(e) => Outcome::Err(e),
-                },
+                Ok(SlotAnswer::Unavailable) => Outcome::Unavailable,
                 Err(e) => Outcome::Err(e),
             },
             Key::Code(_) => {
