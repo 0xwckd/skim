@@ -41,6 +41,10 @@ const BLOCK_CACHE: usize = 128;
 /// Re-broadcast interval and give-up time for sent transactions.
 const REBROADCAST: Duration = Duration::from_secs(12);
 const SENT_TTL: Duration = Duration::from_secs(30 * 60);
+/// Passes over the connected peers before a fetch reports "unavailable", with growing pauses
+/// (peers come and go, and a busy one may answer a moment later).
+const PASSES: u32 = 3;
+const PASS_BACKOFF: Duration = Duration::from_millis(500);
 
 #[derive(Debug)]
 pub enum DataError {
@@ -287,35 +291,43 @@ impl ChainData {
             }
             let want = (oldest - number).min(256);
             let mut done = false;
-            for p in self.peers().into_iter().take(4) {
-                let hs = match self.net.headers_falling(p, parent.into(), want).await {
-                    (Ok(hs), _) => hs,
-                    (Err(e), _) => {
-                        tracing::debug!(peer = %p, "headers: {e}");
+            for pass in 0..PASSES {
+                if pass > 0 {
+                    tokio::time::sleep(PASS_BACKOFF * pass).await;
+                }
+                for p in self.peers().into_iter().take(4) {
+                    let hs = match self.net.headers_falling(p, parent.into(), want).await {
+                        (Ok(hs), _) => hs,
+                        (Err(e), _) => {
+                            tracing::debug!(peer = %p, "headers: {e}");
+                            continue;
+                        }
+                    };
+                    // Accept only a hash-linked chain ending at our oldest header.
+                    let mut expect = parent;
+                    let mut ok = Vec::new();
+                    for h in hs {
+                        let hh = h.hash_slow();
+                        if hh != expect {
+                            break;
+                        }
+                        expect = h.parent_hash;
+                        ok.push((hh, h));
+                    }
+                    if ok.is_empty() {
+                        tracing::debug!(peer = %p, "headers: response does not link to our oldest header");
                         continue;
                     }
-                };
-                // Accept only a hash-linked chain ending at our oldest header.
-                let mut expect = parent;
-                let mut ok = Vec::new();
-                for h in hs {
-                    let hh = h.hash_slow();
-                    if hh != expect {
-                        break;
+                    let mut g = self.inner.write();
+                    for (hh, h) in ok {
+                        g.headers.insert(h.number, (hh, Arc::new(h)));
                     }
-                    expect = h.parent_hash;
-                    ok.push((hh, h));
+                    done = true;
+                    break;
                 }
-                if ok.is_empty() {
-                    tracing::debug!(peer = %p, "headers: response does not link to our oldest header");
-                    continue;
+                if done {
+                    break;
                 }
-                let mut g = self.inner.write();
-                for (hh, h) in ok {
-                    g.headers.insert(h.number, (hh, Arc::new(h)));
-                }
-                done = true;
-                break;
             }
             if !done {
                 return Err(DataError::Unavailable(format!("headers below {oldest} not served by peers")));
@@ -329,26 +341,31 @@ impl ChainData {
         if let Some(b) = self.bodies.lock().get(&hash) {
             return Ok(b);
         }
-        for p in self.peers().into_iter().take(5) {
-            let mut bodies = match self.net.bodies(p, vec![hash]).await {
-                (Ok(b), _) => b,
-                (Err(e), _) => {
-                    tracing::debug!(peer = %p, number = header.number, "bodies: {e}");
+        for pass in 0..PASSES {
+            if pass > 0 {
+                tokio::time::sleep(PASS_BACKOFF * pass).await;
+            }
+            for p in self.peers().into_iter().take(5) {
+                let mut bodies = match self.net.bodies(p, vec![hash]).await {
+                    (Ok(b), _) => b,
+                    (Err(e), _) => {
+                        tracing::debug!(peer = %p, number = header.number, "bodies: {e}");
+                        continue;
+                    }
+                };
+                let Some(body) = bodies.pop() else { continue };
+                let raw: Vec<Bytes> = body.transactions.iter().map(|t| Bytes::from(t.encoded_2718())).collect();
+                let root = ordered_trie_root_with_encoder(&raw, |t: &Bytes, buf| buf.extend_from_slice(t));
+                if root != header.transactions_root {
+                    tracing::debug!(peer = %p, number = header.number, "body does not match transactions_root");
                     continue;
                 }
-            };
-            let Some(body) = bodies.pop() else { continue };
-            let raw: Vec<Bytes> = body.transactions.iter().map(|t| Bytes::from(t.encoded_2718())).collect();
-            let root = ordered_trie_root_with_encoder(&raw, |t: &Bytes, buf| buf.extend_from_slice(t));
-            if root != header.transactions_root {
-                tracing::debug!(peer = %p, number = header.number, "body does not match transactions_root");
-                continue;
+                let raw = Arc::new(raw);
+                self.bodies.lock().put(hash, raw.clone());
+                let mut g = self.inner.write();
+                self.index_txs(&mut g, header.number, hash, tx_hashes(&raw));
+                return Ok(raw);
             }
-            let raw = Arc::new(raw);
-            self.bodies.lock().put(hash, raw.clone());
-            let mut g = self.inner.write();
-            self.index_txs(&mut g, header.number, hash, tx_hashes(&raw));
-            return Ok(raw);
         }
         Err(DataError::Unavailable(format!("block {} body not served by peers", header.number)))
     }
@@ -361,22 +378,27 @@ impl ChainData {
         if let Some(r) = self.receipts.lock().get(&hash) {
             return Ok(r);
         }
-        for p in self.peers().into_iter().take(6) {
-            let (r, d) = match self.net.block_receipts(p, hash).await {
-                (Ok(r), d) => (r, d),
-                (Err(e), _) => {
-                    tracing::debug!(peer = %p, number = header.number, "receipts: {e}");
+        for pass in 0..PASSES {
+            if pass > 0 {
+                tokio::time::sleep(PASS_BACKOFF * pass).await;
+            }
+            for p in self.peers().into_iter().take(6) {
+                let (r, d) = match self.net.block_receipts(p, hash).await {
+                    (Ok(r), d) => (r, d),
+                    (Err(e), _) => {
+                        tracing::debug!(peer = %p, number = header.number, "receipts: {e}");
+                        continue;
+                    }
+                };
+                if Receipt::calculate_receipt_root_no_memo(&r) != header.receipts_root {
+                    tracing::debug!(peer = %p, number = header.number, n = r.len(), "receipts do not match receipts_root");
                     continue;
                 }
-            };
-            if Receipt::calculate_receipt_root_no_memo(&r) != header.receipts_root {
-                tracing::debug!(peer = %p, number = header.number, n = r.len(), "receipts do not match receipts_root");
-                continue;
+                tracing::debug!(number = header.number, n = r.len(), ms = d.as_millis() as u64, "receipts fetched");
+                let r = Arc::new(r);
+                self.receipts.lock().put(hash, r.clone());
+                return Ok(r);
             }
-            tracing::debug!(number = header.number, n = r.len(), ms = d.as_millis() as u64, "receipts fetched");
-            let r = Arc::new(r);
-            self.receipts.lock().put(hash, r.clone());
-            return Ok(r);
         }
         Err(DataError::Unavailable(format!("block {} receipts not served by peers", header.number)))
     }
