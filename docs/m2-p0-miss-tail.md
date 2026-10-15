@@ -43,3 +43,21 @@ The first run of A produced **28 output mismatches vs Infura**. The scheduler ha
 1. **Input-aware range:** estimate how far a swap can move the price from `amount` and the current liquidity, and prefetch the bitmap words up to that point.
 2. **Miss expansion:** when a miss is a bitmap word outside the window, fetch the whole contiguous word range from the current word to the missed one in one wave, instead of discovering it word by word.
 3. Fold the learned set, the V3 prediction and miss expansion into one **State Access Predictor** (the user's proposal): input → predicted keys → async prefetch → MVCC → revm.
+
+## P3: removing the top-serving peer (`probe-call --soak --drop-top-after 50`)
+- **Setup:** 120 blocks of steady-state hinted calls on public peers (7 calls per block, each one fetch wave).
+- **Intervention:** at iteration 50 the scheduler stopped using the peer that had served the most requests (19,714, EWMA 105 ms).
+- **Data:** `data/drop-top.*`.
+
+The SNAP pool grew from 5 to 22 peers during the run. Windows with a similar pool size are compared:
+
+| Window | SNAP peers | Runs | Wall P50 / P95 / P99 / max (ms) |
+|---|---|---|---|
+| Iterations 30–49 (top peer in use) | 12–14 | 140 | 307 / 760 / 985 / 1,007 |
+| Iterations 51–70 (top peer excluded) | 13–19 | 140 | 319 / 754 / 937 / 955 |
+
+- **Completion:** 833 / 833 hinted runs completed, all at k=1, before and after the drop.
+- **Load:** the next peer took about 10k requests and the rest spread across the pool.
+- **Latency:** no measurable change (P50 +12 ms, P99 −48 ms).
+
+**Limitation:** the pool was large (12–22 SNAP peers). The earlier soak sometimes had only 2–4 SNAP peers. Losing the top peer in a pool that small would likely raise the tail, which this run doesn't test.
