@@ -194,8 +194,9 @@ pub async fn refresh_pool(
     pool: &V3Pool,
     (lo, hi): (i32, i32),
     budget: usize,
-) -> Vec<Resolve> {
+) -> (Vec<Resolve>, Vec<StateKey>) {
     let mut rounds = Vec::new();
+    let mut fetched = Vec::new();
     let mut spent = 0usize;
     for _ in 0..3 {
         if spent >= budget {
@@ -229,6 +230,7 @@ pub async fn refresh_pool(
             break;
         }
         spent += unknown.len();
+        fetched.extend(unknown.iter().copied());
         let mut accounts = Vec::new();
         let mut storage = Vec::new();
         for k in unknown {
@@ -243,7 +245,7 @@ pub async fn refresh_pool(
         }
         rounds.push(resolve_with(store, sched, at, &accounts, &storage, &[], Priority::Low).await);
     }
-    rounds
+    (rounds, fetched)
 }
 
 /// `tickSpacing()` decoded from a call's output (int24 ABI-encoded).

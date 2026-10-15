@@ -49,6 +49,18 @@ pub enum StateError {
     OutOfWindow(u64),
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StoreSizes {
+    pub chain: usize,
+    pub recent_bals: usize,
+    pub keys: usize,
+    pub versions: usize,
+    pub watched_keys: usize,
+    pub watched_addresses: usize,
+    pub code: usize,
+    pub code_bytes: usize,
+}
+
 /// Emitted after each applied block.
 #[derive(Debug, Clone)]
 pub struct StateReady {
@@ -186,6 +198,21 @@ impl Store {
             st.put(key, n, v);
         }
         Ok(())
+    }
+
+    /// Sizes of the store's structures (for growth monitoring).
+    pub fn sizes(&self) -> StoreSizes {
+        let st = self.inner.read();
+        StoreSizes {
+            chain: st.chain.len(),
+            recent_bals: st.recent.len(),
+            keys: st.versions.len(),
+            versions: st.versions.values().map(Vec::len).sum(),
+            watched_keys: st.watched_keys.len(),
+            watched_addresses: st.watched_addresses.len(),
+            code: st.code.len(),
+            code_bytes: st.code.values().map(|c| c.len()).sum(),
+        }
     }
 
     pub fn code(&self, hash: &B256) -> Option<Bytes> {

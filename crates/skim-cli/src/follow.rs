@@ -256,6 +256,11 @@ struct Stats {
     predicted_keys: u64,
     predicted_unknown: u64,
     prefetch_skipped: u64,
+    call_lat: Samples,
+    local_ok: u64,
+    local_fail: u64,
+    slow_calls: u64,
+    oracle_checked: u64,
     predict_keys: u64,
     predict_wall: Samples,
     prefetch_keys: u64,
@@ -282,6 +287,9 @@ struct Ctx {
     adaptive_window: bool,
     prefetch_budget: usize,
     infura_every: u64,
+    /// Keys fetched by background prefetch -> whether any simulation has read them since.
+    prefetched: StdMutex<HashMap<StateKey, bool>>,
+    health_out: StdMutex<std::io::BufWriter<std::fs::File>>,
 }
 
 /// First successful Infura `eth_call` at a block number: when that request was sent (an upper
@@ -373,6 +381,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         adaptive_window: args.adaptive_window,
         prefetch_budget: args.prefetch_budget,
         infura_every: args.infura_every.max(1),
+        prefetched: Default::default(),
+        health_out: StdMutex::new(std::io::BufWriter::new(std::fs::File::create(format!("{}.health", args.out))?)),
         predictor: args.predictor.then(|| {
             StdMutex::new(skim_sim::predictor::Predictor {
                 learned: skim_sim::learned::Learned::new(8, 0.5, 256),
@@ -462,6 +472,9 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             _ => {}
         }
         followed += 1;
+        if followed % 10 == 0 {
+            write_health(&ctx, &b);
+        }
         if (b.number + 1) % ctx.infura_every == 0 {
             spawn_poller(&ctx, b.number + 1, b.timestamp + 12);
         }
@@ -500,6 +513,45 @@ async fn bootstrap(ctx: &Ctx, h: &Header, b: &BlockRef) {
     }
     let head = ctx.store.head().map(|h| h.number);
     tracing::info!(at = b.number, ?head, "bootstrap complete; following");
+}
+
+/// Periodic growth / stability record (`<out>.health`).
+fn write_health(ctx: &Ctx, b: &BlockRef) {
+    use std::io::Write;
+    let sizes = ctx.store.sizes();
+    let learned = ctx.predictor.as_ref().map(|p| p.lock().unwrap().learned.sizes());
+    let peers = ctx.sched.peer_stats();
+    let mut ewma: Vec<f64> = peers.values().map(|p| p.ewma_ms).filter(|x| *x > 0.0).collect();
+    ewma.sort_by(|a, b| a.total_cmp(b));
+    let snap_peers = ctx.net.peers().iter().filter(|(_, p)| p.snap1 || p.snap2).count();
+    let (q_hi, q_lo) = ctx.sched.queue_lens();
+    let rej = &ctx.sched.transport().rejections;
+    use std::sync::atomic::Ordering::Relaxed;
+    let (pf_n, pf_used) = {
+        let pf = ctx.prefetched.lock().unwrap();
+        (pf.len(), pf.values().filter(|u| **u).count())
+    };
+    let s = ctx.stats.lock().unwrap();
+    let rec = serde_json::json!({
+        "t": unix_ms(SystemTime::now()) / 1e3, "number": b.number,
+        "store": {"chain": sizes.chain, "recent_bals": sizes.recent_bals, "keys": sizes.keys, "versions": sizes.versions,
+                  "watched_keys": sizes.watched_keys, "code": sizes.code, "code_bytes": sizes.code_bytes},
+        "learned": learned.map(|(e, ek, sh, sk)| serde_json::json!({"exact": e, "exact_keys": ek, "shapes": sh, "shape_keys": sk})),
+        "peers": {"snap_connected": snap_peers, "scheduler_known": peers.len(),
+                  "ewma_p50_ms": ewma.get(ewma.len() / 2), "ewma_p90_ms": ewma.get(ewma.len() * 9 / 10)},
+        "scheduler": ctx.sched.stats(), "queues": {"high": q_hi, "low": q_lo},
+        "rejections": {"no_proof": rej.no_proof.load(Relaxed), "bad_proof": rej.bad_proof.load(Relaxed),
+                       "contradiction": rej.contradiction.load(Relaxed), "root_unavailable": rej.root_unavailable.load(Relaxed)},
+        "prefetch": {"tracked": pf_n, "used": pf_used, "keys_total": s.prefetch_keys},
+        "calls": {"run": s.calls_run, "local_ok": s.local_ok, "local_fail": s.local_fail, "over_1s": s.slow_calls,
+                  "p99_ms": s.call_lat.pct(99.0)},
+        "oracle": {"checked": s.oracle_checked, "disagree": s.match_fail},
+    });
+    drop(s);
+    let mut o = ctx.health_out.lock().unwrap();
+    let _ = serde_json::to_writer(&mut *o, &rec);
+    let _ = o.write_all(b"\n");
+    let _ = o.flush();
 }
 
 /// Splits predicted keys into the accounts and slots that are still unknown at `snap`.
@@ -584,7 +636,20 @@ fn spawn_prefetch(ctx: &Arc<Ctx>, b: BlockRef) {
                 Some(p) if ctx.adaptive_window => p.lock().unwrap().window(&pool.address),
                 _ => (-ctx.v3_words, ctx.v3_words),
             };
-            let rounds = prefetch::refresh_pool(&ctx.store, &ctx.sched, &b, &at, &pool, window, ctx.prefetch_budget).await;
+            let (rounds, fetched) = prefetch::refresh_pool(&ctx.store, &ctx.sched, &b, &at, &pool, window, ctx.prefetch_budget).await;
+            {
+                let mut pf = ctx.prefetched.lock().unwrap();
+                if pf.len() > 500_000 {
+                    pf.clear(); // bounded; efficiency is also logged per health interval
+                }
+                for k in fetched {
+                    let k = match k {
+                        StateKey::Nonce(a) | StateKey::CodeHash(a) => StateKey::Balance(a),
+                        k => k,
+                    };
+                    pf.entry(k).or_insert(false);
+                }
+            }
             let mut s = ctx.stats.lock().unwrap();
             for r in rounds {
                 s.prefetch_rounds += 1;
@@ -605,6 +670,8 @@ async fn measure_block(ctx: Arc<Ctx>, h: Header, b: BlockRef, recv_ms: f64, appl
     let mut resolved = 0u64;
     let mut miss_log = Vec::new();
     for call in &calls {
+        let t_call = Instant::now();
+        let (mut predict_ms, mut miss_ms, mut queue_max, mut service_max) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
         // State Access Predictor: fetch the predicted-but-unknown keys in one wave first.
         if let Some(p) = &ctx.predictor {
             let input = skim_sim::CallInput { to: call.to, data: call.data.clone() };
@@ -621,6 +688,9 @@ async fn measure_block(ctx: Arc<Ctx>, h: Header, b: BlockRef, recv_ms: f64, appl
             }
             if !accts.is_empty() || !slots.is_empty() {
                 let r = prefetch::resolve(&ctx.store, &ctx.sched, &at, &accts, &slots, &[]).await;
+                predict_ms += r.wall_ms;
+                queue_max = queue_max.max(r.queue_ms_max);
+                service_max = service_max.max(r.service_ms_max);
                 let mut s = ctx.stats.lock().unwrap();
                 s.predict_waves += 1;
                 s.predict_keys += r.keys as u64;
@@ -655,6 +725,9 @@ async fn measure_block(ctx: Arc<Ctx>, h: Header, b: BlockRef, recv_ms: f64, appl
             }
             resolved += (m.accounts.len() + m.storage.len()) as u64;
             let r = prefetch::resolve(&ctx.store, &ctx.sched, &at, &m.accounts, &m.storage, &m.code).await;
+            miss_ms += r.wall_ms;
+            queue_max = queue_max.max(r.queue_ms_max);
+            service_max = service_max.max(r.service_ms_max);
             let t2 = Instant::now();
             (out, m) = simulate(&snap, &h, call);
             let rerun_us = t2.elapsed().as_secs_f64() * 1e6;
@@ -669,10 +742,45 @@ async fn measure_block(ctx: Arc<Ctx>, h: Header, b: BlockRef, recv_ms: f64, appl
             }
             miss_log.push(serde_json::json!({"call": call.name, "round": round, "rerun_us": rerun_us, "resolve": r}));
         }
+        let call_ms = t_call.elapsed().as_secs_f64() * 1e3;
+        let local_ok = out.is_some() && m.accounts.is_empty() && m.storage.is_empty() && m.code.is_empty();
         {
             let mut s = ctx.stats.lock().unwrap();
             s.calls_run += 1;
             s.calls_with_miss += had_miss as u64;
+            s.call_lat.push_ms(call_ms);
+            if local_ok { s.local_ok += 1 } else { s.local_fail += 1 }
+            if call_ms > 1000.0 {
+                s.slow_calls += 1;
+            }
+        }
+        if call_ms > 1000.0 {
+            let cause = if predict_ms + miss_ms < 0.5 * call_ms {
+                "local/other"
+            } else if queue_max > service_max {
+                "queue (peer capacity)"
+            } else {
+                "network service"
+            };
+            ctx.log(serde_json::json!({"ev": "slow_call", "number": b.number, "call": call.name, "call_ms": call_ms,
+                "predict_ms": predict_ms, "miss_ms": miss_ms, "queue_ms_max": queue_max, "service_ms_max": service_max,
+                "miss_rounds": had_miss, "cause": cause}));
+        }
+        // Prefetch efficiency: mark background-prefetched keys this call actually read.
+        {
+            let mut pf = ctx.prefetched.lock().unwrap();
+            if !pf.is_empty() {
+                for a in &m.touched_accounts {
+                    if let Some(u) = pf.get_mut(&StateKey::Balance(*a)) {
+                        *u = true;
+                    }
+                }
+                for (a, sl) in &m.touched_storage {
+                    if let Some(u) = pf.get_mut(&StateKey::Storage(*a, *sl)) {
+                        *u = true;
+                    }
+                }
+            }
         }
         if let Some(p) = &ctx.predictor {
             let mut ta = m.touched_accounts.clone();
@@ -721,6 +829,7 @@ async fn measure_block(ctx: Arc<Ctx>, h: Header, b: BlockRef, recv_ms: f64, appl
         s.misses_resolved += resolved;
         s.match_ok += matches;
         s.match_fail += mismatches;
+        s.oracle_checked += (matches + mismatches) as u64;
         if let Some(p) = poll {
             s.infura_polled += 1;
             s.infura_ready.push_ms(p.first_ok_sent_ms - slot0);
@@ -748,6 +857,11 @@ async fn measure_block(ctx: Arc<Ctx>, h: Header, b: BlockRef, recv_ms: f64, appl
 }
 
 fn report(ctx: &Ctx) {
+    let prefetch_eff = {
+        let pf = ctx.prefetched.lock().unwrap();
+        let used = pf.values().filter(|u| **u).count();
+        serde_json::json!({"tracked_keys": pf.len(), "used": used})
+    };
     let s = ctx.stats.lock().unwrap();
     let summary = serde_json::json!({
         "blocks": s.blocks, "from_gossip": s.from_gossip, "from_el_fill": s.from_el_fill, "reorgs": s.reorgs,
@@ -771,6 +885,11 @@ fn report(ctx: &Ctx) {
         "prefetch_hit_rate": if s.predicted_keys > 0 { 1.0 - s.predicted_unknown as f64 / s.predicted_keys as f64 } else { 0.0 },
         "predict_waves": s.predict_waves, "predict_keys": s.predict_keys, "predict_wall": s.predict_wall.json(),
         "prefetch_skipped": s.prefetch_skipped,
+        "call_latency": {"p50_ms": s.call_lat.pct(50.0), "p95_ms": s.call_lat.pct(95.0), "p99_ms": s.call_lat.pct(99.0),
+            "p999_ms": s.call_lat.pct(99.9), "max_ms": s.call_lat.pct(100.0), "n": s.call_lat.len(), "over_1s": s.slow_calls},
+        "local_success": {"ok": s.local_ok, "failed": s.local_fail},
+        "oracle": {"checked": s.oracle_checked, "agree": s.match_ok, "disagree": s.match_fail},
+        "prefetch_efficiency": prefetch_eff,
         "peers": ctx.sched.peer_stats().into_iter().map(|(id, p)| (format!("{id:.10}"), serde_json::json!({"limit": p.limit, "ewma_ms": p.ewma_ms, "ok": p.ok, "errors": p.errors}))).collect::<std::collections::HashMap<_, _>>(),
         "prefetch_rounds": s.prefetch_rounds, "prefetch_keys": s.prefetch_keys, "prefetch_wall": s.prefetch_wall.json(),
         "outputs_match": s.match_ok, "outputs_mismatch": s.match_fail,

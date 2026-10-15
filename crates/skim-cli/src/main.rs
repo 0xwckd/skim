@@ -1,3 +1,4 @@
+#![recursion_limit = "512"]
 //! `skim` command line. For now: M0 probes (PROJECT.md §10).
 
 mod bench_node;

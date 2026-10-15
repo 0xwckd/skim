@@ -32,11 +32,18 @@ pub struct Args {
     /// Blocks of history kept for reads and reorgs.
     #[arg(long, default_value_t = 256)]
     window: u64,
+    /// Never use these peers (hex node ids) for SNAP state, e.g. a node being benchmarked
+    /// against skim on the same host. Repeatable.
+    #[arg(long = "exclude-snap-peer")]
+    exclude_snap_peer: Vec<alloy_primitives::B512>,
 }
 
 pub async fn run(args: Args) -> anyhow::Result<()> {
     let net = ElNet::start_sepolia(args.el_port, Vec::new(), false).await.map_err(|e| anyhow::anyhow!("{e}"))?;
     let transport = ElTransport::new(net.clone());
+    for p in &args.exclude_snap_peer {
+        transport.exclude(*p);
+    }
     let rej = transport.rejections.clone();
     tokio::spawn(async move {
         use std::sync::atomic::Ordering::Relaxed;
