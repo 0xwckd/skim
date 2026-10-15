@@ -97,6 +97,21 @@ impl ElNet {
         trusted: Vec<TrustedPeer>,
         trusted_only: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::start_sepolia_with_key(listen_port, trusted, trusted_only, None).await
+    }
+
+    /// [`Self::start_sepolia`] with a fixed node key (32 secret bytes), so a restarted node keeps
+    /// its identity and peers recognise it. `None` generates a fresh key.
+    pub async fn start_sepolia_with_key(
+        listen_port: u16,
+        trusted: Vec<TrustedPeer>,
+        trusted_only: bool,
+        node_key: Option<[u8; 32]>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let secret = match node_key {
+            Some(k) => reth_network::config::SecretKey::from_byte_array(&k)?,
+            None => rng_secret_key(),
+        };
         let spec: Arc<ChainSpec> = SEPOLIA.clone();
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         // Advertise a current fork id (Amsterdam) while claiming no synced chain beyond genesis.
@@ -109,7 +124,7 @@ impl ElNet {
         };
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], listen_port));
         let snap1 = snap1::Snap1Peers::default();
-        let config = NetworkConfig::builder(rng_secret_key(), reth_tasks::Runtime::test())
+        let config = NetworkConfig::builder(secret, reth_tasks::Runtime::test())
             .sepolia_boot_nodes()
             .listener_addr(addr)
             .discovery_addr(addr)
@@ -447,5 +462,24 @@ impl ElNet {
             self.handle.send_transactions(*p, txs.clone());
         }
         peers.len()
+    }
+
+    /// Connected peers worth reconnecting to after a restart (real clients on eth/69+):
+    /// `(node id, address)`.
+    pub fn good_peers(&self) -> Vec<(PeerId, std::net::SocketAddr)> {
+        self.peers
+            .read()
+            .iter()
+            .filter(|(_, p)| p.eth_version >= 69 && !p.client.starts_with("enrscout"))
+            .map(|(id, p)| (*id, p.remote_addr))
+            .collect()
+    }
+
+    /// Dials previously good peers (their addresses may be stale; failed dials are harmless).
+    pub fn add_peers(&self, peers: &[(PeerId, std::net::SocketAddr)]) {
+        use reth_network_api::Peers;
+        for (id, addr) in peers {
+            self.handle.add_peer(*id, *addr);
+        }
     }
 }

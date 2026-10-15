@@ -84,7 +84,7 @@ All numbers are from Sepolia, measured from one home connection over public peer
 | **Warm simulation** | 7 calls (incl. Uniswap V3 quotes) in **3.8 ms** total; JSON-RPC `eth_call` in 0.5–6 ms |
 | **Fetch reliability** | 298,084 SNAP jobs over public peers, **0 failed**, 126 disconnects absorbed ([soak](docs/experiments/m0-soak.md)) |
 | **Unseen inputs** | Background prefetch had **99.9%** of predicted keys ready at call time. Worst on-path fetch: 1.6 s ([P1](docs/experiments/m2-p0-miss-tail.md)). |
-| **Footprint** | ~120 MB RSS, ~0.25 CPU core, **0 bytes of disk** |
+| **Footprint** | ~120 MB RSS, ~0.25 CPU core. On disk: a restart snapshot of subscribed state (~1 MB for 2,400 keys; `--ephemeral` for none) |
 
 What skim is **not**: faster than an in-process full node on raw execution, or a trustless light client (yet). It saves *resources* while keeping simulation quality close to a node's. Part of the saving is work that public SNAP peers do on skim's behalf.
 

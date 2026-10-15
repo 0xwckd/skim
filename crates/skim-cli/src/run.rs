@@ -51,15 +51,22 @@ pub struct Args {
     #[arg(long, default_value_t = 2048)]
     max_logs_range: u64,
     /// Consensus-layer gossip mesh degree (more = more eager-push paths for new payloads).
-    #[arg(long, default_value_t = 12)]
+    #[arg(long, default_value_t = 8)]
     cl_mesh: usize,
     /// Consensus-layer peers to keep (more = better odds of being close to each publisher).
-    #[arg(long, default_value_t = 80)]
+    #[arg(long, default_value_t = 50)]
     cl_peers: usize,
     /// EL peers to keep connected (enode URLs), e.g. your own node as a dependable state source.
     /// Answers are still Merkle-proof checked. Repeatable.
     #[arg(long = "trusted-peer")]
     trusted_peer: Vec<skim_el::TrustedPeer>,
+    /// Directory for restart data: a snapshot of subscribed state, the EL node key and known
+    /// peers (a few MB at most). Default: `$HOME/.skim/sepolia`.
+    #[arg(long)]
+    data_dir: Option<std::path::PathBuf>,
+    /// Keep nothing on disk (every start begins empty, with a new node identity).
+    #[arg(long)]
+    ephemeral: bool,
     /// Disable the learned-set pattern tier (A/B measurements).
     #[arg(long)]
     no_learned_patterns: bool,
@@ -147,7 +154,36 @@ fn hundred_k() -> usize {
 }
 
 pub async fn run(args: Args) -> anyhow::Result<()> {
-    let net = ElNet::start_sepolia(args.el_port, args.trusted_peer.clone(), false).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let persist = if args.ephemeral {
+        None
+    } else {
+        let dir = args.data_dir.clone().unwrap_or_else(|| {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".skim/sepolia")
+        });
+        Some(Arc::new(skim_state::persist::Persist::open(dir.join("restart.redb"))?))
+    };
+    let node_key = match &persist {
+        Some(p) => Some(crate::persist::node_key(p)?),
+        None => None,
+    };
+    let net = ElNet::start_sepolia_with_key(args.el_port, args.trusted_peer.clone(), false, node_key)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let saved = match &persist {
+        Some(p) => {
+            net.add_peers(&crate::persist::load_peers(p));
+            crate::persist::spawn_peer_saver(p.clone(), net.clone());
+            p.load().unwrap_or_else(|e| {
+                tracing::warn!("restart snapshot unreadable, starting empty: {e}");
+                None
+            })
+        }
+        None => None,
+    };
+    if let Some(s) = &saved {
+        tracing::info!(block = s.number, keys = s.values.len(), "restart snapshot found; will verify and replay it to the head");
+    }
+    let mut saved = saved;
     let transport = ElTransport::new(net.clone());
     for p in &args.exclude_snap_peer {
         transport.exclude(*p);
@@ -236,7 +272,13 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     };
     tracing::info!("following Sepolia from CL gossip; RPC answers once the first block is applied");
 
-    while let Some(ev) = rx.recv().await {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    loop {
+        let ev = tokio::select! {
+            ev = rx.recv() => match ev { Some(ev) => ev, None => break },
+            _ = tokio::signal::ctrl_c() => break,
+            _ = term.recv() => break,
+        };
         let ClEvent::Gossip { topic, data, received, .. } = ev else { continue };
         if topic != "execution_payload" {
             continue;
@@ -264,6 +306,14 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         match chain.place(v.header, Arc::new(writes)).await {
             Placed::Applied { ready, reorged_to, filled } => {
                 tracing::info!(number, arrival_ms = arrival_ms as i64, changed = ready.changed_keys.len(), ?reorged_to, filled, "state ready");
+                if let Some(s) = saved.take() {
+                    tokio::spawn(crate::persist::restore(store.clone(), net.clone(), s, ready.block));
+                }
+                if let Some(p) = &persist
+                    && number % 4 == 0
+                {
+                    crate::persist::save_now(p, &store, &ready.block);
+                }
                 if let Some(v) = &v3 {
                     tokio::spawn(v3_tick(sim.clone(), v.clone(), v3_state.clone(), ready.block));
                 }
@@ -280,6 +330,10 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             Placed::Duplicate => {}
             Placed::Deferred(why) => tracing::debug!(number, "deferred: {why}"),
         }
+    }
+    if let (Some(p), Some(head)) = (&persist, store.head()) {
+        crate::persist::save_now(p, &store, &head);
+        tracing::info!(block = head.number, "shutting down; restart snapshot saved");
     }
     Ok(())
 }

@@ -190,7 +190,7 @@
 <g class="a53">
 <text x="640" y="110" class="h1" text-anchor="middle">Sync (and archive) only what you need</text>
 <g class="a54"><rect x="100" y="200" width="240" height="170" rx="18" class="card"/><text x="220" y="285" class="big" text-anchor="middle">~90 MB</text><text x="220" y="325" class="bs" text-anchor="middle">memory</text></g>
-<g class="a55"><rect x="380" y="200" width="240" height="170" rx="18" class="card"/><text x="500" y="285" class="big" text-anchor="middle">0 bytes</text><text x="500" y="325" class="bs" text-anchor="middle">on disk</text></g>
+<g class="a55"><rect x="380" y="200" width="240" height="170" rx="18" class="card"/><text x="500" y="285" class="big" text-anchor="middle">~1 MB</text><text x="500" y="325" class="bs" text-anchor="middle">on disk</text></g>
 <g class="a56"><rect x="660" y="200" width="240" height="170" rx="18" class="card"/><text x="780" y="285" class="big" text-anchor="middle">~3 ms</text><text x="780" y="325" class="bs" text-anchor="middle">eth_call, local</text></g>
 <g class="a57"><rect x="940" y="200" width="240" height="170" rx="18" class="card"/><text x="1060" y="285" class="big" text-anchor="middle">0.16 ms</text><text x="1060" y="325" class="bs" text-anchor="middle">to apply a block</text></g>
 <text x="640" y="540" class="tag2 a58" text-anchor="middle">No more RPC subscriptions. P2P, with verification.</text>

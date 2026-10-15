@@ -4,6 +4,7 @@
 mod bench_node;
 mod chain;
 mod chaindata;
+mod persist;
 mod follow;
 mod probe_cl;
 mod probe_call;

@@ -128,7 +128,7 @@ add('</g>')
 S4 = show(25.7, 31.9)
 add(f'<g class="{S4}">')
 add('<text x="640" y="110" class="h1" text-anchor="middle">Sync (and archive) only what you need</text>')
-stats = [("~90 MB", "memory", 26.2), ("0 bytes", "on disk", 26.7), ("~3 ms", "eth_call, local", 27.2), ("0.16 ms", "to apply a block", 27.7)]
+stats = [("~90 MB", "memory", 26.2), ("~1 MB", "on disk", 26.7), ("~3 ms", "eth_call, local", 27.2), ("0.16 ms", "to apply a block", 27.7)]
 for i, (big, small, t) in enumerate(stats):
     x = 220 + i * 280
     add(f'<g class="{rise(t, 31.9)}"><rect x="{x-120}" y="200" width="240" height="170" rx="18" class="card"/>'

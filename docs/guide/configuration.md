@@ -72,9 +72,21 @@ predictors:
 | `--archive-backfill <blocks>` | `0` | extend archived history backwards from retained BALs (~2 weeks) |
 | `--max-logs-range <blocks>` | `2048` | largest range one `eth_getLogs` may scan |
 | `--exclude-snap-peer <node-id>` | none | never use this peer for state (e.g. a node you benchmark against); repeatable |
+| `--data-dir <path>` | `~/.skim/sepolia` | restart data: snapshot of subscribed state, EL node key, known peers |
+| `--ephemeral` | off | keep nothing on disk; every start begins empty with a new node identity |
+| `--trusted-peer <enode>` | none | EL peer to keep connected, e.g. your own node (answers are still proof-checked); repeatable |
+| `--cl-mesh <n>` / `--cl-peers <n>` | `8` / `50` | consensus gossip mesh degree and peer target |
 | `--no-learned-patterns` | off | disable the similar-input learned tier (for A/B measurements) |
 
 **Logging:** set `RUST_LOG`, e.g. `RUST_LOG=info,skim::rpc=debug`. That logs every RPC with its latency, and each `eth_call`'s fetch waves.
+
+## Restarts
+The snapshot is a cache, never a source of truth. On start it is used only after:
+1. headers from its block to the current head link by hash
+2. every block's access list matches its header
+3. those blocks' writes are replayed
+
+Anything that doesn't check out (a reorg while skim was down, a gap over 8,192 blocks, an unreadable file) is discarded, and state is fetched as on a fresh start. The replay needs one EL peer that serves eth/71. In practice, restart time is dominated by how long the first such peer takes to connect.
 
 ## Sizing
 - **Memory:** tracked keys, their versions inside `--window`, and contract code. Measured: ~120 MB RSS for a few pools, tokens and quotes, following Sepolia.

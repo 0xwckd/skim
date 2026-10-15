@@ -69,6 +69,7 @@ Calls run in [revm](https://github.com/bluealloy/revm) with Amsterdam rules, aga
 | Tracked state | memory, multi-version for `--window` blocks | ~10–100 MB for typical app state |
 | Contract code | memory, only for tracked accounts | per contract |
 | Headers, tx hashes, BAL addresses | memory, last 2,048–8,192 blocks | a few MB |
+| Restart snapshot | `redb` file in `--data-dir` (default `~/.skim/sepolia`): subscribed values, node key, peers | ~1 MB for 2,400 keys |
 | Archived history (optional) | `redb` file, only for `retention: archive` subscriptions | versions only on change |
 
-Measured: ~120 MB RSS and ~0.25 CPU core following Sepolia with Uniswap subscriptions. Without an archive, it uses 0 bytes of disk.
+Measured: ~120 MB RSS and ~0.25 CPU core following Sepolia with Uniswap subscriptions. On disk: the restart snapshot (about 1 MB), plus the archive if you enable one. `--ephemeral` keeps nothing on disk.

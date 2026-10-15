@@ -14,6 +14,7 @@
 //!   [`StateError::Reorged`] instead of reading another branch's data.
 
 pub mod archive;
+pub mod persist;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -562,6 +563,30 @@ impl Store {
     }
 
     /// Tracked keys that are known at `block`.
+    /// Subscribed keys known at `block`, with the bytecode their code hashes point to: what
+    /// a restart snapshot keeps.
+    pub fn subscribed_at(&self, block: &BlockRef) -> (Vec<(StateKey, U256)>, Vec<(B256, Bytes)>) {
+        let st = self.inner.read();
+        let values: Vec<(StateKey, U256)> = st
+            .watched_keys
+            .iter()
+            .filter_map(|k| {
+                let v = st.versions.get(k)?;
+                let i = v.partition_point(|(n, _)| *n <= block.number);
+                (i > 0).then(|| (*k, v[i - 1].1))
+            })
+            .collect();
+        let code = values
+            .iter()
+            .filter(|(k, _)| matches!(k, StateKey::CodeHash(_)))
+            .filter_map(|(_, h)| {
+                let h = B256::from(*h);
+                st.code.get(&h).map(|c| (h, c.clone()))
+            })
+            .collect();
+        (values, code)
+    }
+
     pub fn known_keys(&self, block: &BlockRef) -> Vec<(StateKey, U256)> {
         let st = self.inner.read();
         st.versions
