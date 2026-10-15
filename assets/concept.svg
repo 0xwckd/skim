@@ -1,0 +1,201 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" role="img" aria-label="skim concept: no RPC provider, your own verified peer on the Ethereum P2P network">
+<defs>
+<linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#111939"/><stop offset="1" stop-color="#070A16"/></linearGradient>
+<linearGradient id="arc" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#7C5CFF"/><stop offset="0.55" stop-color="#3FA8FF"/><stop offset="1" stop-color="#2EE6C5"/></linearGradient>
+</defs>
+<style>
+.h1{font:700 40px ui-sans-serif,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;fill:#fff}
+.bt{font:700 26px ui-sans-serif,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;fill:#fff}
+.bs,.lab2{font:400 17px ui-sans-serif,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;fill:#9AA7C7}
+.lab{font:600 19px ui-sans-serif,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;fill:#DCE6FF}
+.cap{font:500 24px ui-sans-serif,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;fill:#C3D4FF}
+.tt{font:600 17px ui-sans-serif,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;fill:#FFB4C0}
+.ckA{font:700 20px ui-sans-serif,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;fill:#fff}
+.ckB{font:400 20px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;fill:#8FF7E4}
+.ok{font:800 24px ui-sans-serif,-apple-system,sans-serif;fill:#2EE6C5}
+.x{font:800 64px ui-sans-serif,-apple-system,sans-serif;fill:#FF5C7A}
+.bad2{font:700 20px ui-sans-serif,-apple-system,sans-serif;fill:#FF5C7A}
+.bad3{font:400 17px ui-sans-serif,-apple-system,sans-serif;fill:#FFB4C0}
+.big{font:800 46px ui-sans-serif,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;fill:url(#arc)}
+.tag2{font:800 34px ui-sans-serif,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;fill:url(#arc)}
+.url{font:500 22px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;fill:#9AA7C7}
+.box{fill:#141D40;stroke:#3A4A80;stroke-width:2}
+.skim{fill:#16204A;stroke:url(#arc);stroke-width:3}
+.gate{fill:#101836;stroke:#2EE6C5;stroke-width:2;stroke-dasharray:6 6}
+.card{fill:#121A3A;stroke:#2B3A70;stroke-width:1.5}
+.tag{fill:#2A1530;stroke:#FF5C7A;stroke-width:1.5}
+.wire{stroke:#3A4A80;stroke-width:3}
+.wire2{stroke:#3A4A80;stroke-width:2;stroke-dasharray:6 7}
+.mesh{stroke:#2B3A70;stroke-width:2}
+.node{fill:#3FA8FF}
+.pk{fill:#7C5CFF}.pk2{fill:#3FA8FF}
+.blk{fill:#7C5CFF}.prf{fill:#2EE6C5}.bad{fill:#FF5C7A}
+@keyframes a1{0.000%{opacity:0} 0.625%{opacity:0} 2.188%{opacity:1} 23.438%{opacity:1} 25.000%{opacity:0} 100.000%{opacity:0}} .a1{animation:a1 32.0s ease-in-out infinite;}
+@keyframes a2{0.000%{opacity:0;transform:translate(340px,310px)} 3.719%{opacity:0;transform:translate(340px,310px)} 3.750%{opacity:1;transform:translate(340px,310px)} 6.875%{opacity:1;transform:translate(505px,310px)} 7.344%{opacity:0;transform:translate(505px,310px)} 100.000%{opacity:0;transform:translate(505px,310px)}} .a2{animation:a2 32.0s linear infinite;}
+@keyframes a3{0.000%{opacity:0;transform:translate(505px,310px)} 6.844%{opacity:0;transform:translate(505px,310px)} 6.875%{opacity:1;transform:translate(505px,310px)} 9.687%{opacity:1;transform:translate(340px,310px)} 10.156%{opacity:0;transform:translate(340px,310px)} 100.000%{opacity:0;transform:translate(340px,310px)}} .a3{animation:a3 32.0s linear infinite;}
+@keyframes a4{0.000%{opacity:0;transform:translate(340px,310px)} 8.719%{opacity:0;transform:translate(340px,310px)} 8.750%{opacity:1;transform:translate(340px,310px)} 11.875%{opacity:1;transform:translate(505px,310px)} 12.344%{opacity:0;transform:translate(505px,310px)} 100.000%{opacity:0;transform:translate(505px,310px)}} .a4{animation:a4 32.0s linear infinite;}
+@keyframes a5{0.000%{opacity:0;transform:translate(505px,310px)} 11.844%{opacity:0;transform:translate(505px,310px)} 11.875%{opacity:1;transform:translate(505px,310px)} 14.687%{opacity:1;transform:translate(340px,310px)} 15.156%{opacity:0;transform:translate(340px,310px)} 100.000%{opacity:0;transform:translate(340px,310px)}} .a5{animation:a5 32.0s linear infinite;}
+@keyframes a6{0.000%{opacity:0;transform:translate(340px,310px)} 13.719%{opacity:0;transform:translate(340px,310px)} 13.750%{opacity:1;transform:translate(340px,310px)} 16.875%{opacity:1;transform:translate(505px,310px)} 17.344%{opacity:0;transform:translate(505px,310px)} 100.000%{opacity:0;transform:translate(505px,310px)}} .a6{animation:a6 32.0s linear infinite;}
+@keyframes a7{0.000%{opacity:0;transform:translate(505px,310px)} 16.844%{opacity:0;transform:translate(505px,310px)} 16.875%{opacity:1;transform:translate(505px,310px)} 19.688%{opacity:1;transform:translate(340px,310px)} 20.156%{opacity:0;transform:translate(340px,310px)} 100.000%{opacity:0;transform:translate(340px,310px)}} .a7{animation:a7 32.0s linear infinite;}
+@keyframes a8{0.000%{opacity:0;transform:translateY(14px)} 5.000%{opacity:0;transform:translateY(14px)} 6.875%{opacity:1;transform:translateY(0)} 23.750%{opacity:1;transform:translateY(0)} 25.000%{opacity:0;transform:translateY(0)} 100.000%{opacity:0}} .a8{animation:a8 32.0s ease-in-out infinite;}
+@keyframes a9{0.000%{opacity:0;transform:translateY(14px)} 7.500%{opacity:0;transform:translateY(14px)} 9.375%{opacity:1;transform:translateY(0)} 23.750%{opacity:1;transform:translateY(0)} 25.000%{opacity:0;transform:translateY(0)} 100.000%{opacity:0}} .a9{animation:a9 32.0s ease-in-out infinite;}
+@keyframes a10{0.000%{opacity:0;transform:translateY(14px)} 10.000%{opacity:0;transform:translateY(14px)} 11.875%{opacity:1;transform:translateY(0)} 23.750%{opacity:1;transform:translateY(0)} 25.000%{opacity:0;transform:translateY(0)} 100.000%{opacity:0}} .a10{animation:a10 32.0s ease-in-out infinite;}
+@keyframes a11{0.000%{opacity:0;transform:translateY(14px)} 12.500%{opacity:0;transform:translateY(14px)} 14.375%{opacity:1;transform:translateY(0)} 23.750%{opacity:1;transform:translateY(0)} 25.000%{opacity:0;transform:translateY(0)} 100.000%{opacity:0}} .a11{animation:a11 32.0s ease-in-out infinite;}
+@keyframes a12{0.000%{opacity:0;transform:translateY(14px)} 15.000%{opacity:0;transform:translateY(14px)} 16.875%{opacity:1;transform:translateY(0)} 23.750%{opacity:1;transform:translateY(0)} 25.000%{opacity:0;transform:translateY(0)} 100.000%{opacity:0}} .a12{animation:a12 32.0s ease-in-out infinite;}
+@keyframes a13{0.000%{opacity:0;transform:translateY(14px)} 17.500%{opacity:0;transform:translateY(14px)} 19.375%{opacity:1;transform:translateY(0)} 23.750%{opacity:1;transform:translateY(0)} 25.000%{opacity:0;transform:translateY(0)} 100.000%{opacity:0}} .a13{animation:a13 32.0s ease-in-out infinite;}
+@keyframes a14{0.000%{opacity:0} 25.625%{opacity:0} 27.187%{opacity:1} 50.000%{opacity:1} 51.562%{opacity:0} 100.000%{opacity:0}} .a14{animation:a14 32.0s ease-in-out infinite;}
+@keyframes a15{0.000%{opacity:0;transform:translate(310px,325px)} 29.969%{opacity:0;transform:translate(310px,325px)} 30.000%{opacity:1;transform:translate(310px,325px)} 31.875%{opacity:1;transform:translate(420px,325px)} 32.344%{opacity:0;transform:translate(420px,325px)} 100.000%{opacity:0;transform:translate(420px,325px)}} .a15{animation:a15 32.0s linear infinite;}
+@keyframes a16{0.000%{opacity:0;transform:translate(420px,325px)} 32.000%{opacity:0;transform:translate(420px,325px)} 32.031%{opacity:1;transform:translate(420px,325px)} 33.750%{opacity:1;transform:translate(310px,325px)} 34.219%{opacity:0;transform:translate(310px,325px)} 100.000%{opacity:0;transform:translate(310px,325px)}} .a16{animation:a16 32.0s linear infinite;}
+@keyframes a17{0.000%{opacity:0;transform:translate(310px,325px)} 35.906%{opacity:0;transform:translate(310px,325px)} 35.938%{opacity:1;transform:translate(310px,325px)} 37.812%{opacity:1;transform:translate(420px,325px)} 38.281%{opacity:0;transform:translate(420px,325px)} 100.000%{opacity:0;transform:translate(420px,325px)}} .a17{animation:a17 32.0s linear infinite;}
+@keyframes a18{0.000%{opacity:0;transform:translate(420px,325px)} 37.938%{opacity:0;transform:translate(420px,325px)} 37.969%{opacity:1;transform:translate(420px,325px)} 39.688%{opacity:1;transform:translate(310px,325px)} 40.156%{opacity:0;transform:translate(310px,325px)} 100.000%{opacity:0;transform:translate(310px,325px)}} .a18{animation:a18 32.0s linear infinite;}
+@keyframes a19{0.000%{opacity:0;transform:translate(310px,325px)} 41.844%{opacity:0;transform:translate(310px,325px)} 41.875%{opacity:1;transform:translate(310px,325px)} 43.750%{opacity:1;transform:translate(420px,325px)} 44.219%{opacity:0;transform:translate(420px,325px)} 100.000%{opacity:0;transform:translate(420px,325px)}} .a19{animation:a19 32.0s linear infinite;}
+@keyframes a20{0.000%{opacity:0;transform:translate(420px,325px)} 43.875%{opacity:0;transform:translate(420px,325px)} 43.906%{opacity:1;transform:translate(420px,325px)} 45.625%{opacity:1;transform:translate(310px,325px)} 46.094%{opacity:0;transform:translate(310px,325px)} 100.000%{opacity:0;transform:translate(310px,325px)}} .a20{animation:a20 32.0s linear infinite;}
+@keyframes a21{0.000%{opacity:.55} 26.562%{opacity:.55} 27.500%{opacity:1} 29.375%{opacity:.55} 100.000%{opacity:.55}} .a21{animation:a21 32.0s ease-in-out infinite;}
+@keyframes a22{0.000%{opacity:.55} 27.344%{opacity:.55} 28.281%{opacity:1} 30.156%{opacity:.55} 100.000%{opacity:.55}} .a22{animation:a22 32.0s ease-in-out infinite;}
+@keyframes a23{0.000%{opacity:.55} 28.125%{opacity:.55} 29.063%{opacity:1} 30.938%{opacity:.55} 100.000%{opacity:.55}} .a23{animation:a23 32.0s ease-in-out infinite;}
+@keyframes a24{0.000%{opacity:.55} 28.906%{opacity:.55} 29.844%{opacity:1} 31.719%{opacity:.55} 100.000%{opacity:.55}} .a24{animation:a24 32.0s ease-in-out infinite;}
+@keyframes a25{0.000%{opacity:.55} 29.688%{opacity:.55} 30.625%{opacity:1} 32.500%{opacity:.55} 100.000%{opacity:.55}} .a25{animation:a25 32.0s ease-in-out infinite;}
+@keyframes a26{0.000%{opacity:.55} 30.469%{opacity:.55} 31.406%{opacity:1} 33.281%{opacity:.55} 100.000%{opacity:.55}} .a26{animation:a26 32.0s ease-in-out infinite;}
+@keyframes a27{0.000%{opacity:.55} 31.250%{opacity:.55} 32.188%{opacity:1} 34.062%{opacity:.55} 100.000%{opacity:.55}} .a27{animation:a27 32.0s ease-in-out infinite;}
+@keyframes a28{0.000%{opacity:.55} 32.031%{opacity:.55} 32.969%{opacity:1} 34.844%{opacity:.55} 100.000%{opacity:.55}} .a28{animation:a28 32.0s ease-in-out infinite;}
+@keyframes a29{0.000%{opacity:.55} 32.812%{opacity:.55} 33.750%{opacity:1} 35.625%{opacity:.55} 100.000%{opacity:.55}} .a29{animation:a29 32.0s ease-in-out infinite;}
+@keyframes a30{0.000%{opacity:0;transform:translate(920px,225px)} 31.844%{opacity:0;transform:translate(920px,225px)} 31.875%{opacity:1;transform:translate(920px,225px)} 35.312%{opacity:1;transform:translate(735px,284px)} 35.781%{opacity:0;transform:translate(735px,284px)} 100.000%{opacity:0;transform:translate(735px,284px)}} .a30{animation:a30 32.0s linear infinite;}
+@keyframes a31{0.000%{opacity:0;transform:translate(920px,414px)} 34.344%{opacity:0;transform:translate(920px,414px)} 34.375%{opacity:1;transform:translate(920px,414px)} 37.812%{opacity:1;transform:translate(735px,352px)} 38.281%{opacity:0;transform:translate(735px,352px)} 100.000%{opacity:0;transform:translate(735px,352px)}} .a31{animation:a31 32.0s linear infinite;}
+@keyframes a32{0.000%{opacity:0;transform:translate(920px,225px)} 37.469%{opacity:0;transform:translate(920px,225px)} 37.500%{opacity:1;transform:translate(920px,225px)} 40.938%{opacity:1;transform:translate(735px,284px)} 41.406%{opacity:0;transform:translate(735px,284px)} 100.000%{opacity:0;transform:translate(735px,284px)}} .a32{animation:a32 32.0s linear infinite;}
+@keyframes a33{0.000%{opacity:0;transform:translate(920px,414px)} 39.969%{opacity:0;transform:translate(920px,414px)} 40.000%{opacity:1;transform:translate(920px,414px)} 43.438%{opacity:1;transform:translate(735px,352px)} 43.906%{opacity:0;transform:translate(735px,352px)} 100.000%{opacity:0;transform:translate(735px,352px)}} .a33{animation:a33 32.0s linear infinite;}
+@keyframes a34{0.000%{opacity:0;transform:translate(920px,225px)} 43.094%{opacity:0;transform:translate(920px,225px)} 43.125%{opacity:1;transform:translate(920px,225px)} 46.562%{opacity:1;transform:translate(735px,284px)} 47.031%{opacity:0;transform:translate(735px,284px)} 100.000%{opacity:0;transform:translate(735px,284px)}} .a34{animation:a34 32.0s linear infinite;}
+@keyframes a35{0.000%{opacity:0;transform:translate(920px,414px)} 45.594%{opacity:0;transform:translate(920px,414px)} 45.625%{opacity:1;transform:translate(920px,414px)} 49.062%{opacity:1;transform:translate(735px,352px)} 49.531%{opacity:0;transform:translate(735px,352px)} 100.000%{opacity:0;transform:translate(735px,352px)}} .a35{animation:a35 32.0s linear infinite;}
+@keyframes a36{0.000%{opacity:0;transform:translateY(14px)} 31.250%{opacity:0;transform:translateY(14px)} 33.125%{opacity:1;transform:translateY(0)} 50.313%{opacity:1;transform:translateY(0)} 51.562%{opacity:0;transform:translateY(0)} 100.000%{opacity:0}} .a36{animation:a36 32.0s ease-in-out infinite;}
+@keyframes a37{0.000%{opacity:0;transform:translateY(14px)} 34.375%{opacity:0;transform:translateY(14px)} 36.250%{opacity:1;transform:translateY(0)} 50.313%{opacity:1;transform:translateY(0)} 51.562%{opacity:0;transform:translateY(0)} 100.000%{opacity:0}} .a37{animation:a37 32.0s ease-in-out infinite;}
+@keyframes a38{0.000%{opacity:0;transform:translateY(14px)} 39.062%{opacity:0;transform:translateY(14px)} 40.938%{opacity:1;transform:translateY(0)} 50.313%{opacity:1;transform:translateY(0)} 51.562%{opacity:0;transform:translateY(0)} 100.000%{opacity:0}} .a38{animation:a38 32.0s ease-in-out infinite;}
+@keyframes a39{0.000%{opacity:0} 52.188%{opacity:0} 53.750%{opacity:1} 78.125%{opacity:1} 79.688%{opacity:0} 100.000%{opacity:0}} .a39{animation:a39 32.0s ease-in-out infinite;}
+@keyframes a40{0.000%{opacity:0;transform:translate(130px,316px)} 54.344%{opacity:0;transform:translate(130px,316px)} 54.375%{opacity:1;transform:translate(130px,316px)} 56.875%{opacity:1;transform:translate(640px,316px)} 57.344%{opacity:0;transform:translate(640px,316px)} 100.000%{opacity:0;transform:translate(640px,316px)}} .a40{animation:a40 32.0s linear infinite;}
+@keyframes a41{0.000%{opacity:0;transform:translate(640px,316px)} 56.844%{opacity:0;transform:translate(640px,316px)} 56.875%{opacity:1;transform:translate(640px,316px)} 59.062%{opacity:1;transform:translate(1130px,316px)} 59.531%{opacity:0;transform:translate(1130px,316px)} 100.000%{opacity:0;transform:translate(1130px,316px)}} .a41{animation:a41 32.0s linear infinite;}
+@keyframes a42{0.000%{opacity:0;transform:translateY(8px)} 56.562%{opacity:0;transform:translateY(8px)} 58.438%{opacity:1;transform:translateY(0)} 78.438%{opacity:1;transform:translateY(0)} 79.688%{opacity:0;transform:translateY(0)} 100.000%{opacity:0}} .a42{animation:a42 32.0s ease-in-out infinite;}
+@keyframes a43{0.000%{opacity:0;transform:translate(130px,316px)} 59.344%{opacity:0;transform:translate(130px,316px)} 59.375%{opacity:1;transform:translate(130px,316px)} 61.875%{opacity:1;transform:translate(640px,316px)} 62.344%{opacity:0;transform:translate(640px,316px)} 100.000%{opacity:0;transform:translate(640px,316px)}} .a43{animation:a43 32.0s linear infinite;}
+@keyframes a44{0.000%{opacity:0;transform:translate(640px,316px)} 61.844%{opacity:0;transform:translate(640px,316px)} 61.875%{opacity:1;transform:translate(640px,316px)} 64.062%{opacity:1;transform:translate(1130px,316px)} 64.531%{opacity:0;transform:translate(1130px,316px)} 100.000%{opacity:0;transform:translate(1130px,316px)}} .a44{animation:a44 32.0s linear infinite;}
+@keyframes a45{0.000%{opacity:0;transform:translateY(8px)} 61.562%{opacity:0;transform:translateY(8px)} 63.438%{opacity:1;transform:translateY(0)} 78.438%{opacity:1;transform:translateY(0)} 79.688%{opacity:0;transform:translateY(0)} 100.000%{opacity:0}} .a45{animation:a45 32.0s ease-in-out infinite;}
+@keyframes a46{0.000%{opacity:0;transform:translate(130px,316px)} 64.344%{opacity:0;transform:translate(130px,316px)} 64.375%{opacity:1;transform:translate(130px,316px)} 66.875%{opacity:1;transform:translate(640px,316px)} 67.344%{opacity:0;transform:translate(640px,316px)} 100.000%{opacity:0;transform:translate(640px,316px)}} .a46{animation:a46 32.0s linear infinite;}
+@keyframes a47{0.000%{opacity:0;transform:translate(640px,316px)} 66.844%{opacity:0;transform:translate(640px,316px)} 66.875%{opacity:1;transform:translate(640px,316px)} 69.062%{opacity:1;transform:translate(1130px,316px)} 69.531%{opacity:0;transform:translate(1130px,316px)} 100.000%{opacity:0;transform:translate(1130px,316px)}} .a47{animation:a47 32.0s linear infinite;}
+@keyframes a48{0.000%{opacity:0;transform:translateY(8px)} 66.562%{opacity:0;transform:translateY(8px)} 68.438%{opacity:1;transform:translateY(0)} 78.438%{opacity:1;transform:translateY(0)} 79.688%{opacity:0;transform:translateY(0)} 100.000%{opacity:0}} .a48{animation:a48 32.0s ease-in-out infinite;}
+@keyframes a49{0.000%{opacity:0;transform:translate(130px,316px)} 69.969%{opacity:0;transform:translate(130px,316px)} 70.000%{opacity:1;transform:translate(130px,316px)} 72.500%{opacity:1;transform:translate(560px,316px)} 72.969%{opacity:0;transform:translate(560px,316px)} 100.000%{opacity:0;transform:translate(560px,316px)}} .a49{animation:a49 32.0s linear infinite;}
+@keyframes a50{0.000%{opacity:0} 72.500%{opacity:0} 72.969%{opacity:1} 79.062%{opacity:1} 79.688%{opacity:0} 100.000%{opacity:0}} .a50{animation:a50 32.0s ease-in-out infinite;}
+@keyframes a51{0.000%{opacity:0;transform:translateY(6px)} 53.125%{opacity:0;transform:translateY(6px)} 55.000%{opacity:1;transform:translateY(0)} 78.438%{opacity:1;transform:translateY(0)} 79.688%{opacity:0;transform:translateY(0)} 100.000%{opacity:0}} .a51{animation:a51 32.0s ease-in-out infinite;}
+@keyframes a52{0.000%{opacity:0;transform:translateY(6px)} 67.188%{opacity:0;transform:translateY(6px)} 69.062%{opacity:1;transform:translateY(0)} 78.438%{opacity:1;transform:translateY(0)} 79.688%{opacity:0;transform:translateY(0)} 100.000%{opacity:0}} .a52{animation:a52 32.0s ease-in-out infinite;}
+@keyframes a53{0.000%{opacity:0} 80.312%{opacity:0} 81.875%{opacity:1} 98.125%{opacity:1} 99.688%{opacity:0} 100.000%{opacity:0}} .a53{animation:a53 32.0s ease-in-out infinite;}
+@keyframes a54{0.000%{opacity:0;transform:translateY(14px)} 81.875%{opacity:0;transform:translateY(14px)} 83.750%{opacity:1;transform:translateY(0)} 98.438%{opacity:1;transform:translateY(0)} 99.688%{opacity:0;transform:translateY(0)} 100.000%{opacity:0}} .a54{animation:a54 32.0s ease-in-out infinite;}
+@keyframes a55{0.000%{opacity:0;transform:translateY(14px)} 83.438%{opacity:0;transform:translateY(14px)} 85.312%{opacity:1;transform:translateY(0)} 98.438%{opacity:1;transform:translateY(0)} 99.688%{opacity:0;transform:translateY(0)} 100.000%{opacity:0}} .a55{animation:a55 32.0s ease-in-out infinite;}
+@keyframes a56{0.000%{opacity:0;transform:translateY(14px)} 85.000%{opacity:0;transform:translateY(14px)} 86.875%{opacity:1;transform:translateY(0)} 98.438%{opacity:1;transform:translateY(0)} 99.688%{opacity:0;transform:translateY(0)} 100.000%{opacity:0}} .a56{animation:a56 32.0s ease-in-out infinite;}
+@keyframes a57{0.000%{opacity:0;transform:translateY(14px)} 86.562%{opacity:0;transform:translateY(14px)} 88.438%{opacity:1;transform:translateY(0)} 98.438%{opacity:1;transform:translateY(0)} 99.688%{opacity:0;transform:translateY(0)} 100.000%{opacity:0}} .a57{animation:a57 32.0s ease-in-out infinite;}
+@keyframes a58{0.000%{opacity:0;transform:translateY(14px)} 88.750%{opacity:0;transform:translateY(14px)} 90.625%{opacity:1;transform:translateY(0)} 98.438%{opacity:1;transform:translateY(0)} 99.688%{opacity:0;transform:translateY(0)} 100.000%{opacity:0}} .a58{animation:a58 32.0s ease-in-out infinite;}
+@keyframes a59{0.000%{opacity:0;transform:translateY(14px)} 91.250%{opacity:0;transform:translateY(14px)} 93.125%{opacity:1;transform:translateY(0)} 98.438%{opacity:1;transform:translateY(0)} 99.688%{opacity:0;transform:translateY(0)} 100.000%{opacity:0}} .a59{animation:a59 32.0s ease-in-out infinite;}
+@keyframes a60{0.000%{opacity:0;transform:translateY(14px)} 93.125%{opacity:0;transform:translateY(14px)} 95.000%{opacity:1;transform:translateY(0)} 98.438%{opacity:1;transform:translateY(0)} 99.688%{opacity:0;transform:translateY(0)} 100.000%{opacity:0}} .a60{animation:a60 32.0s ease-in-out infinite;}</style>
+<rect width="1280" height="720" fill="url(#bg)"/>
+<g class="a1">
+<text x="640" y="92" class="h1" text-anchor="middle">Today, your app borrows someone else's node</text>
+<rect x="80" y="250" width="250" height="120" rx="16" class="box"/>
+<text x="205.0" y="306.0" class="bt" text-anchor="middle">Your app</text>
+<text x="205.0" y="334.0" class="bs" text-anchor="middle">viem · ethers · foundry</text>
+<rect x="515" y="250" width="250" height="120" rx="16" class="box"/>
+<text x="640.0" y="306.0" class="bt" text-anchor="middle">RPC provider</text>
+<text x="640.0" y="334.0" class="bs" text-anchor="middle">subscription plan</text>
+<rect x="950" y="250" width="250" height="120" rx="16" class="box"/>
+<text x="1075.0" y="306.0" class="bt" text-anchor="middle">Their full node</text>
+<text x="1075.0" y="334.0" class="bs" text-anchor="middle">the whole chain</text>
+<line x1="330" y1="310" x2="515" y2="310" class="wire"/><line x1="765" y1="310" x2="950" y2="310" class="wire"/>
+<circle r="7" class="pk a2"/>
+<circle r="7" class="pk2 a3"/>
+<circle r="7" class="pk a4"/>
+<circle r="7" class="pk2 a5"/>
+<circle r="7" class="pk a6"/>
+<circle r="7" class="pk2 a7"/>
+<g class="a8"><rect x="135" y="430" width="190" height="44" rx="22" class="tag"/><text x="230" y="459" class="tt" text-anchor="middle">API keys</text></g>
+<g class="a9"><rect x="340" y="430" width="190" height="44" rx="22" class="tag"/><text x="435" y="459" class="tt" text-anchor="middle">rate limits</text></g>
+<g class="a10"><rect x="545" y="430" width="190" height="44" rx="22" class="tag"/><text x="640" y="459" class="tt" text-anchor="middle">$ per request</text></g>
+<g class="a11"><rect x="750" y="430" width="190" height="44" rx="22" class="tag"/><text x="845" y="459" class="tt" text-anchor="middle">outages you can't fix</text></g>
+<g class="a12"><rect x="955" y="430" width="190" height="44" rx="22" class="tag"/><text x="1050" y="459" class="tt" text-anchor="middle">trust their answers</text></g>
+<text x="640" y="560" class="cap a13" text-anchor="middle">…and you can't check what they send you.</text>
+</g>
+<g class="a14">
+<text x="640" y="92" class="h1" text-anchor="middle">skim: your own peer on the Ethereum network</text>
+<rect x="70" y="270" width="230" height="110" rx="16" class="box"/>
+<text x="185.0" y="321.0" class="bt" text-anchor="middle">Your app</text>
+<text x="185.0" y="349.0" class="bs" text-anchor="middle">same code, new URL</text>
+<rect x="430" y="235" width="300" height="180" rx="20" class="skim"/>
+<text x="580" y="305" class="bt" text-anchor="middle" style="font-size:34px">skim</text>
+<text x="580" y="340" class="bs" text-anchor="middle">localhost:8545 · JSON-RPC</text>
+<text x="580" y="375" class="bs" text-anchor="middle">only your app's state</text>
+<line x1="300" y1="325" x2="430" y2="325" class="wire"/>
+<circle r="7" class="pk a15"/>
+<circle r="7" class="pk2 a16"/>
+<circle r="7" class="pk a17"/>
+<circle r="7" class="pk2 a18"/>
+<circle r="7" class="pk a19"/>
+<circle r="7" class="pk2 a20"/>
+<line x1="960" y1="180" x2="1110" y2="150" class="mesh"/>
+<line x1="1110" y1="150" x2="1210" y2="260" class="mesh"/>
+<line x1="960" y1="180" x2="1040" y2="300" class="mesh"/>
+<line x1="1110" y1="150" x2="1040" y2="300" class="mesh"/>
+<line x1="1210" y1="260" x2="1040" y2="300" class="mesh"/>
+<line x1="1040" y1="300" x2="930" y2="420" class="mesh"/>
+<line x1="1040" y1="300" x2="1090" y2="450" class="mesh"/>
+<line x1="1210" y1="260" x2="1200" y2="400" class="mesh"/>
+<line x1="1090" y1="450" x2="1200" y2="400" class="mesh"/>
+<line x1="930" y1="420" x2="1090" y2="450" class="mesh"/>
+<line x1="930" y1="420" x2="1010" y2="560" class="mesh"/>
+<line x1="1090" y1="450" x2="1010" y2="560" class="mesh"/>
+<line x1="1090" y1="450" x2="1170" y2="560" class="mesh"/>
+<line x1="1200" y1="400" x2="1170" y2="560" class="mesh"/>
+<line x1="1010" y1="560" x2="1170" y2="560" class="mesh"/>
+<circle cx="960" cy="180" r="15" class="node a21"/>
+<circle cx="1110" cy="150" r="15" class="node a22"/>
+<circle cx="1210" cy="260" r="15" class="node a23"/>
+<circle cx="1040" cy="300" r="15" class="node a24"/>
+<circle cx="930" cy="420" r="15" class="node a25"/>
+<circle cx="1090" cy="450" r="15" class="node a26"/>
+<circle cx="1200" cy="400" r="15" class="node a27"/>
+<circle cx="1010" cy="560" r="15" class="node a28"/>
+<circle cx="1170" cy="560" r="15" class="node a29"/>
+<text x="1070" y="640" class="bs" text-anchor="middle">Ethereum P2P · no provider, no API key</text>
+<line x1="730" y1="290" x2="930" y2="230" class="wire2"/><line x1="730" y1="360" x2="930" y2="420" class="wire2"/>
+<rect width="22" height="14" rx="4" class="blk a30"/>
+<rect width="22" height="14" rx="4" class="prf a31"/>
+<rect width="22" height="14" rx="4" class="blk a32"/>
+<rect width="22" height="14" rx="4" class="prf a33"/>
+<rect width="22" height="14" rx="4" class="blk a34"/>
+<rect width="22" height="14" rx="4" class="prf a35"/>
+<g class="a36"><text x="830" y="210" class="lab" text-anchor="middle">every block + its access list</text><text x="830" y="232" class="lab2" text-anchor="middle">consensus-layer gossip</text></g>
+<g class="a37"><text x="830" y="470" class="lab" text-anchor="middle">missing state + Merkle proof</text><text x="830" y="492" class="lab2" text-anchor="middle">snap peers, on demand</text></g>
+<text x="560" y="610" class="cap a38" text-anchor="middle">Blocks say exactly what changed: no re-execution, no full sync.</text>
+</g>
+<g class="a39">
+<text x="640" y="92" class="h1" text-anchor="middle">Every value is proven against the block</text>
+<rect x="510" y="160" width="260" height="330" rx="18" class="gate"/>
+<text x="640" y="200" class="bt" text-anchor="middle" style="font-size:22px">verify</text>
+<line x1="120" y1="325" x2="510" y2="325" class="wire"/><line x1="770" y1="325" x2="1160" y2="325" class="wire"/>
+<text x="140" y="300" class="lab2">from any peer</text><text x="1150" y="300" class="lab2" text-anchor="end">into skim's state</text>
+<rect width="26" height="18" rx="4" class="prf a40"/>
+<rect width="26" height="18" rx="4" class="prf a41"/>
+<g class="a42"><text x="380" y="560" class="ok">✓</text><text x="420" y="560" class="ckA">block access list</text><text x="640" y="560" class="ckB">keccak(rebuilt header) = block hash</text></g>
+<rect width="26" height="18" rx="4" class="prf a43"/>
+<rect width="26" height="18" rx="4" class="prf a44"/>
+<g class="a45"><text x="380" y="604" class="ok">✓</text><text x="420" y="604" class="ckA">account · slot</text><text x="640" y="604" class="ckB">Merkle proof → stateRoot</text></g>
+<rect width="26" height="18" rx="4" class="prf a46"/>
+<rect width="26" height="18" rx="4" class="prf a47"/>
+<g class="a48"><text x="380" y="648" class="ok">✓</text><text x="420" y="648" class="ckA">receipts · logs</text><text x="640" y="648" class="ckB">→ receiptsRoot</text></g>
+<rect width="26" height="18" rx="4" class="bad a49"/>
+<g class="a50"><text x="640" y="352" class="x" text-anchor="middle">✕</text><text x="640" y="455" class="bad2" text-anchor="middle">forged value</text><text x="640" y="477" class="bad3" text-anchor="middle">rejected · ask another peer</text></g>
+<text x="640" y="135" class="lab a51" text-anchor="middle">unproven is never served · unknown is never zero</text>
+<text x="640" y="700" class="lab2 a52" text-anchor="middle">(the chain head itself is trusted from gossip today; sync-committee light-client checks are next)</text>
+</g>
+<g class="a53">
+<text x="640" y="110" class="h1" text-anchor="middle">Sync (and archive) only what you need</text>
+<g class="a54"><rect x="100" y="200" width="240" height="170" rx="18" class="card"/><text x="220" y="285" class="big" text-anchor="middle">~90 MB</text><text x="220" y="325" class="bs" text-anchor="middle">memory</text></g>
+<g class="a55"><rect x="380" y="200" width="240" height="170" rx="18" class="card"/><text x="500" y="285" class="big" text-anchor="middle">0 bytes</text><text x="500" y="325" class="bs" text-anchor="middle">on disk</text></g>
+<g class="a56"><rect x="660" y="200" width="240" height="170" rx="18" class="card"/><text x="780" y="285" class="big" text-anchor="middle">~3 ms</text><text x="780" y="325" class="bs" text-anchor="middle">eth_call, local</text></g>
+<g class="a57"><rect x="940" y="200" width="240" height="170" rx="18" class="card"/><text x="1060" y="285" class="big" text-anchor="middle">= Infura</text><text x="1060" y="325" class="bs" text-anchor="middle">byte for byte</text></g>
+<text x="640" y="450" class="cap a58" text-anchor="middle">vs. a synced Sepolia full node: 337 GB on disk</text>
+<text x="640" y="540" class="tag2 a59" text-anchor="middle">No more RPC subscriptions. P2P, with verification.</text>
+<text x="640" y="610" class="url a60" text-anchor="middle">github.com/leekt/skim</text>
+</g>
+</svg>

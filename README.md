@@ -12,6 +12,10 @@
 <p align="center"><b>Not every app needs a full node. Sync (and archive) only what you need.</b></p>
 
 <p align="center">
+  <img src="assets/concept.svg" alt="skim in 30 seconds: no RPC provider; your own peer on Ethereum's P2P network; every value proven against the block" width="100%">
+</p>
+
+<p align="center">
   <img src="assets/demo.gif" alt="skim demo: following Sepolia over P2P, Uniswap V3 and V4 quotes and logs through plain viem, in milliseconds" width="100%">
   <br><sub>Real recording, real Sepolia: skim follows the chain from P2P gossip, and unmodified viem gets Uniswap V3/V4 state, quotes and logs from it. (<a href="assets/demo.mp4">MP4</a> · <a href="assets/demo.tape">how it was recorded</a>)</sub>
 </p>
