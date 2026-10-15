@@ -87,7 +87,8 @@ struct Ep {
 
 pub async fn run(args: Args) -> anyhow::Result<()> {
     use std::io::Write;
-    let client = reqwest::Client::builder().pool_max_idle_per_host(256).build()?;
+    // A request that never returns would stall the whole run (seen: 40 min at block 109).
+    let client = reqwest::Client::builder().pool_max_idle_per_host(256).timeout(Duration::from_secs(30)).build()?;
     let eps: Vec<(String, String)> = args
         .endpoints
         .iter()

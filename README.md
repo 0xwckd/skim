@@ -12,7 +12,7 @@
 <p align="center"><b>Not every app needs a full node. Sync (and archive) only what you need.</b></p>
 
 <p align="center">
-  <img src="assets/concept.svg" alt="skim in 30 seconds: no RPC provider; your own peer on Ethereum's P2P network; every value proven against the block" width="100%">
+  <img src="assets/skim-concept.svg" alt="skim in 30 seconds: no RPC provider; your own peer on Ethereum's P2P network; every value proven against the block" width="100%">
 </p>
 
 <p align="center">

@@ -1,4 +1,4 @@
-"""python3 assets/concept.py assets/concept.svg [freeze-at-seconds]. Generates: a 32 s looping explainer (CSS animations only, so GitHub plays it inline)."""
+"""python3 assets/concept.py assets/skim-concept.svg [freeze-at-seconds]. Generates: a 32 s looping explainer (CSS animations only, so GitHub plays it inline)."""
 import sys
 T = 32.0
 css = []
