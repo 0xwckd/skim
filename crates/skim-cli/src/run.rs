@@ -145,19 +145,19 @@ impl Default for OnDemand {
 #[derive(serde::Deserialize)]
 struct Limits {
     #[serde(default = "hundred_k")]
-    max_subscribed_keys: usize,
+    max_subscribed_keys: skim_sim::subscription::Limit,
     #[serde(default = "two_hundred_k")]
-    max_on_demand_keys: usize,
+    max_on_demand_keys: skim_sim::subscription::Limit,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { max_subscribed_keys: 100_000, max_on_demand_keys: 200_000 }
+        Self { max_subscribed_keys: hundred_k(), max_on_demand_keys: two_hundred_k() }
     }
 }
 
-fn two_hundred_k() -> usize {
-    200_000
+fn two_hundred_k() -> skim_sim::subscription::Limit {
+    skim_sim::subscription::Limit(200_000)
 }
 
 fn yes() -> bool {
@@ -166,8 +166,8 @@ fn yes() -> bool {
 fn four() -> u64 {
     4
 }
-fn hundred_k() -> usize {
-    100_000
+fn hundred_k() -> skim_sim::subscription::Limit {
+    skim_sim::subscription::Limit(100_000)
 }
 
 pub async fn run(args: Args) -> anyhow::Result<()> {
@@ -246,10 +246,10 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         tracing::warn!("on_demand.enabled=false: unsubscribed state is still fetched for correctness, with a 1-block TTL");
     }
     *sim.on_demand.write() = skim_state::Retention::Ttl(if cfg.state.on_demand.enabled { cfg.state.on_demand.cache_ttl_blocks } else { 1 });
-    let subs = Arc::new(skim_sim::subscription::Subscriptions::new(cfg.state.subscriptions, cfg.state.limits.max_subscribed_keys)?);
+    let subs = Arc::new(skim_sim::subscription::Subscriptions::new(cfg.state.subscriptions, cfg.state.limits.max_subscribed_keys.0)?);
     // The limit is enforced by the store itself, for every path that subscribes keys.
-    store.set_max_subscribed(cfg.state.limits.max_subscribed_keys);
-    store.set_max_on_demand(cfg.state.limits.max_on_demand_keys);
+    store.set_max_subscribed(cfg.state.limits.max_subscribed_keys.0);
+    store.set_max_on_demand(cfg.state.limits.max_on_demand_keys.0);
     tracing::info!(subscriptions = subs.status().len(), declared_keys = subs.total_keys(), "state subscriptions loaded");
     let mut ncfg = NodeConfig::sepolia(args.cl_port);
     ncfg.mesh_n = args.cl_mesh;

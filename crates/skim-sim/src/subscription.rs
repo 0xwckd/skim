@@ -59,7 +59,37 @@ pub struct SubscriptionSpec {
     pub retention: Option<RetentionSpec>,
     /// `storage: all`: refuse contracts with more slots than this (default 50,000).
     #[serde(default)]
-    pub max_slots: Option<usize>,
+    pub max_slots: Option<Limit>,
+}
+
+/// A count limit in config: a number, or `unlimited`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limit(pub usize);
+
+impl Limit {
+    pub const UNLIMITED: Limit = Limit(usize::MAX);
+}
+
+impl<'de> Deserialize<'de> for Limit {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            N(usize),
+            S(String),
+        }
+        match Raw::deserialize(d)? {
+            Raw::N(n) => Ok(Limit(n)),
+            Raw::S(s) if s == "unlimited" => Ok(Limit::UNLIMITED),
+            Raw::S(s) => s.parse().map(Limit).map_err(|_| serde::de::Error::custom(format!("expected a number or \"unlimited\", got {s:?}"))),
+        }
+    }
+}
+
+impl Serialize for Limit {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if self.0 == usize::MAX { s.serialize_str("unlimited") } else { s.serialize_u64(self.0 as u64) }
+    }
 }
 
 pub const DEFAULT_MAX_SLOTS: usize = 50_000;
@@ -205,7 +235,7 @@ impl Subscriptions {
                 continue;
             }
             let at = if sim.miss_at_parent { sim.store.block(head.number.saturating_sub(1)).unwrap_or(*head) } else { *head };
-            let max = spec.max_slots.unwrap_or(DEFAULT_MAX_SLOTS);
+            let max = spec.max_slots.map_or(DEFAULT_MAX_SLOTS, |l| l.0);
             let tr = sim.sched.transport();
             let mut err = Some("no peer served the storage yet".to_string());
             for peer in tr.net.peers().into_iter().filter(|(_, p)| p.snap1 || p.snap2).map(|(id, _)| id).take(4) {
@@ -222,7 +252,7 @@ impl Subscriptions {
                         break;
                     }
                     Ok(skim_snap::el::StorageAll::TooLarge(n)) => {
-                        err = Some(format!("more than {max} slots ({n}+); raise max_slots"));
+                        err = Some(format!("more than {max} slots ({n}+); raise max_slots (or set it to unlimited)"));
                         break;
                     }
                     Ok(skim_snap::el::StorageAll::Unavailable) | Err(_) => continue,
@@ -345,6 +375,17 @@ mod tests {
         assert!(!is_ready(true, 0, true, true)); // learned set cut by the limit
         assert!(!is_ready(false, 0, true, false)); // not at the head
         assert!(!is_ready(true, 1, true, false));
+    }
+
+    #[test]
+    fn limits_accept_numbers_and_unlimited() {
+        let y = "- name: big\n  address: \"0x0000000000000000000000000000000000000001\"\n  storage: all\n  max_slots: unlimited\n";
+        let specs: Vec<SubscriptionSpec> = serde_yaml_ng::from_str(y).unwrap();
+        assert_eq!(specs[0].max_slots, Some(Limit::UNLIMITED));
+        let y2 = y.replace("unlimited", "1234");
+        let specs: Vec<SubscriptionSpec> = serde_yaml_ng::from_str(&y2).unwrap();
+        assert_eq!(specs[0].max_slots, Some(Limit(1234)));
+        assert!(serde_yaml_ng::from_str::<Vec<SubscriptionSpec>>(&y.replace("unlimited", "lots")).is_err());
     }
 
     #[test]

@@ -12,7 +12,7 @@ state:
       address: "0x…"                  # needed for account/storage
       account: true                   # balance, nonce, code hash (and the code)
       storage: ["0x0", "0x4"]         # explicit slots (hex strings), or "all" (whole storage, see below)
-      max_slots: 50000                # storage: all only: refuse bigger contracts
+      max_slots: 50000                # storage: all only: refuse bigger contracts ("unlimited" allowed)
       calls:                          # simulations whose access sets stay ready
         - to: "0x…"
           data: "0x…"                 # full calldata
@@ -25,8 +25,8 @@ state:
     cache_ttl_blocks: 4               # unsubscribed state stays current this many blocks after use
 
   limits:
-    max_subscribed_keys: 100000       # hard cap on subscribed keys in the store (see below)
-    max_on_demand_keys: 200000        # hard cap on on-demand keys; soonest-expiring evicted first
+    max_subscribed_keys: 100000       # hard cap on subscribed keys in the store (see below); or "unlimited"
+    max_on_demand_keys: 200000        # hard cap on on-demand keys; soonest-expiring evicted first; or "unlimited"
 
 predictors:
   uniswap_v3:                         # input-aware prefetch for QuoterV2.quoteExactInputSingle
@@ -40,7 +40,9 @@ predictors:
 |---|---|
 | `account: true` | Subscribes balance, nonce and code hash. Code is cached for tracked accounts. |
 | `storage: [slots]` | Subscribes exactly these slots. Use `cast index` / `cast storage` to find mapping slots, or subscribe a call instead. |
-| `storage: all` | Downloads the contract's entire storage over SNAP once, and accepts it only if every downloaded slot together rebuilds the account's proven storage root. The contract is then tracked by address, so every BAL write keeps it current, and any slot is answered locally. A slot absent from the verified trie is a proven zero. For contracts up to `max_slots` (default 50,000); the slots count toward `max_subscribed_keys`. Can't be combined with archive retention yet. A reorg below the download block discards it, and it is downloaded again. |
+| `storage: all` | Downloads the contract's entire storage over SNAP once, and accepts it only if every downloaded slot together rebuilds the account's proven storage root. The contract is then tracked by address, so every BAL write keeps it current, and any slot is answered locally. A slot absent from the verified trie is a proven zero. For contracts up to `max_slots` (default 50,000; `unlimited` removes the cap). The slots count toward `max_subscribed_keys`, so for a very large contract set that to `unlimited` (or high enough) too.
+
+With no cap, memory grows with the contract: about 100 bytes per slot, so a contract with 10 million slots needs on the order of 1 GB. The download must also finish while peers still serve the root it started from (about 128 blocks); if it can't, skim retries from a newer root. Can't be combined with archive retention yet. A reorg below the download block discards it, and it is downloaded again. |
 | `calls` | Each call runs every block (local, ~ms). Every key it reads becomes a required key of the subscription, so the call itself and any call reading the same state stay warm. |
 | `on_block: true` | Keeps each call's latest output (hex) or error in `skim_subscriptionStatus.results`. |
 | `retention: { mode: archive }` | Stores every BAL-written version of this subscription's keys (including learned keys) in the `--archive` file, so historical `eth_getStorageAt` / `eth_call` work for them. See [archive](archive.md). |
