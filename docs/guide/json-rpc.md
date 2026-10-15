@@ -17,7 +17,8 @@ skim serves standard Ethereum JSON-RPC over HTTP (`--rpc`, default `127.0.0.1:85
 | `eth_blockNumber` | The latest **state-ready** block. |
 | `eth_chainId`, `net_version`, `net_listening`, `eth_syncing`, `web3_clientVersion` | |
 | `eth_gasPrice`, `eth_maxPriorityFeePerGas` | Head base fee + 1 gwei tip, and the 1 gwei tip. |
-| `skim_subscriptionStatus` | Per subscription: `ready`, `block`, `required_keys`, `missing_keys`, `truncated`, `results` (for `on_block` calls). |
+| `skim_subscriptionStatus` | Per subscription: `ready`, `block`, `required_keys`, `missing_keys`, `truncated`, `calls_ok`, `error`, `results` (for `on_block` calls). |
+| `skim_status` | Head, real store sizes (subscribed / on-demand keys, bytecode, refused admissions), peer counts, light-client status. |
 
 ## Block parameters
 | Tag | Meaning |
@@ -25,7 +26,11 @@ skim serves standard Ethereum JSON-RPC over HTTP (`--rpc`, default `127.0.0.1:85
 | `latest` (or omitted) | The latest state-ready block. Pinned for a whole batch request. |
 | a number, or `{blockNumber}` / `{blockHash}` (EIP-1898) | Inside the in-memory window: any block, for keys tracked at that block. Older: archived subscriptions only ([archive](archive.md)). |
 | `pending` | The latest state (skim keeps no mempool), except for `eth_getTransactionCount`. |
-| `safe`, `finalized`, `earliest` | Not tracked yet: `-32002`. |
+| `safe` | The highest execution block a 2/3 supermajority of the sync committee signed off on (light client). `-32002` until verified. |
+| `finalized` | The execution block of the latest finalized beacon block skim verified. `-32002` until verified. |
+| `earliest` | Not tracked: `-32002`. |
+
+**Light-client status:** consensus clients on Sepolia don't serve Gloas light-client data yet, so `safe` and `finalized` currently answer `-32002`. `skim_status.light_client` shows the state.
 
 ## Errors
 | Code | When |

@@ -76,6 +76,9 @@ predictors:
 | `--ephemeral` | off | keep nothing on disk; every start begins empty with a new node identity |
 | `--trusted-peer <enode>` | none | EL peer to keep connected, e.g. your own node (answers are still proof-checked); repeatable |
 | `--cl-mesh <n>` / `--cl-peers <n>` | `8` / `50` | consensus gossip mesh degree and peer target |
+| `--checkpoint <root>` | none | trusted beacon block root for the light client (default: last finalized root verified in a previous run, else `--checkpoint-url`) |
+| `--checkpoint-url <url>` | ethpandaops Sepolia | checkpoint-sync endpoint for the light client's starting root |
+| `--require-verified` | off | `latest` = highest block the sync committee signed off on (~1–2 slots behind) |
 | `--no-learned-patterns` | off | disable the similar-input learned tier (for A/B measurements) |
 
 **Logging:** set `RUST_LOG`, e.g. `RUST_LOG=info,skim::rpc=debug`. That logs every RPC with its latency, and each `eth_call`'s fetch waves.

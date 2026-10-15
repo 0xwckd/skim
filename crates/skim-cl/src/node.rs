@@ -95,7 +95,12 @@ impl NodeConfig {
             mesh_n: 8,
             bootnodes: SEPOLIA_BOOTNODES.iter().map(|s| s.to_string()).collect(),
             initial_status: None,
-            topics: vec!["beacon_block".into(), "execution_payload".into()],
+            topics: vec![
+                "beacon_block".into(),
+                "execution_payload".into(),
+                "light_client_finality_update".into(),
+                "light_client_optimistic_update".into(),
+            ],
             forward: true,
             explicit_peers: Vec::new(),
             attestation_subnets: 2,
@@ -178,6 +183,14 @@ struct Behaviour {
     ping: request_response::Behaviour<Codec>,
     goodbye: request_response::Behaviour<Codec>,
     empty: request_response::Behaviour<Codec>,
+    envelopes: request_response::Behaviour<rpc::EnvelopesCodec>,
+    lc_bootstrap: request_response::Behaviour<rpc::EnvelopesCodec>,
+}
+
+/// Requests from the owner of a [`ClNode`] to its swarm task.
+enum Cmd {
+    Envelopes { start_slot: u64, count: u64, reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<Vec<u8>>>> },
+    Bootstrap { root: [u8; 32], reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<Vec<u8>>>> },
 }
 
 struct PeerState {
@@ -190,9 +203,31 @@ struct PeerState {
     gossip_first: u64,
 }
 
+#[derive(Clone)]
 pub struct ClNode {
     pub stats: Arc<Mutex<NodeStats>>,
     pub local_peer_id: PeerId,
+    cmd: mpsc::Sender<Cmd>,
+}
+
+impl ClNode {
+    /// `ExecutionPayloadEnvelopesByRange(start_slot, count)` from one connected peer whose head
+    /// is at or past the range. Returns each envelope's SSZ (unverified: callers check them as
+    /// they do gossip). Empty slots and pruned ranges simply yield fewer envelopes.
+    pub async fn envelopes_by_range(&self, start_slot: u64, count: u64) -> anyhow::Result<Vec<Vec<u8>>> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let count = count.min(rpc::MAX_REQUEST_PAYLOADS);
+        self.cmd.send(Cmd::Envelopes { start_slot, count, reply }).await.map_err(|_| anyhow::anyhow!("CL node stopped"))?;
+        tokio::time::timeout(Duration::from_secs(20), rx).await.map_err(|_| anyhow::anyhow!("envelopes request timed out"))??
+    }
+
+    /// `LightClientBootstrap(block_root)` from one connected peer (SSZ, unverified).
+    pub async fn light_client_bootstrap(&self, root: [u8; 32]) -> anyhow::Result<Vec<u8>> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.cmd.send(Cmd::Bootstrap { root, reply }).await.map_err(|_| anyhow::anyhow!("CL node stopped"))?;
+        let mut chunks = tokio::time::timeout(Duration::from_secs(20), rx).await.map_err(|_| anyhow::anyhow!("bootstrap timed out"))???;
+        chunks.pop().ok_or_else(|| anyhow::anyhow!("peer has no bootstrap for that root"))
+    }
 }
 
 fn rr_config() -> request_response::Config {
@@ -344,6 +379,15 @@ impl ClNode {
             ping: rr(&[rpc::PING_V1]),
             goodbye: rr(&[rpc::GOODBYE_V1]),
             empty: rr(&empty),
+            // Outbound only: inbound requests on this protocol go to `empty` (nothing served).
+            envelopes: request_response::Behaviour::new(
+                [(StreamProtocol::new(rpc::ENVELOPES_BY_RANGE), ProtocolSupport::Outbound)],
+                request_response::Config::default().with_request_timeout(Duration::from_secs(15)),
+            ),
+            lc_bootstrap: request_response::Behaviour::new(
+                [(StreamProtocol::new(rpc::LIGHT_CLIENT_BOOTSTRAP), ProtocolSupport::Outbound)],
+                request_response::Config::default().with_request_timeout(Duration::from_secs(15)),
+            ),
         };
 
         let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
@@ -369,7 +413,11 @@ impl ClNode {
             ..Default::default()
         }));
         let (tx, rx) = mpsc::channel(4096);
+        let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let runner = Runner {
+            cmd_rx,
+            env_reqs: HashMap::new(),
+            env_rr: 0,
             cfg,
             swarm,
             discv5: Arc::new(discv5),
@@ -389,11 +437,14 @@ impl ClNode {
             seen_nodes: HashSet::new(),
         };
         tokio::spawn(runner.run());
-        Ok((Self { stats, local_peer_id }, rx))
+        Ok((Self { stats, local_peer_id, cmd: cmd_tx }, rx))
     }
 }
 
 struct Runner {
+    cmd_rx: mpsc::Receiver<Cmd>,
+    env_reqs: HashMap<OutboundRequestId, tokio::sync::oneshot::Sender<anyhow::Result<Vec<Vec<u8>>>>>,
+    env_rr: usize,
     cfg: NodeConfig,
     swarm: Swarm<Behaviour>,
     discv5: Arc<Discv5>,
@@ -485,6 +536,7 @@ impl Runner {
                     _ => {}
                 },
                 ev = self.swarm.select_next_some() => self.on_swarm(ev).await,
+                Some(cmd) = self.cmd_rx.recv() => self.on_cmd(cmd),
                 Some(enrs) = found_rx.recv() => {
                     query_in_flight = query_in_flight.saturating_sub(1);
                     self.on_found(enrs);
@@ -513,6 +565,45 @@ impl Runner {
                         });
                     }
                 }
+            }
+        }
+    }
+
+    fn on_cmd(&mut self, cmd: Cmd) {
+        match cmd {
+            Cmd::Envelopes { start_slot, count, reply } => {
+                // Peers whose head covers the range, rotated so retries spread out.
+                let mut cands: Vec<PeerId> = self
+                    .peers
+                    .iter()
+                    // Peers whose head reaches into the range (handshake heads lag the chain).
+                    .filter(|(_, p)| p.status.is_some_and(|s| s.head_slot >= start_slot))
+                    .map(|(id, _)| *id)
+                    .collect();
+                if cands.is_empty() {
+                    let _ = reply.send(Err(anyhow::anyhow!("no CL peer with a head past slot {}", start_slot + count - 1)));
+                    return;
+                }
+                cands.sort();
+                self.env_rr = self.env_rr.wrapping_add(1);
+                let peer = cands[self.env_rr % cands.len()];
+                let mut ssz = Vec::with_capacity(16);
+                ssz.extend_from_slice(&start_slot.to_le_bytes());
+                ssz.extend_from_slice(&count.to_le_bytes());
+                let id = self.swarm.behaviour_mut().envelopes.send_request(&peer, ssz);
+                self.env_reqs.insert(id, reply);
+            }
+            Cmd::Bootstrap { root, reply } => {
+                let mut cands: Vec<PeerId> = self.peers.iter().filter(|(_, p)| p.status.is_some()).map(|(id, _)| *id).collect();
+                if cands.is_empty() {
+                    let _ = reply.send(Err(anyhow::anyhow!("no CL peers yet")));
+                    return;
+                }
+                cands.sort();
+                self.env_rr = self.env_rr.wrapping_add(1);
+                let peer = cands[self.env_rr % cands.len()];
+                let id = self.swarm.behaviour_mut().lc_bootstrap.send_request(&peer, root.to_vec());
+                self.env_reqs.insert(id, reply);
             }
         }
     }
@@ -682,13 +773,23 @@ impl Runner {
                         Err(_) => false,
                     },
                     "beacon_block" => ssz::BlockInfo::parse(&message.data).is_ok(),
+                    // Size check only here; signatures are verified by the light client.
+                    "light_client_optimistic_update" => {
+                        tracing::debug!(len = message.data.len(), "light_client_optimistic_update gossip");
+                        message.data.len() == crate::light::OPTIMISTIC_UPDATE_LEN
+                    }
+                    "light_client_finality_update" => {
+                        tracing::debug!(len = message.data.len(), "light_client_finality_update gossip");
+                        message.data.len() == crate::light::FINALITY_UPDATE_LEN
+                    }
                     // Syntactic check only: skim cannot verify attestations (no state/BLS).
                     n if n.starts_with("beacon_attestation_") => {
                         message.data.len() == SINGLE_ATTESTATION_LEN
                     }
                     _ => true,
                 };
-                let acc = if ok && self.cfg.forward {
+                // Light-client updates are received, not relayed: skim verifies them later.
+                let acc = if ok && self.cfg.forward && !name.starts_with("light_client") {
                     gossipsub::MessageAcceptance::Accept
                 } else {
                     gossipsub::MessageAcceptance::Ignore
@@ -777,6 +878,26 @@ impl Runner {
                     p.goodbye = reason;
                 }
                 tracing::debug!(%peer, ?reason, "goodbye");
+            }
+            BehaviourEvent::Envelopes(R::Message { message: M::Response { request_id, response }, .. }) => {
+                if let Some(reply) = self.env_reqs.remove(&request_id) {
+                    let _ = reply.send(Ok(response));
+                }
+            }
+            BehaviourEvent::Envelopes(R::OutboundFailure { request_id, error, .. }) => {
+                if let Some(reply) = self.env_reqs.remove(&request_id) {
+                    let _ = reply.send(Err(anyhow::anyhow!("envelopes request failed: {error}")));
+                }
+            }
+            BehaviourEvent::LcBootstrap(R::Message { message: M::Response { request_id, response }, .. }) => {
+                if let Some(reply) = self.env_reqs.remove(&request_id) {
+                    let _ = reply.send(Ok(response));
+                }
+            }
+            BehaviourEvent::LcBootstrap(R::OutboundFailure { request_id, error, .. }) => {
+                if let Some(reply) = self.env_reqs.remove(&request_id) {
+                    let _ = reply.send(Err(anyhow::anyhow!("bootstrap request failed: {error}")));
+                }
             }
             BehaviourEvent::Empty(R::Message { message: M::Request { channel, .. }, .. }) => {
                 self.stats.lock().unwrap().empty_served += 1;

@@ -7,6 +7,7 @@
 //! - [`verify`]: rebuild the EL header from a payload and check its hash (ties the BAL to it).
 
 pub mod gossip;
+pub mod light;
 pub mod node;
 pub mod rpc;
 pub mod ssz;

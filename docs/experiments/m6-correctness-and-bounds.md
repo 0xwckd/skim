@@ -1,0 +1,102 @@
+# M6: correctness and bounds under restarts, reorgs and churn
+
+Runs: 2026-10-15 (KST), Sepolia.
+
+**Goal:** after an external review, prove that long runs on small resources never return a wrong value, instead of adding RPC methods.
+
+## Review findings fixed (each with a regression test)
+| Finding | Fix | Test |
+|---|---|---|
+| Archive: versions written by `write_base` (late-archived keys, replayed writes) and by backfill were not journaled, so a reorg kept the old fork's value | Every stored version is journaled; rollback also withdraws coverage that starts above the rollback point | `reorg_removes_late_base_and_replayed_versions` (fails without the fix) |
+| `BLOCKHASH` read an unknown hash as zero; a 256-block window lost H−256 | Unknown hash = miss, resolved from hash-linked ancestor headers or refused; a 257-entry hash ring independent of `--window` | `blockhash_ring_outlives_a_short_window`, `ancestor_hashes_are_accepted_only_when_hash_linked` |
+| `max_subscribed_keys` trimmed bookkeeping only; fetched keys were already subscribed; bytecode never freed | Limit enforced by the store at admission for every path; over-limit keys stay on demand; declared keys over the limit fail at startup; bytecode GC'd with its accounts | `subscribed_key_limit_is_enforced_at_admission`, `bytecode_is_dropped_with_its_last_account`, `declared_keys_over_the_limit_are_rejected_at_startup` |
+| A simulation subscription whose call failed learned no keys and read as ready | Ready requires every call to have run cleanly at that block, nothing truncated | `failed_or_truncated_simulations_are_never_ready` |
+| `eth_call` ignored `gasPrice`, `accessList`, `authorizationList` | Honoured; blob fields or conflicting fee fields rejected (`-32602`) | live: 354/354 `GASPRICE` probes matched (below) |
+
+## Chaos soak (`docs/experiments/tools/chaos_soak.py`, 2 h)
+Every block, skim and a reference node answered the same requests at the same block hash. Each answer was classified:
+- **match:** skim's answer equals the reference's
+- **refused:** skim returned an error such as `-32002`
+- **WRONG:** skim returned a value the reference contradicts
+
+Every 6–12 minutes the soak either killed skim (SIGKILL), restarted it gracefully, or restarted it with the other config (a different key set). The archive file persisted throughout.
+
+**Setup:**
+- `max_subscribed_keys: 60`, `--window 32` (so archived reads come from disk)
+- a local full node pinned as the state peer (`--trusted-peer`; its answers are still Merkle-checked)
+- a separate reference node
+
+Partway through, the binary under test was rebuilt with restart persistence, so later restarts also exercised the snapshot path.
+
+| | Result |
+|---|---|
+| Blocks | 355 |
+| Disruptions | 12 (5 graceful restarts, 4 SIGKILL, 3 config switches) |
+| Answers | **3,465 match · 23 refused · 0 wrong** (3 where the reference itself errored) |
+| Random V3 quotes / subscribed quote | 1,036 / 350 match, 4 / 3 refused |
+| Subscribed / cold slots | 707 / 342 match, 3 / 13 refused |
+| `BLOCKHASH(n−k)`, random k in 1..256 | 350 match |
+| `GASPRICE` with an explicit price | 354 match |
+| Archived slot at older blocks | 326 match |
+| Subscribed keys | max 60 (limit 60), 0 samples over the limit; up to 177 admissions refused |
+| Memory (RSS) | P50 85 MB, max 102 MB |
+
+The refusals are reads during the seconds after a restart, before state was fetched again. They are correct behaviour: unknown is refused, not guessed.
+
+## Restart persistence
+skim keeps a snapshot of subscribed state (values at a block, plus referenced bytecode), its EL node key, and known peers in `--data-dir`. On start the snapshot is used only after the chain from its block to the head is verified:
+1. headers link by hash at both ends
+2. every BAL matches its header
+3. those blocks' writes are replayed
+
+Otherwise it is discarded. Tests cover a snapshot from an orphaned fork, a chain that ends at the wrong head, and a chain with a gap.
+
+**Restart timing** (`data/persist-test.sh`, Uniswap V3 config, public peers):
+
+| Run | Cold (no snapshot) | With snapshot |
+|---|---|---|
+| 1 | 183 s | 138 s, 72 s |
+| 2 | 74 s | 121 s, 231 s |
+
+Both runs are dominated by waiting for the first EL peer that serves eth/71. Replaying the snapshot itself takes about 1 s. With so few public EL peers, a snapshot doesn't reliably speed up restarts, so catching up from consensus peers is being added (below).
+
+## Catching up from consensus peers
+Gloas `ExecutionPayloadEnvelopesByRange` returns recent payloads with their BALs, and consensus peers connect within seconds. skim now requests the restart gap this way first and verifies each envelope exactly like gossip. It falls back to EL peers only if that fails.
+- **Probe** (`skim probe-cl-req`): peers served 8 envelopes per request, 100–250 KB each.
+- **First integration attempt:** failed because skim only asked peers whose handshake head covered the whole range, and at startup none did. Fixed.
+- **Subscription maintenance:** it now waits while a restore runs, instead of competing for EL peers.
+
+**Restart timing with consensus catch-up** (same test):
+
+| Round | Ready after |
+|---|---|
+| Cold (no snapshot) | 83 s |
+| Snapshot | 36 s |
+| Snapshot | 53 s |
+
+The snapshot replay itself took 2.4–2.8 s from consensus peers. Most of the remaining time is waiting for the first gossiped block (~20 s) and the subscription pass.
+
+## Consensus light client
+Implemented: the Altair sync protocol with Gloas containers.
+- **Bootstrap:** from a checkpoint root, with the sync-committee branch checked at gindex 2945.
+- **Updates:** optimistic and finality updates require a 2/3 supermajority BLS aggregate signature, and the execution block hash is proven against the beacon body root at gindex 2856.
+- **Committee rollover:** through signed finalized headers.
+- **RPC:** `safe` and `finalized` block tags, `--require-verified`, and status in `skim_status`.
+- **Unit tests:** Merkle branches, header roots, and BLS aggregate verification, including rejection of a wrong header, a wrong fork version, and too few signers.
+
+**Live status: blocked by the network, not by skim.**
+- **Bootstrap:** Sepolia peers (Lighthouse v8.3.0-rc.0) answer *"Sync committee branch for block root … not found"*, even for the current finalized checkpoint.
+- **Gossip:** no light-client update arrived on either topic in 3 minutes.
+- **Local Lighthouse:** with its light-client server enabled (the default), it returns 404 for the finality update, the optimistic update, and the bootstrap.
+
+Consensus clients don't produce Gloas light-client data yet. Until they do, skim reports this in `skim_status` and answers `safe` / `finalized` with `-32002`. Nothing is assumed.
+
+## Consensus gossip mesh A/B
+Mesh 12 / 80 peers against 8 / 50, measured on the same 304 blocks:
+
+| Metric | Old (8 / 50) | New (12 / 80) |
+|---|---|---|
+| Arrival after slot start, P50 | 854 ms | 760 ms |
+| Arrival after slot start, P90 | 1,601 ms | 1,671 ms |
+
+The median per-block difference between the two was −17 ms (new earlier in 56% of blocks). The payload-topic mesh stayed at 6 peers either way, because remote peers decide whether to graft us. The defaults stay at 8 / 50.

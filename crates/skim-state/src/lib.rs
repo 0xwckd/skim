@@ -557,6 +557,11 @@ impl Store {
         added
     }
 
+    /// Number of a block hash on the in-memory chain.
+    pub fn number_of_hash(&self, hash: &B256) -> Option<u64> {
+        self.inner.read().chain.iter().rev().find(|(_, b)| b.hash == *hash).map(|(n, _)| *n)
+    }
+
     /// Number of an archived block hash.
     pub fn archived_number(&self, hash: &B256) -> Option<u64> {
         self.archive.as_ref().and_then(|a| a.number_of(hash).ok().flatten())

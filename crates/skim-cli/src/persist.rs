@@ -74,11 +74,26 @@ pub fn save_now(p: &Arc<Persist>, store: &Store, head: &BlockRef) {
 
 /// Verifies the snapshot against the chain up to `head` and installs it. Never partially:
 /// either every check passes and all keys are inserted, or nothing is.
-pub async fn restore(store: Arc<Store>, net: ElNet, saved: Saved, head: BlockRef) {
+pub async fn restore(store: Arc<Store>, net: ElNet, cl: skim_cl::ClNode, saved: Saved, head: BlockRef) {
     let t = Instant::now();
+    // Consensus peers connect within seconds of start; EL peers can take minutes. Try the
+    // envelopes (payload + BAL, verified like gossip) first, then fall back to EL.
+    if saved.number < head.number && head.number - saved.number <= MAX_REPLAY {
+        match fetch_via_cl(&cl, &saved, &head).await {
+            Ok(blocks) => match verify_and_replay(&saved, &blocks, &head).and_then(|(v, c)| install(&store, &head, &v, &c)) {
+                Ok(n) => {
+                    tracing::info!(keys = n, from = saved.number, to = head.number, ms = t.elapsed().as_millis() as u64,
+                        source = "consensus peers", "restart snapshot verified and replayed to the head");
+                    return;
+                }
+                Err(e) => tracing::warn!("restart via consensus peers failed ({e}); trying EL peers"),
+            },
+            Err(e) => tracing::info!("restart via consensus peers unavailable ({e}); trying EL peers"),
+        }
+    }
     match restore_inner(&store, &net, &saved, &head).await {
         Ok(n) => tracing::info!(keys = n, from = saved.number, to = head.number, ms = t.elapsed().as_millis() as u64,
-            "restart snapshot verified and replayed to the head"),
+            source = "EL peers", "restart snapshot verified and replayed to the head"),
         Err(e) => tracing::warn!(from = saved.number, "restart snapshot discarded ({e}); fetching state as usual"),
     }
 }
@@ -135,6 +150,51 @@ async fn restore_inner(store: &Store, net: &ElNet, saved: &Saved, head: &BlockRe
     }
     let (values, code) = verify_and_replay(saved, &fetched, head)?;
     install(store, head, &values, &code)
+}
+
+/// Blocks `saved.number + 1 ..= head.number` from consensus peers' payload envelopes, walking
+/// back from the head's slot. Each envelope is checked like gossip (the rebuilt header must
+/// hash to the payload's block hash, which commits to the BAL); linkage is checked after.
+async fn fetch_via_cl(cl: &skim_cl::ClNode, saved: &Saved, head: &BlockRef) -> anyhow::Result<Vec<(alloy_consensus::Header, BlockWrites)>> {
+    const CHUNK: u64 = 32;
+    let deadline = Instant::now() + std::time::Duration::from_secs(60);
+    let head_slot = head.timestamp.saturating_sub(skim_cl::node::SEPOLIA_GENESIS_TIME) / 12;
+    let lowest_needed = saved.number + 1;
+    let mut got: std::collections::BTreeMap<u64, (alloy_consensus::Header, BlockWrites)> = Default::default();
+    let mut end = head_slot;
+    // Slots >= blocks (some slots are empty), so walk back until the lowest needed block shows up.
+    while got.keys().next().is_none_or(|n| *n > lowest_needed) {
+        anyhow::ensure!(Instant::now() < deadline, "timed out at slot {end}");
+        anyhow::ensure!(head_slot - end <= MAX_REPLAY * 2, "walked back {} slots without reaching block {lowest_needed}", head_slot - end);
+        let start = end.saturating_sub(CHUNK - 1);
+        let mut chunks = None;
+        for _ in 0..4 {
+            match cl.envelopes_by_range(start, end - start + 1).await {
+                Ok(c) if !c.is_empty() => {
+                    chunks = Some(c);
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => tracing::debug!("envelopes {start}..={end}: {e}"),
+            }
+        }
+        let chunks = chunks.ok_or_else(|| anyhow::anyhow!("no peer served envelopes for slots {start}..={end}"))?;
+        for ssz in chunks {
+            let env = skim_cl::ssz::Envelope::parse(&ssz)?;
+            let v = skim_cl::verify::verify_payload(&env);
+            anyhow::ensure!(v.ok, "envelope for block {} does not hash to its block_hash", env.payload.block_number);
+            let n = v.header.number;
+            if n >= lowest_needed && n <= head.number {
+                let bal = skim_bal::decode(env.payload.block_access_list)?;
+                got.insert(n, (v.header, BlockWrites::from_bal(&bal)));
+            }
+        }
+        if start == 0 {
+            break;
+        }
+        end = start - 1;
+    }
+    Ok(got.into_values().collect())
 }
 
 type Replayed = (Vec<(skim_bal::StateKey, alloy_primitives::U256)>, Vec<(B256, alloy_primitives::Bytes)>);

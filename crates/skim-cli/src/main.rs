@@ -5,8 +5,10 @@ mod bench_node;
 mod chain;
 mod chaindata;
 mod persist;
+mod light;
 mod follow;
 mod probe_cl;
+mod probe_clreq;
 mod probe_call;
 mod probe_el;
 mod rpc;
@@ -26,6 +28,8 @@ struct Cli {
 enum Cmd {
     /// M0 Spike B: Sepolia EL peers, eth/71 BALs, snap/2 point lookups, root-servable lag.
     ProbeEl(probe_el::Args),
+    /// Diagnostics: CL req/resp (payload envelopes by range, light-client bootstrap).
+    ProbeClReq(probe_clreq::Args),
     /// M0 Spike C: cold-call SNAP rounds and latency vs Infura eth_call at the same block.
     ProbeCall(probe_call::Args),
     /// M1: follow the chain from CL gossip BALs into the MVCC store; time block -> state ready
@@ -52,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
     match Cli::parse().cmd {
         Cmd::ProbeEl(args) => probe_el::run(args).await,
+        Cmd::ProbeClReq(args) => probe_clreq::run(args).await,
         Cmd::ProbeCall(args) => probe_call::run(args).await,
         Cmd::Follow(args) => follow::run(args).await,
         Cmd::Run(args) => run::run(args).await,

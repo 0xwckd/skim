@@ -257,6 +257,91 @@ impl request_response::Codec for Codec {
     }
 }
 
+pub const ENVELOPES_BY_RANGE: &str = "/eth2/beacon_chain/req/execution_payload_envelopes_by_range/1/ssz_snappy";
+pub const LIGHT_CLIENT_BOOTSTRAP: &str = "/eth2/beacon_chain/req/light_client_bootstrap/1/ssz_snappy";
+/// Spec limit per request (`MAX_REQUEST_PAYLOADS`).
+pub const MAX_REQUEST_PAYLOADS: u64 = 128;
+const MAX_ENVELOPE_RESPONSE_BYTES: u64 = 256 << 20;
+
+/// Requester for chunked SSZ protocols (`ExecutionPayloadEnvelopesByRange`,
+/// `LightClientBootstrap`): request is raw SSZ, response the
+/// SSZ of each `SignedExecutionPayloadEnvelope` chunk (context bytes checked by the caller via
+/// the envelope itself; the digest is skipped here).
+#[derive(Clone, Default)]
+pub struct EnvelopesCodec;
+
+/// Decodes one `varint(len) ++ snappy_frames` payload from the start of `b`, returning it and
+/// how many input bytes it used (responses carry several chunks back to back).
+pub fn decode_payload_len(b: &[u8], max: u64) -> io::Result<(Vec<u8>, usize)> {
+    let (len, n) = read_varint(b)?;
+    if len as u64 > max {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "chunk too large"));
+    }
+    let mut out = vec![0u8; len];
+    let mut cur = io::Cursor::new(&b[n..]);
+    snap::read::FrameDecoder::new(&mut cur).read_exact(&mut out)?;
+    Ok((out, n + cur.position() as usize))
+}
+
+/// Splits a ByRange/ByRoot response into chunk payloads. Stops at the first error chunk.
+pub fn split_context_chunks(mut b: &[u8]) -> io::Result<Vec<Vec<u8>>> {
+    let mut out = Vec::new();
+    while let Some((&code, rest)) = b.split_first() {
+        if code != 0 {
+            if out.is_empty() {
+                // Only an error: report it (1 InvalidRequest, 2 ServerError, 3 ResourceUnavailable).
+                let msg = decode_payload_len(rest, 256).map(|(m, _)| String::from_utf8_lossy(&m).into_owned()).unwrap_or_default();
+                return Err(io::Error::other(format!("peer error {code}: {msg}")));
+            }
+            break; // error chunk after data: what came before is still valid
+        }
+        if rest.len() < 4 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "missing context bytes"));
+        }
+        let (ssz, used) = decode_payload_len(&rest[4..], 16 << 20)?;
+        out.push(ssz);
+        b = &rest[4 + used..];
+    }
+    Ok(out)
+}
+
+impl request_response::Codec for EnvelopesCodec {
+    type Protocol = StreamProtocol;
+    type Request = Vec<u8>;
+    type Response = Vec<Vec<u8>>;
+
+    async fn read_request<T>(&mut self, _p: &StreamProtocol, _io: &mut T) -> io::Result<Vec<u8>>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "envelopes are not served"))
+    }
+
+    async fn read_response<T>(&mut self, _p: &StreamProtocol, io: &mut T) -> io::Result<Vec<Vec<u8>>>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let mut buf = Vec::new();
+        io.take(MAX_ENVELOPE_RESPONSE_BYTES).read_to_end(&mut buf).await?;
+        split_context_chunks(&buf)
+    }
+
+    async fn write_request<T>(&mut self, _p: &StreamProtocol, io: &mut T, ssz: Vec<u8>) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        io.write_all(&encode_payload(&ssz)).await?;
+        io.flush().await
+    }
+
+    async fn write_response<T>(&mut self, _p: &StreamProtocol, _io: &mut T, _res: Vec<Vec<u8>>) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "envelopes are not served"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,5 +383,25 @@ mod tests {
         assert_eq!(enc[0], 92); // varint of the uncompressed length
         assert_eq!(&enc[1..5], &[0xff, 0x06, 0x00, 0x00]); // snappy stream identifier
         assert_eq!(decode_payload(&enc).unwrap(), ssz);
+    }
+
+    #[test]
+    fn splits_multi_chunk_responses_with_context_bytes() {
+        let mut b = Vec::new();
+        for payload in [vec![1u8; 70_000], vec![2u8; 10], vec![]] {
+            b.push(0);
+            b.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
+            b.extend_from_slice(&encode_payload(&payload));
+        }
+        b.push(3); // an error chunk ends the response
+        b.extend_from_slice(&encode_payload(b"unavailable"));
+        let chunks = split_context_chunks(&b).unwrap();
+        let mut only_err = vec![3u8];
+        only_err.extend_from_slice(&encode_payload(b"unavailable"));
+        assert!(split_context_chunks(&only_err).unwrap_err().to_string().contains("peer error 3: unavailable"));
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0], vec![1u8; 70_000]);
+        assert_eq!(chunks[1], vec![2u8; 10]);
+        assert!(chunks[2].is_empty());
     }
 }

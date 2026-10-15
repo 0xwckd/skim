@@ -17,7 +17,7 @@ skim is built so that it can be **slow or unavailable, but not wrong** about the
 | Guarantee | Status |
 |---|---|
 | **A value matches the block it claims to be from** (state root, receipts root, block hash) | Checked, for every value skim serves |
-| **That block is on the canonical chain** | **Not checked yet.** skim trusts the gossiped head. |
+| **That block is on the canonical chain** | Implemented through the consensus light client (sync-committee signatures, served as `safe` / `finalized`), but **not active yet**: Sepolia's consensus clients don't serve Gloas light-client data. Until they do, skim trusts the gossiped head. |
 
 A Merkle proof shows that a value belongs to a root. It doesn't show that the root belongs to the right chain. Until consensus verification lands, a network that feeds skim a well-formed but non-canonical block can make it serve that block's (correctly proven) state.
 

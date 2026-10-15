@@ -81,7 +81,7 @@ All numbers are from Sepolia, measured from one home connection over public peer
 |---|---|
 | **Correctness** | Every completed run matched a reference archive node byte for byte at the same block hash. Totals: 1,753 calls in a 1-hour soak; 2,700 calls with randomized, never-seen Uniswap V3 quotes; 866 with proof verification on; 36/36 JSON-RPC requests ([P0](docs/experiments/m2-p0-miss-tail.md), [verified state](docs/experiments/m2-verified-state.md)). |
 | **State ready after a new block** | BAL applied **0.16 ms** after the payload arrives. State ready at about **880 ms** P50 after slot start, bounded by gossip arrival ([M1](docs/experiments/m1-follower.md)). |
-| **Warm simulation** | 7 calls (incl. Uniswap V3 quotes) in **3.8 ms** total; JSON-RPC `eth_call` in 0.5–6 ms |
+| **Warm simulation** | Uniswap V3 quote over JSON-RPC: **0.25 ms** P50, 0.56 ms P99; ~8,500 calls/s at 50 in flight |
 | **Fetch reliability** | 298,084 SNAP jobs over public peers, **0 failed**, 126 disconnects absorbed ([soak](docs/experiments/m0-soak.md)) |
 | **Unseen inputs** | Background prefetch had **99.9%** of predicted keys ready at call time. Worst on-path fetch: 1.6 s ([P1](docs/experiments/m2-p0-miss-tail.md)). |
 | **Footprint** | ~120 MB RSS, ~0.25 CPU core. On disk: a restart snapshot of subscribed state (~1 MB for 2,400 keys; `--ephemeral` for none) |
@@ -186,7 +186,9 @@ Consensus light-client verification is on the roadmap. Until then, skim trusts t
 - [x] **M4.2: backfill from retained BALs.** `--archive-backfill N` extends archived history up to about 2 weeks before a subscription existed. Unchanged keys are covered for the whole range; written keys are covered from their first write. Live: 102 historical reads matched a reference archive node, 3 were correctly refused, 0 were wrong.
 - [x] **M5:** generalized learned patterns (exact args + amount buckets) with key/byte bounds. The V3 predictor is configurable in `skim run`: calls that needed the network fell from 51 to 19 out of 400. Added `eth_sendRawTransaction`, receipts and `eth_getLogs`, all identical to a reference node in every check ([M5](docs/experiments/m5-predictors-and-chain-data.md)).
 - [ ] `storage: all` for small contracts; WebSocket pushes for `on_block` subscriptions
-- [ ] Consensus light-client verification; mainnet once Glamsterdam ships there
+- [x] **M6: correctness and bounds.** Review fixes with regression tests. 2 h chaos soak (kills, restarts, key-set switches): 3,465 matches, 23 refusals, 0 wrong. Verified restart snapshots, warm `eth_call` 3× faster ([M6](docs/experiments/m6-correctness-and-bounds.md))
+- [ ] Consensus light-client verification: implemented and unit-tested, waiting on consensus clients to serve Gloas light-client data
+- [ ] Mainnet once Glamsterdam ships there
 
 Design: [PROJECT.md](PROJECT.md). Guides and experiment logs: [docs/](docs).
 

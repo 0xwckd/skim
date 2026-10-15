@@ -67,6 +67,17 @@ pub struct Args {
     /// Keep nothing on disk (every start begins empty, with a new node identity).
     #[arg(long)]
     ephemeral: bool,
+    /// Trusted beacon block root to bootstrap consensus verification from (weak subjectivity).
+    /// Default: the last finalized root this node verified, else `--checkpoint-url`.
+    #[arg(long)]
+    checkpoint: Option<alloy_primitives::B256>,
+    /// Checkpoint-sync endpoint used when no checkpoint is given or saved.
+    #[arg(long, default_value = "https://checkpoint-sync.sepolia.ethpandaops.io")]
+    checkpoint_url: String,
+    /// Answer `latest` with the highest block the sync committee has signed off on, instead of
+    /// the newest gossiped block (trust-minimized, typically ~1-2 slots behind).
+    #[arg(long)]
+    require_verified: bool,
     /// Disable the learned-set pattern tier (A/B measurements).
     #[arg(long)]
     no_learned_patterns: bool,
@@ -246,12 +257,21 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             tracing::info!(peers = s.connected, outbound = s.outbound, mesh = ?s.mesh, topic_peers = ?s.topic_peers, "CL gossip");
         }
     });
+    let light = crate::light::Light::new(cl.clone(), persist.clone());
+    light.start(args.checkpoint, args.checkpoint_url.clone());
     let chaindata = crate::chaindata::ChainData::new(net.clone(), args.max_logs_range);
-    tokio::spawn(serve(Arc::new(Rpc { sim: sim.clone(), subs: Some(subs.clone()), chain: Some(chaindata.clone()) }), args.rpc));
+    tokio::spawn(serve(Arc::new(Rpc {
+        sim: sim.clone(),
+        subs: Some(subs.clone()),
+        chain: Some(chaindata.clone()),
+        light: Some(light.clone()),
+        require_verified: args.require_verified,
+    }), args.rpc));
     if store.archive().is_some() {
         spawn_archive_healer(store.clone(), net.clone(), args.archive_backfill);
     }
     let maintaining = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let restoring = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let v3 = cfg.predictors.uniswap_v3.map(Arc::new);
     if let Some(v) = &v3 {
         sim.predictor.lock().base_words = v.words;
@@ -280,6 +300,11 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             _ = term.recv() => break,
         };
         let ClEvent::Gossip { topic, data, received, .. } = ev else { continue };
+        if topic.starts_with("light_client_") {
+            let (light, store) = (light.clone(), store.clone());
+            tokio::spawn(async move { light.on_gossip(&topic, &data, &store).await });
+            continue;
+        }
         if topic != "execution_payload" {
             continue;
         }
@@ -306,8 +331,16 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         match chain.place(v.header, Arc::new(writes)).await {
             Placed::Applied { ready, reorged_to, filled } => {
                 tracing::info!(number, arrival_ms = arrival_ms as i64, changed = ready.changed_keys.len(), ?reorged_to, filled, "state ready");
+                light.on_block(&store);
                 if let Some(s) = saved.take() {
-                    tokio::spawn(crate::persist::restore(store.clone(), net.clone(), s, ready.block));
+                    // Subscriptions wait for the restore: fetching the same keys over SNAP in
+                    // parallel would only compete for (often absent) EL peers.
+                    restoring.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let (store, net, cl, flag, b) = (store.clone(), net.clone(), cl.clone(), restoring.clone(), ready.block);
+                    tokio::spawn(async move {
+                        crate::persist::restore(store, net, cl, s, b).await;
+                        flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                    });
                 }
                 if let Some(p) = &persist
                     && number % 4 == 0
@@ -318,7 +351,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                     tokio::spawn(v3_tick(sim.clone(), v.clone(), v3_state.clone(), ready.block));
                 }
                 // Keep subscriptions current and their readiness fresh (one pass at a time).
-                if !maintaining.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                if !restoring.load(std::sync::atomic::Ordering::SeqCst) && !maintaining.swap(true, std::sync::atomic::Ordering::SeqCst) {
                     let (sim, subs, flag, b) = (sim.clone(), subs.clone(), maintaining.clone(), ready.block);
                     tokio::spawn(async move {
                         subs.maintain(&sim, &b).await;

@@ -91,6 +91,9 @@ pub struct Rpc {
     pub sim: Arc<Simulator>,
     pub subs: Option<Arc<skim_sim::subscription::Subscriptions>>,
     pub chain: Option<Arc<ChainData>>,
+    pub light: Option<Arc<crate::light::Light>>,
+    /// `latest` = highest block the sync committee signed off on.
+    pub require_verified: bool,
 }
 
 impl From<DataError> for RpcError {
@@ -115,6 +118,17 @@ impl Rpc {
                 .ok_or_else(|| RpcError::unavailable(format!("block {n} is outside the retained window and not archived"))),
             // Pending state = latest state (skim keeps no mempool); see eth_getTransactionCount.
             BlockId::Number(BlockNumberOrTag::Pending) => latest(),
+            BlockId::Number(t @ (BlockNumberOrTag::Safe | BlockNumberOrTag::Finalized)) => {
+                // `safe`: signed by a sync-committee supermajority; `finalized`: finalized
+                // beacon block's execution block. Both from the light client.
+                let st = self.light.as_ref().map(|l| l.status()).unwrap_or_default();
+                let n = if t == BlockNumberOrTag::Safe { st.verified_block } else { st.finalized_block };
+                let n = n.ok_or_else(|| RpcError::unavailable(format!("no {t} block verified yet")))?;
+                store
+                    .block(n)
+                    .or_else(|| store.archived_block(n).map(|(b, _)| b))
+                    .ok_or_else(|| RpcError::unavailable(format!("{t} block {n} is outside the retained window")))
+            }
             BlockId::Number(t) => Err(RpcError::unavailable(format!("block tag {t} is not tracked yet"))),
             BlockId::Hash(h) => {
                 let head = latest()?;
@@ -325,6 +339,7 @@ impl Rpc {
                         "subscribed_keys": z.watched_keys, "on_demand_keys": z.temp_keys,
                         "code": z.code, "code_bytes": z.code_bytes, "admissions_refused": z.admissions_refused,
                     },
+                    "light_client": self.light.as_ref().map(|l| l.status()),
                     "el_peers": peers.len(),
                     "snap_peers": peers.iter().filter(|(_, p)| p.snap1 || p.snap2).count(),
                 }))
@@ -358,7 +373,11 @@ impl Rpc {
 }
 
 async fn handle(State(rpc): State<Arc<Rpc>>, Json(body): Json<Value>) -> Json<Value> {
-    let latest = rpc.sim.store.head();
+    let latest = if rpc.require_verified {
+        rpc.light.as_ref().and_then(|l| l.status().verified_block).and_then(|n| rpc.sim.store.block(n))
+    } else {
+        rpc.sim.store.head()
+    };
     match body {
         Value::Array(reqs) => {
             let mut out = Vec::with_capacity(reqs.len());
