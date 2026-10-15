@@ -76,6 +76,10 @@ pub struct Args {
     /// Random new-input V3 quotes per block (no learned set applies to them).
     #[arg(long, default_value_t = 0)]
     random_quotes: usize,
+    /// Run the State Access Predictor before each call (learned sets + V3 input-aware range)
+    /// and expand V3 bitmap misses.
+    #[arg(long)]
+    predictor: bool,
 }
 
 fn unix_ms(t: SystemTime) -> f64 {
@@ -97,6 +101,9 @@ struct SnapMisses {
     accounts: Vec<Address>,
     storage: Vec<(Address, U256)>,
     code: Vec<B256>,
+    /// Every account/slot read (hit or miss): the call's access set.
+    touched_accounts: Vec<Address>,
+    touched_storage: Vec<(Address, U256)>,
 }
 
 struct SnapDb<'a> {
@@ -108,6 +115,7 @@ impl DatabaseRef for SnapDb<'_> {
     type Error = std::convert::Infallible;
 
     fn basic_ref(&self, a: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        self.misses.lock().unwrap().touched_accounts.push(a);
         let g = |k| self.snap.get(&k).unwrap_or(StateValue::Unknown);
         match (g(StateKey::Balance(a)), g(StateKey::Nonce(a)), g(StateKey::CodeHash(a))) {
             (StateValue::Known(balance), StateValue::Known(nonce), StateValue::Known(ch)) => {
@@ -135,6 +143,7 @@ impl DatabaseRef for SnapDb<'_> {
     }
 
     fn storage_ref(&self, a: Address, slot: U256) -> Result<U256, Self::Error> {
+        self.misses.lock().unwrap().touched_storage.push((a, slot));
         match self.snap.get(&StateKey::Storage(a, slot)).unwrap_or(StateValue::Unknown) {
             StateValue::Known(v) => Ok(v),
             StateValue::Unknown => {
@@ -234,6 +243,9 @@ struct Stats {
     calls_run: u64,
     calls_with_miss: u64,
     prefetch_rounds: u64,
+    predict_waves: u64,
+    predict_keys: u64,
+    predict_wall: Samples,
     prefetch_keys: u64,
     prefetch_wall: Samples,
     match_ok: u64,
@@ -254,6 +266,7 @@ struct Ctx {
     v3_words: i32,
     v3_pools: StdMutex<Vec<prefetch::V3Pool>>,
     random_quotes: usize,
+    predictor: Option<StdMutex<crate::predictor::Predictor>>,
 }
 
 /// First successful Infura `eth_call` at a block number: when that request was sent (an upper
@@ -342,6 +355,13 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         v3_words: args.v3_words,
         v3_pools: Default::default(),
         random_quotes: args.random_quotes,
+        predictor: args.predictor.then(|| {
+            StdMutex::new(crate::predictor::Predictor {
+                learned: crate::learned::Learned::new(8, 0.5, 256),
+                v3: Vec::new(),
+                base_words: args.v3_words.max(1),
+            })
+        }),
     });
     for a in args.v3_pools.iter().chain([&crate::probe_call::WETH_ADDR, &crate::probe_call::USDC_ADDR]) {
         ctx.store.watch_address(*a);
@@ -466,6 +486,26 @@ async fn bootstrap(ctx: &Ctx, h: &Header, b: &BlockRef) {
     tracing::info!(at = b.number, ?head, "bootstrap complete; following");
 }
 
+/// Splits predicted keys into the accounts and slots that are still unknown at `snap`.
+fn unknown_split(snap: &Snapshot, keys: &[StateKey]) -> (Vec<Address>, Vec<(Address, U256)>) {
+    let mut accts = Vec::new();
+    let mut slots = Vec::new();
+    for k in keys {
+        if !matches!(snap.get(k), Ok(StateValue::Unknown)) {
+            continue;
+        }
+        match *k {
+            StateKey::Storage(a, s) => slots.push((a, s)),
+            StateKey::Balance(a) | StateKey::Nonce(a) | StateKey::CodeHash(a) => {
+                if !accts.contains(&a) {
+                    accts.push(a);
+                }
+            }
+        }
+    }
+    (accts, slots)
+}
+
 /// Reads each pool's `tickSpacing()` from the bootstrapped state (resolving it if needed).
 async fn detect_pools(ctx: &Arc<Ctx>, h: &Header, b: &BlockRef, pools: &[Address]) {
     let sel = Bytes::from_static(&[0xd0, 0xc9, 0x3a, 0x7c]); // tickSpacing()
@@ -477,8 +517,26 @@ async fn detect_pools(ctx: &Arc<Ctx>, h: &Header, b: &BlockRef, pools: &[Address
             if m.accounts.is_empty() && m.storage.is_empty() && m.code.is_empty() {
                 match out.as_ref().and_then(prefetch::decode_spacing) {
                     Some(spacing) => {
-                        tracing::info!(%address, spacing, "V3 pool registered for prefetch");
-                        ctx.v3_pools.lock().unwrap().push(prefetch::V3Pool { address, spacing });
+                        let pool = prefetch::V3Pool { address, spacing };
+                        ctx.v3_pools.lock().unwrap().push(pool);
+                        let word = |sel: [u8; 4]| -> Option<U256> {
+                            let c = Call { name: "pool".into(), to: address, data: Bytes::copy_from_slice(&sel) };
+                            let (o, m) = simulate(&snap, h, &c);
+                            (m.accounts.is_empty() && m.storage.is_empty()).then_some(())?;
+                            o.filter(|o| o.len() == 32).map(|o| U256::from_be_slice(&o))
+                        };
+                        let fee = word([0xdd, 0xca, 0x3f, 0x43]);
+                        let t0 = word([0x0d, 0xfe, 0x16, 0x81]);
+                        let t1 = word([0xd2, 0x12, 0x20, 0xa7]);
+                        tracing::info!(%address, spacing, ?fee, "V3 pool registered for prefetch");
+                        if let (Some(p), Some(fee), Some(t0), Some(t1)) = (&ctx.predictor, fee, t0, t1) {
+                            p.lock().unwrap().v3.push(crate::predictor::V3Meta {
+                                pool,
+                                fee: fee.to(),
+                                token0: Address::from_word(t0.into()),
+                                token1: Address::from_word(t1.into()),
+                            });
+                        }
                     }
                     None => tracing::warn!(%address, "tickSpacing() failed"),
                 }
@@ -547,6 +605,20 @@ async fn measure_block(ctx: Arc<Ctx>, h: Header, b: BlockRef, recv_ms: f64, appl
     let mut resolved = 0u64;
     let mut miss_log = Vec::new();
     for call in &calls {
+        // State Access Predictor: fetch the predicted-but-unknown keys in one wave first.
+        if let Some(p) = &ctx.predictor {
+            let (keys, pred) = p.lock().unwrap().predict(call, &snap);
+            let (accts, slots) = unknown_split(&snap, &keys);
+            if !accts.is_empty() || !slots.is_empty() {
+                let r = prefetch::resolve(&ctx.store, &ctx.sched, &at, &accts, &slots, &[]).await;
+                let mut s = ctx.stats.lock().unwrap();
+                s.predict_waves += 1;
+                s.predict_keys += r.keys as u64;
+                s.predict_wall.push_ms(r.wall_ms);
+                drop(s);
+                miss_log.push(serde_json::json!({"call": call.name, "round": "predict", "prediction": pred, "resolve": r}));
+            }
+        }
         let t = Instant::now();
         let (mut out, mut m) = simulate(&snap, &h, call);
         local_us += t.elapsed().as_secs_f64() * 1e6;
@@ -564,6 +636,13 @@ async fn measure_block(ctx: Arc<Ctx>, h: Header, b: BlockRef, recv_ms: f64, appl
             m.storage.dedup();
             m.code.sort();
             m.code.dedup();
+            if let Some(p) = &ctx.predictor {
+                let extra = p.lock().unwrap().expand(&snap, &m.storage);
+                let (_, more) = unknown_split(&snap, &extra);
+                m.storage.extend(more);
+                m.storage.sort();
+                m.storage.dedup();
+            }
             resolved += (m.accounts.len() + m.storage.len()) as u64;
             let r = prefetch::resolve(&ctx.store, &ctx.sched, &at, &m.accounts, &m.storage, &m.code).await;
             let t2 = Instant::now();
@@ -584,6 +663,15 @@ async fn measure_block(ctx: Arc<Ctx>, h: Header, b: BlockRef, recv_ms: f64, appl
             let mut s = ctx.stats.lock().unwrap();
             s.calls_run += 1;
             s.calls_with_miss += had_miss as u64;
+        }
+        if let Some(p) = &ctx.predictor {
+            let mut ta = m.touched_accounts.clone();
+            let mut ts = m.touched_storage.clone();
+            ta.sort();
+            ta.dedup();
+            ts.sort();
+            ts.dedup();
+            p.lock().unwrap().record(call, &ta, &ts);
         }
         outputs.push(out);
     }
@@ -668,6 +756,7 @@ fn report(ctx: &Ctx) {
         "miss_events": s.miss_events, "miss_wall": s.miss_wall.json(), "miss_queue_max": s.miss_queue.json(),
         "miss_service_max": s.miss_service.json(), "miss_attempts_max": s.miss_attempts_max,
         "miss_root_unavailable": s.miss_unavailable,
+        "predict_waves": s.predict_waves, "predict_keys": s.predict_keys, "predict_wall": s.predict_wall.json(),
         "prefetch_rounds": s.prefetch_rounds, "prefetch_keys": s.prefetch_keys, "prefetch_wall": s.prefetch_wall.json(),
         "outputs_match": s.match_ok, "outputs_mismatch": s.match_fail,
         "scheduler": ctx.sched.stats(),
