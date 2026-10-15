@@ -34,6 +34,9 @@ use skim_snap::Priority;
 pub use db::Access;
 pub use prefetch::Resolve;
 
+/// Most keys fetched in one predicted wave before running a call.
+pub const MAX_PREDICTED_WAVE: usize = 192;
+
 /// The part of a call the predictor keys on.
 #[derive(Debug, Clone)]
 pub struct CallInput {
@@ -81,7 +84,9 @@ pub struct Simulator {
     pub store: Arc<Store>,
     pub sched: Scheduler<ElTransport>,
     pub predictor: Mutex<predictor::Predictor>,
-    headers: RwLock<BTreeMap<u64, Header>>,
+    /// Headers by number, with their hash computed once on insert.
+    headers: RwLock<BTreeMap<u64, (B256, Arc<Header>)>>,
+    code_cache: RwLock<std::collections::HashMap<B256, revm::bytecode::Bytecode>>,
     /// Resolve misses at the parent root (peers may not have executed the head yet).
     pub miss_at_parent: bool,
     /// Retention for state fetched on demand (unsubscribed): `Ttl(n)` keeps it current for n
@@ -96,6 +101,7 @@ impl Simulator {
             sched,
             predictor: Mutex::new(predictor),
             headers: RwLock::default(),
+            code_cache: RwLock::default(),
             miss_at_parent: true,
             on_demand: RwLock::new(Retention::Ttl(4)),
         })
@@ -104,8 +110,9 @@ impl Simulator {
     /// Keeps the header of an applied block (execution env, BLOCKHASH). Pruned with the store
     /// window.
     pub fn insert_header(&self, h: Header) {
+        let hash = h.hash_slow();
         let mut hs = self.headers.write();
-        hs.insert(h.number, h);
+        hs.insert(h.number, (hash, Arc::new(h)));
         if let Some(head) = hs.keys().next_back().copied() {
             while hs.keys().next().is_some_and(|n| *n + 512 < head) {
                 hs.pop_first();
@@ -114,12 +121,17 @@ impl Simulator {
     }
 
     pub fn header(&self, b: &BlockRef) -> Option<Header> {
-        if let Some(h) = self.headers.read().get(&b.number).filter(|h| h.hash_slow() == b.hash).cloned() {
-            return Some(h);
+        self.header_arc(b).map(|h| (*h).clone())
+    }
+
+    /// The header of `b`, shared (no copy, no re-hash on the hot path).
+    pub fn header_arc(&self, b: &BlockRef) -> Option<Arc<Header>> {
+        if let Some((_, h)) = self.headers.read().get(&b.number).filter(|(hash, _)| *hash == b.hash) {
+            return Some(h.clone());
         }
         let (_, rlp) = self.store.archived_block(b.number)?;
         let h = <Header as alloy_rlp::Decodable>::decode(&mut rlp.as_slice()).ok()?;
-        (h.hash_slow() == b.hash).then_some(h)
+        (h.hash_slow() == b.hash).then(|| Arc::new(h))
     }
 
     fn fetch_at(&self, b: &BlockRef) -> BlockRef {
@@ -130,7 +142,7 @@ impl Simulator {
     pub fn execute(&self, snap: &Snapshot, header: &Header, tx: TxEnv) -> Result<(ExecutionResult, Access), SimError> {
         let store = self.store.clone();
         let block_hash = move |n: u64| store.block_hash(n);
-        let db = db::SnapDb { snap, block_hash: &block_hash, access: Default::default() };
+        let db = db::SnapDb { snap, block_hash: &block_hash, access: Default::default(), code_cache: &self.code_cache };
         let res = {
             let mut evm = Context::mainnet()
                 .with_db(WrapDatabaseRef(&db))
@@ -153,7 +165,7 @@ impl Simulator {
     /// [`Self::call`] committing fetched state with `retention` (subscriptions use `Subscribed`).
     pub async fn call_retained(&self, b: &BlockRef, tx: TxEnv, mode: Mode, retention: Retention) -> Result<CallOutcome, SimError> {
         let snap = self.store.snapshot(b)?;
-        let header = self.header(b).ok_or(SimError::NoHeader(b.number))?;
+        let header = self.header_arc(b).ok_or(SimError::NoHeader(b.number))?;
         let at = self.fetch_at(b);
         // Historical (archived) blocks: old roots aren't served by SNAP peers, so never fetch.
         let mode = if snap.is_archived() { Mode::WarmOnly } else { mode };
@@ -161,16 +173,9 @@ impl Simulator {
             TxKind::Call(to) => Some(CallInput { to, data: tx.data.clone() }),
             TxKind::Create => None,
         };
+        // Fast path first: most calls find every key local. Prediction runs only after a run
+        // misses, and its keys go out in the same wave as the actual misses.
         let mut predicted = None;
-        if let (Mode::Resolve { .. }, Some(input)) = (mode, &input) {
-            let (keys, _) = self.predictor.lock().predict(input, &snap);
-            let (accts, slots) = unknown_split(&snap, &keys);
-            if !accts.is_empty() || !slots.is_empty() {
-                predicted = Some(
-                    prefetch::resolve_retained(&self.store, &self.sched, &at, &accts, &slots, &[], Priority::High, retention).await,
-                );
-            }
-        }
         let mut rounds = Vec::new();
         let mut exec_us = 0.0;
         loop {
@@ -178,7 +183,11 @@ impl Simulator {
             let (result, access) = self.execute(&snap, &header, tx.clone())?;
             exec_us += t.elapsed().as_secs_f64() * 1e6;
             if !access.has_misses() {
-                if let Some(input) = &input {
+                // Learn only from runs that had to fetch: a fully local run teaches nothing new
+                // and recording it on every call costs allocations on the hot path.
+                if let Some(input) = &input
+                    && (predicted.is_some() || !rounds.is_empty())
+                {
                     self.predictor.lock().record(input, &access.accounts, &access.storage);
                 }
                 if let Retention::Ttl(n) = retention {
@@ -190,6 +199,32 @@ impl Simulator {
                     self.store.touch_ttl(&keys, n);
                 }
                 return Ok(CallOutcome { result, access, predicted, rounds, exec_us });
+            }
+            if let (Mode::Resolve { .. }, Some(input), None) = (mode, &input, &predicted) {
+                let (keys, _) = self.predictor.lock().predict(input, &snap);
+                let (mut accts, mut slots) = unknown_split(&snap, &keys);
+                // One predicted wave is capped (keys come nearest-first); the rest, if the call
+                // needs them, arrive as ordinary miss rounds. An uncapped wave of hundreds of
+                // keys on a few peers can take longer than the call is worth (seen: 75 s).
+                slots.truncate(MAX_PREDICTED_WAVE.saturating_sub(accts.len()));
+                for a in &access.miss_accounts {
+                    if !accts.contains(a) {
+                        accts.push(*a);
+                    }
+                }
+                for s in &access.miss_storage {
+                    if !slots.contains(s) {
+                        slots.push(*s);
+                    }
+                }
+                if let Some(&lowest) = access.miss_block_hashes.first() {
+                    self.resolve_block_hashes(lowest).await;
+                }
+                predicted = Some(
+                    prefetch::resolve_retained(&self.store, &self.sched, &at, &accts, &slots, &access.miss_code, Priority::High, retention)
+                        .await,
+                );
+                continue;
             }
             let max = match mode {
                 Mode::WarmOnly if snap.is_archived() => {

@@ -132,8 +132,8 @@ impl Rpc {
         self.chain.as_ref().ok_or_else(|| RpcError::unavailable("chain data is not available in this mode"))
     }
 
-    fn header(&self, b: &BlockRef) -> Result<Header, RpcError> {
-        self.sim.header(b).ok_or_else(|| RpcError::unavailable(format!("no header for block {}", b.number)))
+    fn header(&self, b: &BlockRef) -> Result<std::sync::Arc<Header>, RpcError> {
+        self.sim.header_arc(b).ok_or_else(|| RpcError::unavailable(format!("no header for block {}", b.number)))
     }
 
     /// Builds the execution for a call request. Every field that changes execution is honoured
@@ -207,7 +207,7 @@ impl Rpc {
                 };
                 let h = self.header(&b)?;
                 let block: Block<alloy_rpc_types_eth::Transaction> = Block {
-                    header: alloy_rpc_types_eth::Header::new(h),
+                    header: alloy_rpc_types_eth::Header::new((*h).clone()),
                     uncles: vec![],
                     // Hashes when skim indexed the block's transactions (gossip or a fetched body).
                     transactions: BlockTransactions::Hashes(

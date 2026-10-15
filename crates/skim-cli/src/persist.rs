@@ -95,7 +95,7 @@ async fn restore_inner(store: &Store, net: &ElNet, saved: &Saved, head: &BlockRe
     anyhow::ensure!(gap <= MAX_REPLAY, "snapshot is {gap} blocks old (max {MAX_REPLAY})");
     // EL peers come up after CL gossip; give them time.
     let deadline = Instant::now() + std::time::Duration::from_secs(300);
-    let mut writes: Vec<BlockWrites> = Vec::with_capacity(gap as usize);
+    let mut fetched: Vec<(alloy_consensus::Header, BlockWrites)> = Vec::with_capacity(gap as usize);
     let mut prev = saved.hash;
     let mut next = saved.number + 1;
     while next <= head.number {
@@ -118,7 +118,7 @@ async fn restore_inner(store: &Store, net: &ElNet, saved: &Saved, head: &BlockRe
             for (h, raw) in hs.iter().zip(bals.0) {
                 let Some(raw) = raw else { break };
                 let Ok(bal) = skim_bal::decode_verified(&raw, h.block_access_list_hash.unwrap_or_default()) else { break };
-                writes.push(BlockWrites::from_bal(&bal));
+                fetched.push((h.clone(), BlockWrites::from_bal(&bal)));
                 ok += 1;
             }
             if ok == 0 {
@@ -133,9 +133,90 @@ async fn restore_inner(store: &Store, net: &ElNet, saved: &Saved, head: &BlockRe
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
     }
-    anyhow::ensure!(prev == head.hash, "replayed chain ends at {prev}, not the head {}", head.hash);
-    let (values, code) = skim_state::persist::replay(saved, &writes);
+    let (values, code) = verify_and_replay(saved, &fetched, head)?;
     install(store, head, &values, &code)
+}
+
+type Replayed = (Vec<(skim_bal::StateKey, alloy_primitives::U256)>, Vec<(B256, alloy_primitives::Bytes)>);
+
+/// The whole check, independent of where the blocks came from: the headers start right after
+/// the snapshot block, each links to the previous by hash (the first to the snapshot's hash, so
+/// a snapshot on an orphaned fork fails here), and the last one is the current head. Only then
+/// are the writes replayed. BALs were already checked against their headers when decoded.
+pub fn verify_and_replay(saved: &Saved, blocks: &[(alloy_consensus::Header, BlockWrites)], head: &BlockRef) -> anyhow::Result<Replayed> {
+    let mut prev = saved.hash;
+    let mut number = saved.number;
+    for (h, _) in blocks {
+        anyhow::ensure!(h.number == number + 1, "block {} follows {number}", h.number);
+        anyhow::ensure!(h.parent_hash == prev, "block {} does not link to the snapshot chain", h.number);
+        prev = h.hash_slow();
+        number = h.number;
+    }
+    anyhow::ensure!(number == head.number && prev == head.hash, "replayed chain ends at {number}/{prev}, not the head {}/{}", head.number, head.hash);
+    let writes: Vec<BlockWrites> = blocks.iter().map(|(_, w)| w.clone()).collect();
+    Ok(skim_state::persist::replay(saved, &writes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_consensus::Header;
+    use alloy_primitives::{Address, U256};
+    use skim_bal::StateKey;
+
+    fn chain(from_parent: B256, from: u64, n: u64, salt: u64) -> Vec<Header> {
+        let mut out = Vec::new();
+        let mut parent = from_parent;
+        for i in 0..n {
+            let h = Header { number: from + i, parent_hash: parent, gas_limit: salt, ..Default::default() };
+            parent = h.hash_slow();
+            out.push(h);
+        }
+        out
+    }
+
+    fn slot() -> StateKey {
+        StateKey::Storage(Address::repeat_byte(1), U256::from(1))
+    }
+
+    fn head_of(h: &Header) -> BlockRef {
+        BlockRef { number: h.number, hash: h.hash_slow(), parent_hash: h.parent_hash, state_root: B256::ZERO, timestamp: 0 }
+    }
+
+    #[test]
+    fn replays_a_linked_chain() {
+        let snap_hash = B256::repeat_byte(5);
+        let hs = chain(snap_hash, 11, 3, 1);
+        let w = |v: u64| BlockWrites { writes: vec![(slot(), U256::from(v))], ..Default::default() };
+        let blocks: Vec<_> = hs.iter().cloned().zip([w(2), BlockWrites::default(), w(3)]).collect();
+        let saved = Saved { number: 10, hash: snap_hash, values: vec![(slot(), U256::from(1))], code: vec![] };
+        let (v, _) = verify_and_replay(&saved, &blocks, &head_of(&hs[2])).unwrap();
+        assert_eq!(v, vec![(slot(), U256::from(3))]);
+    }
+
+    #[test]
+    fn a_snapshot_from_an_orphaned_fork_is_discarded() {
+        // The snapshot was taken at block 10 on a branch that was reorged out while skim was
+        // down: the canonical 11 doesn't have it as parent.
+        let canonical_10 = B256::repeat_byte(5);
+        let orphaned_10 = B256::repeat_byte(6);
+        let hs = chain(canonical_10, 11, 3, 1);
+        let blocks: Vec<_> = hs.iter().cloned().map(|h| (h, BlockWrites::default())).collect();
+        let saved = Saved { number: 10, hash: orphaned_10, values: vec![(slot(), U256::from(1))], code: vec![] };
+        assert!(verify_and_replay(&saved, &blocks, &head_of(&hs[2])).is_err());
+    }
+
+    #[test]
+    fn a_chain_that_misses_the_head_or_skips_blocks_is_discarded() {
+        let snap_hash = B256::repeat_byte(5);
+        let hs = chain(snap_hash, 11, 3, 1);
+        let blocks: Vec<_> = hs.iter().cloned().map(|h| (h, BlockWrites::default())).collect();
+        let saved = Saved { number: 10, hash: snap_hash, values: vec![], code: vec![] };
+        let other_head = chain(snap_hash, 11, 3, 2); // same numbers, different blocks
+        assert!(verify_and_replay(&saved, &blocks, &head_of(&other_head[2])).is_err());
+        let gapped: Vec<_> = vec![blocks[0].clone(), blocks[2].clone()];
+        assert!(verify_and_replay(&saved, &gapped, &head_of(&hs[2])).is_err());
+    }
 }
 
 fn install(store: &Store, at: &BlockRef, values: &[(skim_bal::StateKey, alloy_primitives::U256)], code: &[(B256, alloy_primitives::Bytes)]) -> anyhow::Result<usize> {

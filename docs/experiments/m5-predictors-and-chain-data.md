@@ -94,3 +94,30 @@ How each piece of data is obtained:
 | `Swap` topic with no address, 1,024 blocks (bloom saturated) | 881 | 116 s |
 
 Wide historical scans are bounded by receipt downloads from the 1–2 EL peers connected at the time. Narrow filters over followed blocks are nearly free. Sending was checked for decoding, validation and broadcast. A funded Sepolia key is needed for an end-to-end inclusion test.
+
+## 4. Warm-path latency (after the review fixes)
+Three things ran on every call, even when every key was already local:
+- **Prediction:** the predictor ran before every call, including the V3 tick-range computation.
+- **Learning:** every call's access set was recorded.
+- **Bytecode analysis:** the bytecode of every contract touched was re-analyzed (`Bytecode::new_raw` jump-table analysis), and the header re-hashed.
+
+**Now:**
+- the call runs first
+- prediction happens only after a run misses, and its keys go out in the same wave as the actual misses
+- only runs that fetched something are learned
+- analyzed bytecode is cached by code hash
+- header hashes are computed once
+
+Predicted waves are also capped at 192 keys, nearest tick words first, so a huge prediction can't stall a call.
+
+`docs/experiments/tools/latency_bench.py`, same config (`examples/uniswap-v3/skim.yaml`), same machine, sequential calls at `latest` after warm-up (500 per kind):
+
+| | Before | After |
+|---|---|---|
+| Subscribed quote P50 / P90 / P99 | 0.756 / 0.842 / 1.076 ms | **0.248 / 0.327 / 0.558 ms** |
+| Quotes for 10 amounts P50 / P99 | 0.735 / 1.145 ms | **0.216 / 0.447 ms** |
+| `balanceOf` P50 | 0.140 ms | 0.123 ms |
+| `eth_getStorageAt` P50 (no EVM; ~HTTP floor) | 0.109 ms | 0.114 ms |
+| Throughput, 1 / 10 / 50 in flight | 1,260 / 2,675 / 2,798 calls/s | **4,144 / 8,377 / 8,469 calls/s** |
+
+A profile under load now shows the server's time is almost all in the EVM interpreter itself.

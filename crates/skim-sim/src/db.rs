@@ -50,7 +50,13 @@ pub struct SnapDb<'a> {
     /// BLOCKHASH source (recent header hashes by number).
     pub block_hash: &'a (dyn Fn(u64) -> Option<B256> + Sync),
     pub access: Mutex<Access>,
+    /// Analyzed bytecode by code hash, shared across calls (jump-table analysis is per contract,
+    /// not per call). Code is content-addressed, so entries never go stale.
+    pub code_cache: &'a parking_lot::RwLock<std::collections::HashMap<B256, Bytecode>>,
 }
+
+/// Analyzed contracts kept in [`SnapDb::code_cache`] before it is reset.
+pub const CODE_CACHE_MAX: usize = 4096;
 
 impl SnapDb<'_> {
     fn get(&self, k: StateKey) -> StateValue {
@@ -83,8 +89,19 @@ impl DatabaseRef for SnapDb<'_> {
         if h == KECCAK_EMPTY {
             return Ok(Bytecode::default());
         }
+        if let Some(b) = self.code_cache.read().get(&h) {
+            return Ok(b.clone());
+        }
         match self.snap.code(&h) {
-            Some(c) => Ok(Bytecode::new_raw(c)),
+            Some(c) => {
+                let b = Bytecode::new_raw(c);
+                let mut cache = self.code_cache.write();
+                if cache.len() >= CODE_CACHE_MAX {
+                    cache.clear();
+                }
+                cache.insert(h, b.clone());
+                Ok(b)
+            }
             None => {
                 self.access.lock().unwrap().miss_code.push(h);
                 Ok(Bytecode::default())

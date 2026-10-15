@@ -114,7 +114,10 @@ impl Predictor {
             e.1 = e.1.max(hi - w0);
         }
         let mut keys = prefetch::predict(snap, &m.pool, self.base_words);
-        for w in lo..=hi {
+        // Nearest words first: if a wave is capped, the keys a swap reads first are fetched first.
+        let mut words: Vec<i32> = (lo..=hi).collect();
+        words.sort_by_key(|w| (w - w0).abs());
+        for w in words {
             let wk = prefetch::bitmap_slot(w);
             keys.push(StateKey::Storage(a, wk));
             if let Some(StateValue::Known(bits)) = get(wk) {
