@@ -83,6 +83,9 @@ pub struct Args {
     /// Background V3 window follows the predictor's observed per-pool reach.
     #[arg(long)]
     adaptive_window: bool,
+    /// Background prefetch budget: keys per pool per block (closest to the current tick first).
+    #[arg(long, default_value_t = 256)]
+    prefetch_budget: usize,
 }
 
 fn unix_ms(t: SystemTime) -> f64 {
@@ -247,6 +250,8 @@ struct Stats {
     calls_with_miss: u64,
     prefetch_rounds: u64,
     predict_waves: u64,
+    predicted_keys: u64,
+    predicted_unknown: u64,
     predict_keys: u64,
     predict_wall: Samples,
     prefetch_keys: u64,
@@ -271,6 +276,7 @@ struct Ctx {
     random_quotes: usize,
     predictor: Option<StdMutex<skim_sim::predictor::Predictor>>,
     adaptive_window: bool,
+    prefetch_budget: usize,
 }
 
 /// First successful Infura `eth_call` at a block number: when that request was sent (an upper
@@ -360,6 +366,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         v3_pools: Default::default(),
         random_quotes: args.random_quotes,
         adaptive_window: args.adaptive_window,
+        prefetch_budget: args.prefetch_budget,
         predictor: args.predictor.then(|| {
             StdMutex::new(skim_sim::predictor::Predictor {
                 learned: skim_sim::learned::Learned::new(8, 0.5, 256),
@@ -562,7 +569,7 @@ fn spawn_prefetch(ctx: &Arc<Ctx>, b: BlockRef) {
                 Some(p) if ctx.adaptive_window => p.lock().unwrap().window(&pool.address),
                 _ => (-ctx.v3_words, ctx.v3_words),
             };
-            let rounds = prefetch::refresh_pool(&ctx.store, &ctx.sched, &b, &at, &pool, window).await;
+            let rounds = prefetch::refresh_pool(&ctx.store, &ctx.sched, &b, &at, &pool, window, ctx.prefetch_budget).await;
             let mut s = ctx.stats.lock().unwrap();
             for r in rounds {
                 s.prefetch_rounds += 1;
@@ -588,6 +595,15 @@ async fn measure_block(ctx: Arc<Ctx>, h: Header, b: BlockRef, recv_ms: f64, appl
             let input = skim_sim::CallInput { to: call.to, data: call.data.clone() };
             let (keys, pred) = p.lock().unwrap().predict(&input, &snap);
             let (accts, slots) = unknown_split(&snap, &keys);
+            {
+                let unknown = keys
+                    .iter()
+                    .filter(|k| matches!(snap.get(k), Ok(StateValue::Unknown)))
+                    .count();
+                let mut s = ctx.stats.lock().unwrap();
+                s.predicted_keys += keys.len() as u64;
+                s.predicted_unknown += unknown as u64;
+            }
             if !accts.is_empty() || !slots.is_empty() {
                 let r = prefetch::resolve(&ctx.store, &ctx.sched, &at, &accts, &slots, &[]).await;
                 let mut s = ctx.stats.lock().unwrap();
@@ -735,6 +751,8 @@ fn report(ctx: &Ctx) {
         "miss_events": s.miss_events, "miss_wall": s.miss_wall.json(), "miss_queue_max": s.miss_queue.json(),
         "miss_service_max": s.miss_service.json(), "miss_attempts_max": s.miss_attempts_max,
         "miss_root_unavailable": s.miss_unavailable,
+        "predicted_keys": s.predicted_keys, "predicted_unknown_at_call": s.predicted_unknown,
+        "prefetch_hit_rate": if s.predicted_keys > 0 { 1.0 - s.predicted_unknown as f64 / s.predicted_keys as f64 } else { 0.0 },
         "predict_waves": s.predict_waves, "predict_keys": s.predict_keys, "predict_wall": s.predict_wall.json(),
         "prefetch_rounds": s.prefetch_rounds, "prefetch_keys": s.prefetch_keys, "prefetch_wall": s.prefetch_wall.json(),
         "outputs_match": s.match_ok, "outputs_mismatch": s.match_fail,

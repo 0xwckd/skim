@@ -169,6 +169,8 @@ pub struct Stats {
     pub late_answers_ignored: u64,
     pub failed: u64,
     pub code_batches: u64,
+    pub low_jobs: u64,
+    pub upgraded: u64,
 }
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
@@ -179,6 +181,15 @@ pub struct PeerStats {
     pub errors: u64,
     pub ewma_ms: f64,
     pub inflight: usize,
+}
+
+/// Who is waiting: a simulation (`High`) or a background prefetch (`Low`). Low jobs use at most
+/// half of each peer's in-flight cap and never get hedged, so they can't delay High jobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Priority {
+    #[default]
+    High,
+    Low,
 }
 
 /// Where a job's time went (PROJECT.md §6.3 tail-latency breakdown).
@@ -199,6 +210,7 @@ pub struct FetchMeta {
 type Waiter = oneshot::Sender<(Result<Value, FetchError>, FetchMeta)>;
 
 struct Job {
+    low: bool,
     waiters: Vec<(Waiter, bool)>,
     attempts: u32,
     unavailable: u32,
@@ -267,6 +279,7 @@ impl Peer {
 struct State {
     jobs: HashMap<Key, Job>,
     queue: VecDeque<Key>,
+    queue_lo: VecDeque<Key>,
     peers: HashMap<PeerId, Peer>,
     stats: Stats,
 }
@@ -311,9 +324,13 @@ impl<T: Transport> Scheduler<T> {
 
     /// Like [`Self::fetch`], with per-key timing and retry metadata.
     pub async fn fetch_detailed(&self, keys: &[Key]) -> Vec<(Result<Value, FetchError>, FetchMeta)> {
+        self.fetch_detailed_with(keys, Priority::High).await
+    }
+
+    pub async fn fetch_detailed_with(&self, keys: &[Key], prio: Priority) -> Vec<(Result<Value, FetchError>, FetchMeta)> {
         let rxs: Vec<_> = {
             let mut st = self.inner.state.lock();
-            keys.iter().map(|k| self.inner.enqueue(&mut st, *k)).collect()
+            keys.iter().map(|k| self.inner.enqueue(&mut st, *k, prio)).collect()
         };
         self.inner.wake.notify_one();
         futures::future::join_all(rxs.into_iter().map(|rx| async move {
@@ -351,16 +368,27 @@ impl<T: Transport> Scheduler<T> {
 }
 
 impl<T: Transport> Inner<T> {
-    fn enqueue(&self, st: &mut State, key: Key) -> oneshot::Receiver<(Result<Value, FetchError>, FetchMeta)> {
+    fn enqueue(&self, st: &mut State, key: Key, prio: Priority) -> oneshot::Receiver<(Result<Value, FetchError>, FetchMeta)> {
         let (tx, rx) = oneshot::channel();
         if let Some(job) = st.jobs.get_mut(&key) {
             job.waiters.push((tx, true));
             st.stats.dedup_hits += 1;
+            // A simulation now waits on a background job: promote it.
+            if prio == Priority::High && job.low {
+                job.low = false;
+                let queued = job.queued;
+                st.stats.upgraded += 1;
+                if queued {
+                    st.queue_lo.retain(|k| *k != key);
+                    st.queue.push_front(key);
+                }
+            }
             return rx;
         }
         st.jobs.insert(
             key,
             Job {
+                low: prio == Priority::Low,
                 waiters: vec![(tx, false)],
                 attempts: 0,
                 unavailable: 0,
@@ -373,7 +401,12 @@ impl<T: Transport> Inner<T> {
                 queued: true,
             },
         );
-        st.queue.push_back(key);
+        if prio == Priority::Low {
+            st.queue_lo.push_back(key);
+            st.stats.low_jobs += 1;
+        } else {
+            st.queue.push_back(key);
+        }
         st.stats.jobs += 1;
         rx
     }
@@ -402,7 +435,7 @@ impl<T: Transport> Inner<T> {
         if let Some(job) = st.jobs.get_mut(&key) {
             if !job.queued && job.inflight == 0 {
                 job.queued = true;
-                st.queue.push_front(key);
+                if job.low { st.queue_lo.push_back(key) } else { st.queue.push_front(key) }
                 st.stats.requeued += 1;
             }
         }
@@ -417,7 +450,7 @@ impl<T: Transport> Inner<T> {
         });
         let eligible = |(id, p): &(&PeerId, &Peer)| {
             allowed.as_ref().is_none_or(|a| a.contains(*id))
-                && p.inflight < p.cap(&self.cfg)
+                && p.inflight < if job.low { (p.cap(&self.cfg) / 2).max(1) } else { p.cap(&self.cfg) }
                 && root.is_none_or(|r| p.unavailable_roots.get(&r).is_none_or(|t| t.elapsed() > ROOT_RETRY))
 
         };
@@ -456,6 +489,7 @@ impl<T: Transport> Inner<T> {
             if overdue {
                 expired.push(*k);
             } else if j.inflight == 1
+                && !j.low
                 && !j.hedged
                 && !j.queued
                 && j.last_sent.is_some_and(|t| now.duration_since(t) > self.cfg.hedge_after)
@@ -474,26 +508,37 @@ impl<T: Transport> Inner<T> {
             st.stats.hedges += 1;
         }
 
-        // Place queued jobs.
+        // Place queued jobs: simulations first, then background work in what's left.
+        self.place(&mut st, false);
+        self.place(&mut st, true);
+    }
+
+    fn place(self: &Arc<Self>, st: &mut State, low: bool) {
         let mut deferred = VecDeque::new();
-        while let Some(key) = st.queue.pop_front() {
+        loop {
+            let next = if low { st.queue_lo.pop_front() } else { st.queue.pop_front() };
+            let Some(key) = next else { break };
             let Some(job) = st.jobs.get(&key) else { continue };
-            let Some(peer) = self.pick_peer(&st, &key, job) else {
+            if job.low != low {
+                continue; // promoted or demoted while queued; it sits in the other queue
+            }
+            let Some(peer) = self.pick_peer(st, &key, job) else {
                 deferred.push_back(key);
                 continue;
             };
             let mut keys = vec![key];
             if matches!(key, Key::Code(_)) {
                 // Batch further queued code hashes onto the same request.
+                let q = if low { &mut st.queue_lo } else { &mut st.queue };
                 let mut rest = VecDeque::new();
-                while let Some(k) = st.queue.pop_front() {
-                    if matches!(k, Key::Code(_)) && keys.len() < self.cfg.code_batch && st.jobs.contains_key(&k) {
+                while let Some(k) = q.pop_front() {
+                    if matches!(k, Key::Code(_)) && keys.len() < self.cfg.code_batch && st.jobs.get(&k).is_some_and(|j| j.low == low) {
                         keys.push(k);
                     } else {
                         rest.push_back(k);
                     }
                 }
-                st.queue = rest;
+                if low { st.queue_lo = rest } else { st.queue = rest }
                 st.stats.code_batches += 1;
             }
             for k in &keys {
@@ -510,7 +555,7 @@ impl<T: Transport> Inner<T> {
             let this = self.clone();
             tokio::spawn(async move { this.run(peer, keys).await });
         }
-        st.queue = deferred;
+        if low { st.queue_lo = deferred } else { st.queue = deferred }
     }
 
     async fn run(self: Arc<Self>, peer: PeerId, keys: Vec<Key>) {

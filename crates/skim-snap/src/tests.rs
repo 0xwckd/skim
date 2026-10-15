@@ -258,3 +258,24 @@ fn aimd_rules() {
     assert_eq!(p.cap(&c), 1);
     assert_eq!(Peer::default().cap(&Config { adaptive: false, ..c }), 8);
 }
+
+#[tokio::test]
+async fn background_work_never_takes_more_than_half_the_cap_and_promotes() {
+    let m = Mock::new(&[(1, Behav::Ok { ms: 40 })]);
+    let s = Scheduler::new(m.clone(), Config { per_peer_inflight: 8, adaptive: false, ..cfg() });
+    // 64 background keys: at most 4 in flight at once on the single peer.
+    let bg: Vec<_> = (0..64).map(slot).collect();
+    let s2 = s.clone();
+    let bg_task = tokio::spawn(async move { s2.fetch_detailed_with(&bg, Priority::Low).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    // A simulation needs one of the queued background keys and 3 fresh ones: they must not wait
+    // for the background backlog.
+    let t = Instant::now();
+    let hi = s.fetch(&[slot(63), slot(100), slot(101), slot(102)]).await;
+    assert!(hi.iter().all(|x| x.is_ok()));
+    assert!(t.elapsed() < Duration::from_millis(200), "high waited {:?}", t.elapsed());
+    assert!(bg_task.await.unwrap().iter().all(|(r, _)| r.is_ok()));
+    assert!(s.stats().upgraded >= 1);
+    // Low jobs alone never exceeded half the cap (4); high jobs could use the rest.
+    assert!(m.inflight.lock()[&pid(1)].1 <= 8);
+}

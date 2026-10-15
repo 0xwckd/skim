@@ -15,7 +15,7 @@
 use alloy_primitives::{Address, B256, Bytes, I256, U256, keccak256};
 use revm::primitives::KECCAK_EMPTY;
 use skim_bal::StateKey;
-use skim_snap::{FetchMeta, Key, Scheduler, Value, el::ElTransport};
+use skim_snap::{FetchMeta, Key, Priority, Scheduler, Value, el::ElTransport};
 use skim_state::{BlockRef, Snapshot, StateValue, Store};
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
@@ -49,6 +49,19 @@ pub async fn resolve(
     storage: &[(Address, U256)],
     code: &[B256],
 ) -> Resolve {
+    resolve_with(store, sched, at, accounts, storage, code, Priority::High).await
+}
+
+/// [`resolve`] at a given scheduler priority (background prefetch uses `Low`).
+pub async fn resolve_with(
+    store: &Store,
+    sched: &Scheduler<ElTransport>,
+    at: &BlockRef,
+    accounts: &[Address],
+    storage: &[(Address, U256)],
+    code: &[B256],
+    prio: Priority,
+) -> Resolve {
     let t = std::time::Instant::now();
     let root = at.state_root;
     let mut keys: Vec<Key> = accounts.iter().map(|&address| Key::Account { root, address }).collect();
@@ -56,7 +69,7 @@ pub async fn resolve(
     keys.extend(code.iter().map(|&h| Key::Code(h)));
     let mut r = Resolve { keys: keys.len(), ..Default::default() };
     let mut chained = Vec::new();
-    for (k, (res, meta)) in keys.iter().zip(sched.fetch_detailed(&keys).await) {
+    for (k, (res, meta)) in keys.iter().zip(sched.fetch_detailed_with(&keys, prio).await) {
         absorb(&mut r, &meta);
         match (k, res) {
             (Key::Account { address, .. }, Ok(Value::Account(a))) => {
@@ -82,7 +95,7 @@ pub async fn resolve(
     }
     if !chained.is_empty() {
         r.code_round = true;
-        for (res, meta) in sched.fetch_detailed(&chained).await {
+        for (res, meta) in sched.fetch_detailed_with(&chained, prio).await {
             absorb(&mut r, &meta);
             match res {
                 Ok(Value::Code(c)) => {
@@ -180,17 +193,42 @@ pub async fn refresh_pool(
     at: &BlockRef,
     pool: &V3Pool,
     (lo, hi): (i32, i32),
+    budget: usize,
 ) -> Vec<Resolve> {
     let mut rounds = Vec::new();
+    let mut spent = 0usize;
     for _ in 0..3 {
+        if spent >= budget {
+            break;
+        }
         let Ok(snap) = store.snapshot(head) else { break };
-        let unknown: Vec<StateKey> = predict_range(&snap, pool, lo, hi)
+        // Closest to the current word first, so a budget cut keeps the most likely keys.
+        let w0 = match snap.get(&StateKey::Storage(pool.address, U256::ZERO)) {
+            Ok(StateValue::Known(s0)) => word_of(decode_slot0(s0).0, pool.spacing),
+            _ => 0,
+        };
+        let mut ordered: Vec<(i32, StateKey)> = Vec::new();
+        for d in 0..=lo.abs().max(hi) {
+            for w in [w0 - d, w0 + d] {
+                if w < w0 + lo || w > w0 + hi || (d == 0 && w != w0) {
+                    continue;
+                }
+                for k in predict_range(&snap, pool, w - w0, w - w0) {
+                    ordered.push((d, k));
+                }
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        let unknown: Vec<StateKey> = ordered
             .into_iter()
-            .filter(|k| matches!(snap.get(k), Ok(StateValue::Unknown)))
+            .map(|(_, k)| k)
+            .filter(|k| seen.insert(*k) && matches!(snap.get(k), Ok(StateValue::Unknown)))
+            .take(budget - spent)
             .collect();
         if unknown.is_empty() {
             break;
         }
+        spent += unknown.len();
         let mut accounts = Vec::new();
         let mut storage = Vec::new();
         for k in unknown {
@@ -203,7 +241,7 @@ pub async fn refresh_pool(
                 }
             }
         }
-        rounds.push(resolve(store, sched, at, &accounts, &storage, &[]).await);
+        rounds.push(resolve_with(store, sched, at, &accounts, &storage, &[], Priority::Low).await);
     }
     rounds
 }
